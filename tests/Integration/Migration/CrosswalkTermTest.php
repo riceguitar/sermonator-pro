@@ -57,6 +57,35 @@ final class CrosswalkTermTest extends WP_UnitTestCase {
         $this->assertSame( '9002', (string) $ttIdRows[0] );
     }
 
+    public function test_re_stamping_same_term_keeps_single_row_each_unique_crash_safe(): void {
+        // The crash-safety invariant: a resumed run re-stamps a term that was
+        // already stamped before the crash. unique=true must prevent duplicate
+        // back-ref rows from accumulating, and the original values must survive.
+        // A cache-bound or unique=false reimplementation would fail this.
+        $res       = wp_insert_term( 'Ephesians', Identifiers::TAX_BOOK );
+        $newTermId = (int) $res['term_id'];
+
+        Crosswalk::markLegacyTerm( $newTermId, 5252, 9003 );
+        // Second call simulates the resumed run re-entering markLegacyTerm.
+        Crosswalk::markLegacyTerm( $newTermId, 5252, 9003 );
+
+        $idRows   = get_term_meta( $newTermId, Crosswalk::LEGACY_TERM_ID, false );
+        $ttIdRows = get_term_meta( $newTermId, Crosswalk::LEGACY_TERM_TT_ID, false );
+
+        // Exactly one row each — no duplicate accumulation across the two calls.
+        $this->assertCount( 1, $idRows );
+        $this->assertCount( 1, $ttIdRows );
+        // Original values preserved (unique add is a no-op on the second call).
+        $this->assertSame( '5252', (string) $idRows[0] );
+        $this->assertSame( '9003', (string) $ttIdRows[0] );
+
+        // The single stamped term still resolves cleanly after the re-stamp.
+        $this->assertSame(
+            $newTermId,
+            Crosswalk::findNewTermByLegacyId( 5252, Identifiers::TAX_BOOK )
+        );
+    }
+
     public function test_lookup_is_taxonomy_aware_for_duplicate_named_terms(): void {
         // The SAME legacy term id, migrated into two different target taxonomies
         // (a corrupt-but-defensive scenario the lookup must disambiguate), must
