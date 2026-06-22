@@ -160,6 +160,59 @@ final class TermWriterMigrateTermTest extends WP_UnitTestCase {
         $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_SLUG, true ) );
     }
 
+    public function test_collision_with_native_term_same_slug_different_name_is_deterministic_and_flagged(): void {
+        // A church's NATIVE term whose SLUG matches the legacy term's slug but
+        // whose NAME differs. WordPress does NOT raise term_exists for this in a
+        // non-hierarchical taxonomy, so a naive insert would silently produce a
+        // 'faith-2' slug with no flag. We must still create a NEW term with the
+        // DETERMINISTIC '-legacy-{id}' suffix and record slug_collision.
+        $native = wp_insert_term( 'Belief', Identifiers::TAX_TOPIC, array( 'slug' => 'faith' ) );
+        $this->assertIsArray( $native );
+        $nativeTermId   = (int) $native['term_id'];
+        $this->assertSame( 'faith', get_term( $nativeTermId, Identifiers::TAX_TOPIC )->slug );
+        $nativeSnapshot = $this->snapshotTerm( $nativeTermId, Identifiers::TAX_TOPIC );
+        $nativeMetaBefore = get_term_meta( $nativeTermId );
+
+        // Legacy term: DIFFERENT name ('Faith'), SAME slug ('faith').
+        $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Faith' );
+        $legacy   = $this->legacyTerm( LegacyIdentifiers::TAX_TOPIC, $legacyId );
+        $this->assertSame( 'faith', $legacy->slug );
+        $this->assertNotSame( 'Belief', $legacy->name );
+
+        $writer = new TermWriter();
+        $newId  = $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy );
+
+        // A NEW distinct term — not the native one.
+        $this->assertNotSame( $nativeTermId, $newId );
+        $new = get_term( $newId, Identifiers::TAX_TOPIC );
+        $this->assertInstanceOf( WP_Term::class, $new );
+        $this->assertSame( 'Faith', $new->name );
+
+        // EXACTLY the deterministic suffix slug — never an order-dependent '-2'.
+        $this->assertSame( 'faith-legacy-' . $legacy->term_id, $new->slug );
+
+        // slug_collision flag recorded on the new term.
+        $flags = get_term_meta( $newId, Crosswalk::MIGRATION_FLAGS, false );
+        $this->assertContains( 'slug_collision', $this->flattenFlags( $flags ) );
+
+        // LEGACY_SLUG records the ORIGINAL legacy slug (not the suffixed one).
+        $this->assertSame( 'faith', get_term_meta( $newId, Crosswalk::LEGACY_SLUG, true ) );
+
+        // The NATIVE term is byte-for-byte untouched, and carries NO back-ref.
+        $this->assertSame( $nativeSnapshot, $this->snapshotTerm( $nativeTermId, Identifiers::TAX_TOPIC ) );
+        $this->assertSame( $nativeMetaBefore, get_term_meta( $nativeTermId ) );
+        $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_TERM_ID, true ) );
+        $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_SLUG, true ) );
+
+        // Idempotent: re-run yields the same id, same slug, no duplicate term.
+        $countBefore = (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) );
+        $second      = $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy );
+        $this->assertSame( $newId, $second );
+        $this->assertSame( $countBefore, (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) ) );
+        $this->assertCount( 1, get_term_meta( $second, Crosswalk::LEGACY_TERM_ID, false ) );
+        $this->assertCount( 1, get_term_meta( $second, Crosswalk::MIGRATION_FLAGS, false ) );
+    }
+
     public function test_rerun_after_collision_recomputes_same_deterministic_slug_no_duplicate(): void {
         wp_insert_term( 'Hope', Identifiers::TAX_TOPIC ); // native collision target.
         $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Hope' );

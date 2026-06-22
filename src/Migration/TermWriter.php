@@ -21,7 +21,12 @@ use WP_Term;
  *   it — we create a NEW term with a DETERMINISTIC suffix slug
  *   ($slug.'-legacy-'.$legacyTermId), flag slug_collision, and leave the native
  *   term byte-for-byte untouched. Determinism is what makes the collision branch
- *   itself resumable.
+ *   itself resumable. We detect the collision by probing the slug DIRECTLY
+ *   (term_exists) BEFORE the first insert, not by relying on a wp_insert_term
+ *   term_exists WP_Error: in a non-hierarchical taxonomy that error only fires
+ *   when the NAME also matches, so a same-slug/different-name native term would
+ *   otherwise slip through to wp_unique_term_slug and get a silent, order-
+ *   dependent '-2' suffix with no flag.
  * - Back-refs (term_id + tt_id) and LEGACY_SLUG (the ORIGINAL legacy slug) are
  *   stamped immediately after a confirmed, non-error insert — never before the
  *   is_wp_error guard.
@@ -50,22 +55,44 @@ final class TermWriter {
 
         $flags = array();
 
-        // First attempt: copy slug verbatim.
+        // Detect a NATIVE-term slug collision BEFORE the first insert. The
+        // back-ref probe above already returned null, so any term already
+        // occupying this slug in the target taxonomy is NOT one of ours — it is
+        // a church's NATIVE term we must never adopt.
+        //
+        // We cannot rely on a wp_insert_term term_exists WP_Error for this: in a
+        // non-hierarchical taxonomy WordPress only raises term_exists when the
+        // NAME also matches. For a same-slug/different-name native term,
+        // wp_insert_term silently routes through wp_unique_term_slug and appends
+        // an order-dependent '-2'/'-3' suffix — yielding a non-deterministic
+        // slug and NO collision flag. So we probe the slug directly and take the
+        // deterministic-suffix branch unconditionally whenever the slug is taken.
+        $slugIsTaken = term_exists( $legacySlug, $targetTaxonomy ) !== null;
+
+        if ( $slugIsTaken ) {
+            $insertSlug = $legacySlug . '-legacy-' . $legacyTermId;
+            $flags[]    = 'slug_collision';
+        } else {
+            $insertSlug = $legacySlug;
+        }
+
         $result = wp_insert_term(
             $name,
             $targetTaxonomy,
             array(
-                'slug'        => $legacySlug,
+                'slug'        => $insertSlug,
                 'description' => $description,
             )
         );
 
-        // Collision with an existing term in the target taxonomy. Because the
-        // back-ref probe above already returned null, any colliding term is NOT
-        // one of ours — it is a church's NATIVE term, which we must never adopt.
+        // A residual term_exists collision (e.g. a same-NAME native term whose
+        // own slug differs, so the slug probe above missed it) still routes to
+        // the deterministic suffix — never adopt, never silently '-2'.
         if ( is_wp_error( $result ) && in_array( 'term_exists', $result->get_error_codes(), true ) ) {
             $deterministicSlug = $legacySlug . '-legacy-' . $legacyTermId;
-            $flags[]           = 'slug_collision';
+            if ( ! in_array( 'slug_collision', $flags, true ) ) {
+                $flags[] = 'slug_collision';
+            }
 
             $result = wp_insert_term(
                 $name,
