@@ -106,6 +106,74 @@ final class Crosswalk {
     }
 
     /**
+     * Stamp a migrated term with BOTH legacy back-refs — its source term_id and
+     * its source term_taxonomy_id — the crash-safety spine for terms, written
+     * immediately after the term is inserted. Each is a single row (unique=true)
+     * so re-stamping on a resumed run never accumulates duplicates.
+     *
+     * The tt_id back-ref is what lets the artwork remapper translate legacy
+     * term_taxonomy keys to the new term's current tt_id (see TermCrosswalk).
+     */
+    public static function markLegacyTerm( int $newTermId, int $legacyTermId, int $legacyTtId ): void {
+        add_term_meta( $newTermId, self::LEGACY_TERM_ID, $legacyTermId, true );
+        add_term_meta( $newTermId, self::LEGACY_TERM_TT_ID, $legacyTtId, true );
+    }
+
+    /**
+     * Resolve the migrated term for a legacy source term_id, scoped to a target
+     * taxonomy.
+     *
+     * Resolution is authoritative (the LEGACY_TERM_ID back-ref termmeta) and
+     * TAXONOMY-AWARE: the query joins term_taxonomy and filters on the requested
+     * taxonomy, so the resolved id is guaranteed to live in $targetTaxonomy. This
+     * disambiguates duplicate-named legacy terms migrated into different
+     * taxonomies, and a back-ref stamped on a term in another taxonomy never
+     * resolves here.
+     *
+     * The probe reads $wpdb directly (no get_terms / get_term_meta cache) so a
+     * term inserted moments earlier is found by the very next call with no
+     * stale-term-cache miss — essential for idempotent, resumable writes.
+     *
+     * At-most-one is asserted: on a corrupt >1 state we are loud (error_log) but
+     * deterministic, returning the lowest new term id.
+     *
+     * @return int|null The new term id, or null if no migrated term carries it.
+     */
+    public static function findNewTermByLegacyId( int $legacyTermId, string $targetTaxonomy ): ?int {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT tm.term_id FROM {$wpdb->termmeta} tm"
+                . " INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = tm.term_id"
+                . " WHERE tm.meta_key = %s AND tm.meta_value = %d AND tt.taxonomy = %s"
+                . " ORDER BY tm.term_id ASC",
+                self::LEGACY_TERM_ID,
+                $legacyTermId,
+                $targetTaxonomy
+            )
+        );
+
+        $ids = array_values( array_unique( array_map( 'intval', (array) $ids ) ) );
+
+        if ( $ids === [] ) {
+            return null;
+        }
+
+        if ( count( $ids ) > 1 ) {
+            error_log( sprintf(
+                'Sermonator Crosswalk: legacy term id %d maps to %d new terms in %s (%s); using lowest id.',
+                $legacyTermId,
+                count( $ids ),
+                $targetTaxonomy,
+                implode( ',', $ids )
+            ) );
+        }
+
+        return $ids[0];
+    }
+
+    /**
      * All migrated post ids of a given post type — those carrying the
      * LEGACY_POST_ID back-ref. Status-agnostic; excludes natively-authored
      * posts (which have no back-ref).
