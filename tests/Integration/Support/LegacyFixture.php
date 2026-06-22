@@ -74,4 +74,17 @@ final class LegacyFixture {
     public function setOption( string $name, mixed $value ): void {
         update_option( $name, $value );
     }
+
+    /**
+     * Seed the legacy Sermon Image Plugin options.
+     *
+     * @param array<int, int>      $images   Legacy term_taxonomy_id => attachment_id.
+     * @param array<string, mixed> $settings Legacy settings (taxonomy-name keys + globals).
+     */
+    public function seedArtwork( array $images, array $settings = array() ): void {
+        update_option( LegacyIdentifiers::OPTION_TERM_IMAGES, $images );
+        if ( $settings !== array() ) {
+            update_option( LegacyIdentifiers::OPTION_TERM_IMAGES_SETTINGS, $settings );
+        }
+    }
 }
