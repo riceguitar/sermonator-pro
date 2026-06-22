@@ -1,0 +1,58 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sermonator\Schema;
+
+final class Identifiers {
+    public const POST_TYPE_SERMON  = 'sermonator_sermon';
+    public const POST_TYPE_PODCAST = 'sermonator_podcast';
+
+    public const TAX_PREACHER     = 'sermonator_preacher';
+    public const TAX_SERIES       = 'sermonator_series';
+    public const TAX_TOPIC        = 'sermonator_topic';
+    public const TAX_BOOK         = 'sermonator_book';
+    public const TAX_SERVICE_TYPE = 'sermonator_service_type';
+
+    public const META_DATE           = 'sermonator_date';
+    public const META_DATE_AUTO      = 'sermonator_date_auto';
+    public const META_BIBLE_PASSAGE  = 'sermonator_bible_passage';
+    public const META_AUDIO          = 'sermonator_audio';
+    public const META_AUDIO_ID       = 'sermonator_audio_id';
+    public const META_AUDIO_DURATION = '_sermonator_audio_duration';
+    public const META_AUDIO_SIZE     = '_sermonator_audio_size';
+    public const META_VIDEO_EMBED    = 'sermonator_video_embed';
+    public const META_VIDEO_URL      = 'sermonator_video_url';
+    public const META_NOTES          = 'sermonator_notes';
+    public const META_BULLETIN       = 'sermonator_bulletin';
+    public const META_VIEWS          = 'sermonator_views';
+
+    /** @return list<string> The five sermon taxonomy slugs, in display order. */
+    public static function sermonTaxonomies(): array {
+        return array(
+            self::TAX_PREACHER,
+            self::TAX_SERIES,
+            self::TAX_TOPIC,
+            self::TAX_BOOK,
+            self::TAX_SERVICE_TYPE,
+        );
+    }
+
+    /** @return list<string> Every sermonator_* meta key stored on a sermon. */
+    public static function metaKeys(): array {
+        return array(
+            self::META_DATE,
+            self::META_DATE_AUTO,
+            self::META_BIBLE_PASSAGE,
+            self::META_AUDIO,
+            self::META_AUDIO_ID,
+            self::META_AUDIO_DURATION,
+            self::META_AUDIO_SIZE,
+            self::META_VIDEO_EMBED,
+            self::META_VIDEO_URL,
+            self::META_NOTES,
+            self::META_BULLETIN,
+            self::META_VIEWS,
+        );
+    }
+}
