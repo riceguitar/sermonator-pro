@@ -20,3 +20,7 @@ define( 'SERMONATOR_PATH', plugin_dir_path( __FILE__ ) );
 require_once __DIR__ . '/vendor/autoload.php';
 
 \Sermonator\Plugin::boot();
+
+register_activation_hook( __FILE__, static function (): void {
+    ( new \Sermonator\Model\Activation() )->activate();
+} );
