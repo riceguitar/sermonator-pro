@@ -46,7 +46,17 @@ final class ArtworkWriter {
         $remappedImages   = TermArtworkMapper::remapImages( $legacyImages, $ttIdMap );
         $remappedSettings = TermArtworkMapper::remapSettings( $legacySettings );
 
-        $this->writeOption( Identifiers::OPTION_TERM_IMAGES, $remappedImages['images'] );
+        // Only write images if there is something to write — an empty result
+        // (legacy plugin had no artwork, or every legacy tt_id was orphaned and
+        // dropped) must not stamp an empty array over a church's native
+        // sermonator_term_images. This mirrors the settings guard below: when
+        // there is nothing to migrate we leave native config untouched and take
+        // no backup. A clobbered-then-emptied native value would be recoverable
+        // from OPTION_PRE_MIGRATION_BACKUP, but needlessly destroying a working
+        // native config when we have nothing to offer is the wrong default.
+        if ( $remappedImages['images'] !== array() ) {
+            $this->writeOption( Identifiers::OPTION_TERM_IMAGES, $remappedImages['images'] );
+        }
 
         // Only write settings if the legacy plugin had any — an empty settings
         // option should not stamp an empty array over a church's native settings.

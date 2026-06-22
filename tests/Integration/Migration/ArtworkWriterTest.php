@@ -30,7 +30,13 @@ use Sermonator\Tests\Integration\Support\LegacyFixture;
  *    pass through verbatim;
  *  - add_option-FIRST + backup: a pre-existing NATIVE sermonator_term_images
  *    is backed up to OPTION_PRE_MIGRATION_BACKUP, never blind-clobbered;
- *  - re-run idempotent (no duplicate writes, stable result);
+ *  - new-tt_id collision (two legacy tt_ids → one new tt_id): first-wins, no
+ *    silent overwrite; collision returned AND persisted;
+ *  - re-run idempotent (no duplicate writes, stable result); a re-run over a
+ *    pre-existing native value does NOT re-back-up (never clobbers the preserved
+ *    native value with the migrated one);
+ *  - empty result never stamps an empty array over native config (no clobber,
+ *    no backup when there is nothing to migrate);
  *  - dropped/conflicts persisted, not merely returned;
  *  - legacy options byte-for-byte unchanged.
  */
@@ -186,6 +192,142 @@ final class ArtworkWriterTest extends WP_UnitTestCase {
         // Persisted (not just returned) for verification / review.
         $persisted = ArtworkWriter::persistedFlags();
         $this->assertContains( 888888, $persisted['dropped'] );
+    }
+
+    /**
+     * The CONFLICT branch of must_handle: two distinct legacy tt_ids that map to
+     * the SAME new tt_id (e.g. a term-collision dedup collapsed two legacy terms
+     * into one new term). The colliding new tt_id must be written exactly once
+     * (FIRST-WINS, never silently overwritten by the later attachment), and the
+     * collision must be both RETURNED and PERSISTED so the verifier can flag it.
+     *
+     * The live TermCrosswalk reader is exercised end-to-end: ttIdMap() reads the
+     * LEGACY_TERM_TT_ID back-ref termmeta joined to each new term's current
+     * tt_id. We reproduce a real dedup-collapse by stamping a SECOND
+     * LEGACY_TERM_TT_ID back-ref (a second legacy tt_id) onto the already-migrated
+     * preacher term — exactly the corrupt/collapsed state the reader can surface.
+     * Only sermonator-owned termmeta on the NEW term is touched; legacy data is
+     * never mutated, and the legacy artwork option is read READ-ONLY.
+     */
+    public function test_colliding_new_tt_id_first_wins_and_conflict_recorded(): void {
+        $tt = $this->migrateTwoTermsTtMap();
+
+        $newTtId       = $tt['newPreacherTt'];
+        $legacyTtFirst = $tt['preacherLegacyTt'];
+
+        // A distinct legacy tt_id that does NOT correspond to any real legacy
+        // term — it must collapse onto the SAME new tt_id as legacyTtFirst.
+        $legacyTtSecond = $legacyTtFirst + 100000;
+
+        // Resolve the new preacher term_id from the new tt_id we already hold,
+        // then stamp a second legacy-tt_id back-ref onto it so ttIdMap() yields
+        // two legacy tt_ids → one new tt_id.
+        global $wpdb;
+        $newTermId = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT term_id FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id = %d",
+                $newTtId
+            )
+        );
+        add_term_meta(
+            $newTermId,
+            \Sermonator\Migration\Crosswalk::LEGACY_TERM_TT_ID,
+            $legacyTtSecond,
+            false
+        );
+
+        // First-seen legacy tt_id carries 500, the colliding one carries 600.
+        // remapImages iterates in legacy-array order, so 500 must win.
+        $this->fixture->seedArtwork(
+            array(
+                $legacyTtFirst  => 500,
+                $legacyTtSecond => 600,
+            )
+        );
+
+        $result = ( new ArtworkWriter() )->migrate( new TermCrosswalk() );
+
+        // Exactly one image written; first-wins, no silent overwrite.
+        $this->assertSame( 1, $result['written'] );
+        $this->assertContains( $newTtId, $result['conflicts'] );
+
+        $target = get_option( Identifiers::OPTION_TERM_IMAGES );
+        $this->assertSame( 500, $target[ $newTtId ], 'Collision must keep the first attachment, not the overwriting one.' );
+        $this->assertNotContains( 600, $target );
+
+        // Persisted (not just returned) for verification / review.
+        $persisted = ArtworkWriter::persistedFlags();
+        $this->assertContains( $newTtId, $persisted['conflicts'] );
+    }
+
+    /**
+     * The load-bearing idempotency-of-backup case: a church has a PRE-EXISTING
+     * native sermonator_term_images, and migrate() runs TWICE. The first run must
+     * back up the native value; the second run must NOT re-back-up (which would
+     * clobber the preserved native value with the migrated value WE wrote on the
+     * first run, permanently destroying the church's original config). The backup
+     * must equal the ORIGINAL native value after BOTH runs.
+     */
+    public function test_rerun_with_preexisting_native_does_not_clobber_backup(): void {
+        $tt = $this->migrateTwoTermsTtMap();
+
+        // (1) Church's own pre-existing native value.
+        $native = array( 42 => 9000 );
+        add_option( Identifiers::OPTION_TERM_IMAGES, $native );
+
+        // (2) Legacy artwork to migrate over it.
+        $this->fixture->seedArtwork( array( $tt['preacherLegacyTt'] => 500 ) );
+
+        // (3) Run twice.
+        $writer = new ArtworkWriter();
+        $writer->migrate( new TermCrosswalk() );
+
+        $backupAfterFirst = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        $this->assertIsArray( $backupAfterFirst );
+        $this->assertSame( $native, $backupAfterFirst[ Identifiers::OPTION_TERM_IMAGES ] );
+
+        $writer->migrate( new TermCrosswalk() );
+
+        $backupAfterSecond = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        $this->assertSame(
+            $native,
+            $backupAfterSecond[ Identifiers::OPTION_TERM_IMAGES ],
+            'Second run re-backed-up, clobbering the preserved native value with the migrated one.'
+        );
+
+        // The migrated value remains in place; the native value is recoverable.
+        $target = get_option( Identifiers::OPTION_TERM_IMAGES );
+        $this->assertSame( 500, $target[ $tt['newPreacherTt'] ] );
+    }
+
+    /**
+     * Asymmetric-clobber guard (mirrors the settings path): when the legacy
+     * plugin has NO artwork at all, a church's pre-existing native
+     * sermonator_term_images must be left byte-for-byte untouched and NO backup
+     * taken — there is nothing to migrate, so we must not destroy working native
+     * config.
+     */
+    public function test_native_target_untouched_when_no_legacy_artwork(): void {
+        $this->migrateTwoTermsTtMap();
+
+        $native = array( 42 => 9000 );
+        add_option( Identifiers::OPTION_TERM_IMAGES, $native );
+
+        // No legacy artwork seeded at all.
+        $result = ( new ArtworkWriter() )->migrate( new TermCrosswalk() );
+
+        $this->assertSame( 0, $result['written'] );
+
+        // Native value untouched, byte-for-byte.
+        $this->assertSame( $native, get_option( Identifiers::OPTION_TERM_IMAGES ) );
+
+        // No backup taken — we never touched the key.
+        $backup = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        if ( is_array( $backup ) ) {
+            $this->assertArrayNotHasKey( Identifiers::OPTION_TERM_IMAGES, $backup );
+        } else {
+            $this->assertFalse( $backup );
+        }
     }
 
     public function test_legacy_options_byte_equal_before_and_after(): void {
