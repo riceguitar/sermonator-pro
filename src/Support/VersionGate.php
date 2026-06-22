@@ -19,6 +19,10 @@ final class VersionGate {
     }
 
     public function failureMessage(): string {
+        if ( version_compare( $this->phpVersion, self::MIN_PHP, '>=' ) && version_compare( $this->wpVersion, self::MIN_WP, '>=' ) ) {
+            return '';
+        }
+
         $problems = array();
         if ( version_compare( $this->phpVersion, self::MIN_PHP, '<' ) ) {
             $problems[] = sprintf( 'PHP %s+ (you have %s)', self::MIN_PHP, $this->phpVersion );
