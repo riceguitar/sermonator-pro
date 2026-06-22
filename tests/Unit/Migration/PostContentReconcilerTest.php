@@ -40,4 +40,30 @@ final class PostContentReconcilerTest extends TestCase {
         $this->assertNull( $out['backup'] );
         $this->assertFalse( $out['flag'] );
     }
+
+    public function test_body_only_in_post_content_temp_is_preserved(): void {
+        $out = PostContentReconciler::reconcile( '', null, 'Only in temp backup' );
+        $this->assertSame( '', $out['content'] );
+        $this->assertStringContainsString( 'Only in temp backup', (string) $out['backup'] );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_temp_text_within_description_not_backed_up(): void {
+        $out = PostContentReconciler::reconcile( '', '<p>Full body here</p>', 'Full body here' );
+        $this->assertNull( $out['backup'] );
+        $this->assertFalse( $out['flag'] );
+    }
+
+    public function test_shortcode_blob_not_discarded_even_if_text_contained(): void {
+        $out = PostContentReconciler::reconcile( '[audio src="x.mp3"]Intro', '<p>Intro</p>', null );
+        $this->assertNotNull( $out['backup'] );   // shortcode carries data the plain text doesn't
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_old_and_temp_both_unique_single_flag_distinct_backup(): void {
+        $out = PostContentReconciler::reconcile( 'Alpha unique', 'desc', 'Beta unique' );
+        $this->assertStringContainsString( 'Alpha unique', (string) $out['backup'] );
+        $this->assertStringContainsString( 'Beta unique', (string) $out['backup'] );
+        $this->assertTrue( $out['flag'] );
+    }
 }
