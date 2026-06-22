@@ -29,6 +29,6 @@ final class Plugin {
             return;
         }
 
-        // Registrar + Capabilities are wired here in Tasks 4 and 5.
+        ( new \Sermonator\Model\Registrar() )->hook();
     }
 }
