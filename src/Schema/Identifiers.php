@@ -27,10 +27,15 @@ final class Identifiers {
     public const META_BULLETIN       = 'sermonator_bulletin';
     public const META_VIEWS          = 'sermonator_views';
 
-    public const OPTION_PREFIX          = 'sermonator_';
-    public const META_PODCAST_SETTINGS  = 'sermonator_podcast_settings';
-    public const OPTION_DEFAULT_PODCAST = 'sermonator_default_podcast';
-    public const OPTION_TERM_IMAGES     = 'sermonator_term_images';
+    public const OPTION_PREFIX                  = 'sermonator_';
+    public const META_PODCAST_SETTINGS          = 'sermonator_podcast_settings';
+    public const OPTION_DEFAULT_PODCAST         = 'sermonator_default_podcast';
+    public const OPTION_TERM_IMAGES             = 'sermonator_term_images';
+    public const OPTION_TERM_IMAGES_SETTINGS    = 'sermonator_term_images_settings';
+    public const OPTION_MIGRATION_STATE         = 'sermonator_migration_state';
+    public const OPTION_PRE_MIGRATION_BACKUP    = 'sermonator_pre_migration_backup';
+    public const OPTION_MIGRATION_PROGRESS      = 'sermonator_migration_progress';
+    public const META_DATE_NORMALIZED           = 'sermonator_date_normalized';
 
     /** @return list<string> The five sermon taxonomy slugs, in display order. */
     public static function sermonTaxonomies(): array {
