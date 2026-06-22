@@ -15,7 +15,7 @@ Today there are two plugins in this problem space:
 
 **Governing standard:** data preservation and reuse is the highest bar — it outranks clean architecture and every other concern. Any tradeoff that touches data is decided in favor of data safety.
 
-**Decomposition:** "Sermonator" is six sub-projects (1: data foundation + migration; 2: admin/editing; 3: podcast feed generation; 4: front-end; 5: importers; 6: licensing/distribution). This spec covers **sub-project 1 only** — the data model and the migration engine that every other piece sits on.
+**Decomposition:** "Sermonator" is six sub-projects (1: data foundation + migration; 2: admin/editing; 3: podcast feed generation; 4: front-end; 5: importers; 6: distribution & extensibility — **no monetization**). This spec covers **sub-project 1 only** — the data model and the migration engine that every other piece sits on.
 
 ## 2. Constraints (decided)
 
@@ -25,6 +25,7 @@ Today there are two plugins in this problem space:
 - **Window behaviour:** a **verification window**, not parallel operation. Flow is migrate → verify → switch → finalize. No live dual-entry, so no delta/re-sync engine.
 - **Approach:** faithful WP-API copy-forward migrator (records recreated via WordPress core functions), not raw SQL and not WXR re-import.
 - **No custom DB tables** (consistent with Sermon Manager). All state lives in options + back-reference meta.
+- **No monetization; open source.** Zero licensing/upsell/paid-update/telemetry code anywhere in Sermonator. Licensed **GPL-2.0-or-later**, no warranties. The legacy WHMCS/EDD licensing, self-hosted update server, and Intercom/Freshchat are removed, not ported. Any future monetization is via separate addon plugins/services — so the core ships clean extension points, never paywalls.
 
 ## 3. Success criterion (acceptance gate)
 

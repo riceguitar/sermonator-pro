@@ -21,6 +21,7 @@
 - **Capabilities:** `sermonator_sermon` caps + `manage_sermonator_categories` + `manage_sermonator_settings`, granted to admin/editor/author.
 - **Single-site only** (multisite out of scope).
 - **Data preservation is the highest bar** — nothing in this plan touches legacy `wpfc_*` data.
+- **No monetization; open source.** Zero licensing/upsell/paid-update/telemetry code. Licensed **GPL-2.0-or-later**, no warranties. Future monetization (if any) lives in separate addons — ship clean extension points, none today.
 
 ---
 
@@ -161,11 +162,25 @@ final class Plugin {
 Run: `composer install`
 Expected: `vendor/autoload.php` exists; no errors.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add the open-source license and readme**
+
+Sermonator is open source under GPL-2.0-or-later, with no monetization and no warranty. Create `LICENSE` containing the standard GPL-2.0 text (verbatim from https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt), and create `readme.txt`:
+
+```
+=== Sermonator ===
+Requires at least: 6.0
+Requires PHP: 8.1
+License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+
+Sermon management for WordPress. Free and open source. No monetization, no warranty of any kind.
+```
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add composer.json composer.lock sermonator.php src/Plugin.php
-git commit -m "feat: plugin scaffold, PSR-4 autoload, boot entry"
+git add composer.json composer.lock sermonator.php src/Plugin.php LICENSE readme.txt
+git commit -m "feat: plugin scaffold, PSR-4 autoload, boot entry, GPL license"
 ```
 
 ---
