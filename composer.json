@@ -1,0 +1,22 @@
+{
+  "name": "sermonator/sermonator",
+  "description": "Sermon management for WordPress.",
+  "type": "wordpress-plugin",
+  "license": "GPL-2.0-or-later",
+  "require": {
+    "php": ">=8.1"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^9.6",
+    "yoast/wp-test-utils": "^1.2"
+  },
+  "autoload": {
+    "psr-4": { "Sermonator\\": "src/" }
+  },
+  "autoload-dev": {
+    "psr-4": { "Sermonator\\Tests\\": "tests/" }
+  },
+  "config": {
+    "allow-plugins": { "composer/installers": true }
+  }
+}
