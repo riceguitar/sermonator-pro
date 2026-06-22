@@ -58,11 +58,11 @@ final class Registrar {
 
     private function registerTaxonomies(): void {
         $labels = array(
-            Identifiers::TAX_PREACHER     => array( 'Preachers', 'Preacher' ),
-            Identifiers::TAX_SERIES       => array( 'Series', 'Series' ),
-            Identifiers::TAX_TOPIC        => array( 'Topics', 'Topic' ),
-            Identifiers::TAX_BOOK         => array( 'Books', 'Book' ),
-            Identifiers::TAX_SERVICE_TYPE => array( 'Service Types', 'Service Type' ),
+            Identifiers::TAX_PREACHER     => array( __( 'Preachers', 'sermonator' ), __( 'Preacher', 'sermonator' ) ),
+            Identifiers::TAX_SERIES       => array( __( 'Series', 'sermonator' ), __( 'Series', 'sermonator' ) ),
+            Identifiers::TAX_TOPIC        => array( __( 'Topics', 'sermonator' ), __( 'Topic', 'sermonator' ) ),
+            Identifiers::TAX_BOOK         => array( __( 'Books', 'sermonator' ), __( 'Book', 'sermonator' ) ),
+            Identifiers::TAX_SERVICE_TYPE => array( __( 'Service Types', 'sermonator' ), __( 'Service Type', 'sermonator' ) ),
         );
 
         foreach ( Identifiers::sermonTaxonomies() as $taxonomy ) {

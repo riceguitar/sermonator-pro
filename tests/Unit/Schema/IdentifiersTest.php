@@ -39,6 +39,7 @@ final class IdentifiersTest extends TestCase {
 
     public function test_identifiers_are_unique(): void {
         $all = array_merge(
+            array( Identifiers::POST_TYPE_SERMON, Identifiers::POST_TYPE_PODCAST ),
             Identifiers::sermonTaxonomies(),
             Identifiers::metaKeys()
         );

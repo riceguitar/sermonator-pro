@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Sermonator\Model;
 
-use Sermonator\Schema\Identifiers;
-
 final class Capabilities {
     /** Caps every editing role gets. */
     private const BASE_CAPS = array(
@@ -38,18 +36,6 @@ final class Capabilities {
         $this->addTo( 'administrator', array_merge( self::BASE_CAPS, self::ELEVATED_CAPS, self::ADMIN_ONLY_CAPS ) );
         $this->addTo( 'editor', array_merge( self::BASE_CAPS, self::ELEVATED_CAPS ) );
         $this->addTo( 'author', self::BASE_CAPS );
-    }
-
-    /**
-     * Capability map for register_post_type( capability_type => sermonator_sermon ).
-     *
-     * @return array<string,string>
-     */
-    public static function sermonCaps(): array {
-        return array(
-            'manage_sermonator_categories' => 'manage_sermonator_categories',
-            'manage_sermonator_settings'   => 'manage_sermonator_settings',
-        );
     }
 
     /** @param list<string> $caps */
