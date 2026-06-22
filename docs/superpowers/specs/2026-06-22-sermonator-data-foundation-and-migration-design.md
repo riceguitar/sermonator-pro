@@ -70,13 +70,14 @@ All standard WP tables. No custom tables.
 **Taxonomies** (non-hierarchical; final slugs adjustable)
 `sermonator_preacher`, `sermonator_series`, `sermonator_topic`, `sermonator_book`, `sermonator_service_type`.
 
+**Bible books are a fixed-but-extensible taxonomy.** `sermonator_book` ships seeded with a default canon, but it remains a normal, admin-editable taxonomy: a Catholic or Orthodox church can add deuterocanonical books (Tobit, Judith, Wisdom, Sirach, Baruch, 1–2 Maccabees, etc.). Migration consequences: **every existing book term is preserved, including any custom books a church already added**, and any later "sort books in biblical order" feature must tolerate non-canonical / user-added books gracefully (no crash, sensible fallback ordering).
+
 **Per-sermon meta**
 
 | New key | Holds |
 |---|---|
 | `sermonator_date` / `sermonator_date_auto` | preached date (Unix) + auto flag |
 | `sermonator_bible_passage` | passage text |
-| `sermonator_description` | sermon body (WYSIWYG HTML) |
 | `sermonator_audio` / `sermonator_audio_id` | audio URL / attachment id |
 | `_sermonator_audio_duration` / `_sermonator_audio_size` | hh:mm:ss / bytes |
 | `sermonator_video_embed` / `sermonator_video_url` | video embed / link |
@@ -90,6 +91,8 @@ All standard WP tables. No custom tables.
 
 **Term/series artwork:** the bundled taxonomy-images association option (term_id → attachment_id) → a `sermonator_` term-image option.
 
+**Sermon body lives in native `post_content`** (decided). `sermonator_sermon` supports the editor; the body is the WordPress content, not a custom field. There is no `sermonator_description` meta key. See §6 for how the old `sermon_description` is moved into `post_content` during migration.
+
 **Capabilities:** `sermonator_sermon` caps + `manage_sermonator_categories` + `manage_sermonator_settings`, granted to admin/editor/author (mirrors current roles).
 
 **Engine-owned options:** `sermonator_version`, `sermonator_migration_state` (state machine + progress + manifest reference).
@@ -100,11 +103,11 @@ All standard WP tables. No custom tables.
 
 ## 6. The Mapping Contract
 
-**① Sermons** (`wpfc_sermon` → `sermonator_sermon`): every post column copied verbatim (title, content, excerpt, author, `post_date`/`_gmt`, status, slug, comment/ping status, menu_order, password, parent). Only `post_type` changes. New post ID recorded via back-ref crosswalk.
+**① Sermons** (`wpfc_sermon` → `sermonator_sermon`): every post column copied verbatim (title, excerpt, author, `post_date`/`_gmt`, status, slug, comment/ping status, menu_order, password, parent) **except `post_content`**, which is sourced from the old `sermon_description` (see the tricky cases below). `post_type` and `post_content` change; everything else is identical. New post ID recorded via back-ref crosswalk.
 
 **② Terms** (5 taxonomies): create each `sermonator_` term mirroring name/slug/description; record per-taxonomy crosswalk. **Orphan terms (zero sermons) are still migrated.** New sermons assigned new terms via crosswalk.
 
-**③ Sermon meta:** known keys re-prefixed per §5. **Critical fidelity rule: all other post meta is copied verbatim under its original key** (Yoast/SEO, custom fields, other-plugin meta). Known keys remapped; everything else moves unchanged. The migration never drops an unrecognized meta row.
+**③ Sermon meta:** known keys re-prefixed per §5 (note: `sermon_description` is *not* re-prefixed — it becomes `post_content`, see the tricky cases). **Critical fidelity rule: all other post meta is copied verbatim under its original key** (Yoast/SEO, custom fields, other-plugin meta). Known keys remapped; everything else moves unchanged. The migration never drops an unrecognized meta row.
 
 **④ Comments:** copied to the new post (new comment IDs), preserving author, date, content, threading, approval status.
 
@@ -115,7 +118,7 @@ All standard WP tables. No custom tables.
 **⑦ Settings:** `sermonmanager_*` → `sermonator_*`, values verbatim. Pro's front-end-only options (page assignment, template, licensing) are out of scope.
 
 **Tricky cases (explicit):**
-- **`post_content` ↔ `sermon_description`:** both copied verbatim (→ `post_content` and `sermonator_description`). The verifier **flags** any sermon whose `post_content` holds substantive text not reflected in `sermon_description` (the rare "body lives only in the editor" case) for human review — never dropped. Pro's `post_content_temp` backup is carried across namespaced (`_sermonator_legacy_post_content_temp`).
+- **Sermon body → `post_content`:** the authoritative rich body lives in the old `sermon_description` meta, while the old `post_content` is a degraded, auto-generated text blob (SM's "Bible Text | Preacher | Series | …" render). Rule: **new `post_content` = old `sermon_description`**; the old derived `post_content` blob is **discarded** (it is regenerable and carries no unique data). Safety net for weird installs: if the old `post_content` (or Pro's `post_content_temp` backup) contains substantive text that is **not** present in `sermon_description`, that text is preserved in `_sermonator_legacy_post_content` and **flagged** for human review — never silently dropped. (During the reversible window the originals are untouched regardless, so nothing is at risk before Finalize.)
 - **Legacy date formats:** copy the raw `sermon_date` value verbatim to `sermonator_date`; if non-numeric, additionally store a normalized timestamp, keep the raw original, and flag it. Never overwrite the original interpretation with a guess.
 - **Absent companions** (`sermon_audio_id`, duration, size for external/remote files): simply absent — not an error.
 - **Idempotency:** the crosswalk means a re-run skips already-migrated records.
@@ -161,7 +164,9 @@ none → detected → migrating → migrated → verified → finalized
 - **Finalize is the only irreversible action** — gated behind `verified` state + explicit confirmation + its own pre-finalize manifest.
 - **Version gate & coexistence:** below PHP 8.1/WP 6.0 → no migration, data untouched. During the window, old plugins and Sermonator coexist without collision (fully disjoint namespaces).
 
-**Edge-case catalog (each gets a test):** 10k–50k-sermon archives; legacy/empty dates; body-only-in-`post_content`; orphan / shared / duplicate-named terms; missing/external media (referenced, not re-fetched); other-plugin/custom meta; idempotent re-runs; fresh installs with nothing to migrate; free-only installs (no feeds); source edited between detect and migrate (manifest-checksum warning → re-detect). **Multisite:** single-site first-class; multisite detected and migrated per-site — flagged as a risk to validate explicitly.
+**Edge-case catalog (each gets a test):** 10k–50k-sermon archives; legacy/empty dates; body-only-in-`post_content`; orphan / shared / duplicate-named terms; custom/added Bible-book terms (Catholic/Orthodox deuterocanon); missing/external media (referenced, not re-fetched); other-plugin/custom meta; idempotent re-runs; fresh installs with nothing to migrate; free-only installs (no feeds); source edited between detect and migrate (manifest-checksum warning → re-detect).
+
+**Multisite is out of scope for sub-project 1** (single-site only). Network/multisite support comes in a later iteration; the migration may assume a single site for now.
 
 ## 9. Testing strategy
 
@@ -170,13 +175,15 @@ none → detected → migrating → migrated → verified → finalized
 - **Full-cycle integration test:** detect → migrate → verify (green reconciliation) → **rollback (legacy tables byte-for-byte unchanged)** → re-migrate (identical, idempotent) → finalize (legacy gone, new intact).
 - **Reconciliation/property tests:** counts, checksums, "every source meta row has a target home."
 - **Scale test:** 10k generated sermons complete in bounded batches, no timeout/memory blowup.
-- **CI matrix:** PHP 8.1/8.2/8.3 × WP 6.x × single + multisite.
+- **CI matrix:** PHP 8.1/8.2/8.3 × WP 6.x (single-site; multisite deferred).
 
 ## 10. Deferred decisions & out of scope
 
-**Deferred to later sub-projects (intentionally not decided here):**
-- *Canonical body location going forward* (`post_content` vs `sermonator_description`) → sub-project 2 (admin/editing). This spec faithfully preserves both.
+**Decided since first draft:** sermon body lives in native `post_content` (no `sermonator_description` meta); `sermonator_book` is a seeded-but-extensible taxonomy; multisite is out of scope for now.
+
+**Still deferred to later sub-projects (intentionally not decided here):**
 - Final taxonomy slug names (proposed in §5; adjustable before implementation).
 - Exact enumerated list of the ~50 `sermonmanager_*` → `sermonator_*` settings (mechanical; produced during implementation from the settings classes).
+- Multisite / network-install support (a later iteration).
 
 **Out of scope for sub-project 1:** sermon-editing UI beyond the wizard; front-end rendering; podcast feed *output*; SermonBrowser/Series Engine/WXR importers; licensing & distribution. Each is a later sub-project that depends on this foundation.
