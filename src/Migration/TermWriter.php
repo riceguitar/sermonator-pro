@@ -128,4 +128,119 @@ final class TermWriter {
 
         return $newTermId;
     }
+
+    /**
+     * Migrate EVERY legacy term across all five legacy taxonomies into their
+     * mapped target taxonomies.
+     *
+     * Iteration order is canonical (LegacyIdentifiers::sermonTaxonomies()).
+     * Orphan terms — attached to no posts — are included via hide_empty=false,
+     * so nothing is silently left behind. Each term is delegated to
+     * migrateTerm(), which is itself idempotent on the cache-safe back-ref
+     * probe, making migrateAll fully resumable: a second run skips every
+     * already-crosswalked term and creates zero duplicate terms, back-refs, or
+     * flag rows.
+     *
+     * HARD UNIQUENESS GUARD: after processing each legacy term we re-query the
+     * authoritative back-ref directly and assert it maps to EXACTLY one new term
+     * in the target taxonomy. A >1 state means a prior run (or external
+     * corruption) produced a duplicate crosswalk — we stop loudly with a
+     * reconciliation error rather than let a divergent mapping propagate into
+     * the artwork/term-assignment writers that depend on a single deterministic
+     * target id.
+     *
+     * @return array{migrated:int, skipped:int, flags:list<string>}
+     */
+    public function migrateAll(): array {
+        $migrated = 0;
+        $skipped  = 0;
+        $flags    = array();
+
+        foreach ( LegacyIdentifiers::sermonTaxonomies() as $legacyTaxonomy ) {
+            $targetTaxonomy = MappingContract::taxonomyMap()[ $legacyTaxonomy ];
+
+            $terms = get_terms(
+                array(
+                    'taxonomy'   => $legacyTaxonomy,
+                    'hide_empty' => false,
+                )
+            );
+
+            if ( is_wp_error( $terms ) ) {
+                throw new \RuntimeException( sprintf(
+                    'TermWriter::migrateAll: failed to read legacy taxonomy %s: %s',
+                    $legacyTaxonomy,
+                    $terms->get_error_message()
+                ) );
+            }
+
+            foreach ( $terms as $legacyTerm ) {
+                $legacyTermId = (int) $legacyTerm->term_id;
+
+                // Was this legacy term already crosswalked before we touched it?
+                // (status of the probe BEFORE delegating decides migrated/skipped).
+                $alreadyMigrated = Crosswalk::findNewTermByLegacyId( $legacyTermId, $targetTaxonomy ) !== null;
+
+                $this->migrateTerm( $legacyTaxonomy, $legacyTerm );
+
+                if ( $alreadyMigrated ) {
+                    $skipped++;
+                } else {
+                    $migrated++;
+                }
+
+                // Hard uniqueness guard: re-probe the raw back-ref count. Run for
+                // EVERY processed term (migrated or skipped) so a pre-existing
+                // duplicate crosswalk — which migrateTerm short-circuits on — is
+                // still caught.
+                $mappedCount = $this->countNewTermsForLegacyId( $legacyTermId, $targetTaxonomy );
+                if ( $mappedCount > 1 ) {
+                    throw new \RuntimeException( sprintf(
+                        'TermWriter::migrateAll: reconciliation error — legacy term id %d in %s maps to %d new terms in %s.',
+                        $legacyTermId,
+                        $legacyTaxonomy,
+                        $mappedCount,
+                        $targetTaxonomy
+                    ) );
+                }
+
+                foreach ( get_term_meta( $this->resolveNewTermId( $legacyTermId, $targetTaxonomy ), Crosswalk::MIGRATION_FLAGS, false ) as $flag ) {
+                    $flags[] = (string) $flag;
+                }
+            }
+        }
+
+        return array(
+            'migrated' => $migrated,
+            'skipped'  => $skipped,
+            'flags'    => array_values( $flags ),
+        );
+    }
+
+    /**
+     * Count the distinct new terms carrying the legacy back-ref in a target
+     * taxonomy. Reads $wpdb directly (cache-safe) so a term inserted moments
+     * earlier on this same run is counted — the uniqueness guard cannot rely on
+     * a stale term cache.
+     */
+    private function countNewTermsForLegacyId( int $legacyTermId, string $targetTaxonomy ): int {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT DISTINCT tm.term_id FROM {$wpdb->termmeta} tm"
+                . " INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = tm.term_id"
+                . " WHERE tm.meta_key = %s AND tm.meta_value = %d AND tt.taxonomy = %s",
+                Crosswalk::LEGACY_TERM_ID,
+                $legacyTermId,
+                $targetTaxonomy
+            )
+        );
+
+        return count( (array) $ids );
+    }
+
+    private function resolveNewTermId( int $legacyTermId, string $targetTaxonomy ): int {
+        return (int) Crosswalk::findNewTermByLegacyId( $legacyTermId, $targetTaxonomy );
+    }
 }
