@@ -27,6 +27,11 @@ final class Identifiers {
     public const META_BULLETIN       = 'sermonator_bulletin';
     public const META_VIEWS          = 'sermonator_views';
 
+    public const OPTION_PREFIX          = 'sermonator_';
+    public const META_PODCAST_SETTINGS  = 'sermonator_podcast_settings';
+    public const OPTION_DEFAULT_PODCAST = 'sermonator_default_podcast';
+    public const OPTION_TERM_IMAGES     = 'sermonator_term_images';
+
     /** @return list<string> The five sermon taxonomy slugs, in display order. */
     public static function sermonTaxonomies(): array {
         return array(
