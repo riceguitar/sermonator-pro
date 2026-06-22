@@ -62,10 +62,9 @@ final class Detector {
     }
 
     private function sermonChecksum( int $id ): string {
-        $post = get_post( $id );
-        $meta = get_post_meta( $id );
-        ksort( $meta );
-        return md5( ( $post ? $post->post_content : '' ) . wp_json_encode( $meta ) );
+        // Delegate to the shared, encoding-hardened implementation so the
+        // Detector and the Verifier cannot drift apart.
+        return LegacyChecksum::forPost( $id );
     }
 
     private function countLegacyOptions(): int {
