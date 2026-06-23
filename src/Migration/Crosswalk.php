@@ -106,6 +106,28 @@ final class Crosswalk {
     }
 
     /**
+     * How many migrated posts of a type carry a given legacy source id. The
+     * Verifier uses this to assert EXACTLY ONE counterpart per legacy id: where
+     * findNewByLegacyId silently collapses a corrupt >1 state to the lowest id
+     * (so a duplicate counterpart would otherwise verify clean), this exposes the
+     * true cardinality so a surplus counterpart is caught.
+     */
+    public static function countNewByLegacyId( int $legacyPostId, string $postType = Identifiers::POST_TYPE_SERMON ): int {
+        global $wpdb;
+
+        return (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(DISTINCT pm.post_id) FROM {$wpdb->postmeta} pm"
+                . " INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id"
+                . " WHERE pm.meta_key = %s AND pm.meta_value = %d AND p.post_type = %s",
+                self::LEGACY_POST_ID,
+                $legacyPostId,
+                $postType
+            )
+        );
+    }
+
+    /**
      * Stamp a migrated term with BOTH legacy back-refs — its source term_id and
      * its source term_taxonomy_id — the crash-safety spine for terms, written
      * immediately after the term is inserted. Each is a single row (unique=true)

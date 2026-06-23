@@ -48,26 +48,6 @@ final class OptionWriter {
     private const PROGRESS_KEY = 'options';
 
     /**
-     * The CLOSED set of new option names whose VALUES embed legacy TERM IDs —
-     * either as a top-level scalar or recursively within an array. All are
-     * translated via TermCrosswalk::newTermId() (type-preserving; recursing into
-     * arrays) before writing. Any unresolvable positive id is left verbatim and
-     * flagged with missing_option_id_crosswalk:<optionName>.
-     *
-     * Attachment ids in options are SHARED globals (same id in both schemas)
-     * and are intentionally excluded — they never need remapping.
-     *
-     * @var list<string>
-     */
-    private const TERM_ID_OPTIONS = array(
-        'sermonator_default_series',
-        'sermonator_default_preacher',
-        'sermonator_default_service_type',
-        'sermonator_default_book',
-        'sermonator_default_topic',
-    );
-
-    /**
      * @return array{written: int, backed_up: int}
      */
     public function migrate(): array {
@@ -85,8 +65,10 @@ final class OptionWriter {
         $crosswalk   = new TermCrosswalk();
 
         foreach ( $mapped as $name => $value ) {
-            // Translate known id-bearing option values before writing.
-            $remapped = $this->remapEmbeddedIds( $name, $value, $crosswalk );
+            // Translate known id-bearing option values before writing — via the
+            // SHARED OptionIdRemapper so the Verifier computes the identical
+            // expected value and the two can never drift.
+            $remapped = OptionIdRemapper::remap( $name, $value, $crosswalk );
             $value    = $remapped['value'];
             $idFlags  = array_merge( $idFlags, $remapped['flags'] );
 
@@ -111,70 +93,6 @@ final class OptionWriter {
             'written'   => $written,
             'backed_up' => $backedUp,
         );
-    }
-
-    /**
-     * For KNOWN id-bearing options (TERM_ID_OPTIONS), translate all embedded
-     * legacy term ids to new term ids via TermCrosswalk — recursing into arrays
-     * so both scalar and array-valued options are covered (type-preserving:
-     * int→int, string→string). Returns the (possibly remapped) value and any
-     * missing-crosswalk flags.
-     *
-     * An unresolvable positive id is left VERBATIM and a
-     * missing_option_id_crosswalk:<optionName> flag is returned so a later
-     * self-heal pass can re-run once the term is migrated.
-     *
-     * Attachment ids are SHARED globals (same id in both schemas) — they do not
-     * appear in TERM_ID_OPTIONS and are intentionally left verbatim.
-     *
-     * @return array{value: mixed, flags: list<string>}
-     */
-    private function remapEmbeddedIds( string $optionName, mixed $value, TermCrosswalk $crosswalk ): array {
-        $flags = array();
-
-        if ( in_array( $optionName, self::TERM_ID_OPTIONS, true ) ) {
-            $value = $this->remapTermValue( $optionName, $value, $crosswalk, $flags );
-        }
-
-        return array( 'value' => $value, 'flags' => $flags );
-    }
-
-    /**
-     * Recursively translate legacy term ids embedded in a value (scalar or array).
-     *
-     * Positive integer values (int or numeric string) are looked up via
-     * TermCrosswalk::newTermId(). An unresolvable positive id is left verbatim and
-     * appends a missing_option_id_crosswalk:<optionName> flag. Non-positive or
-     * non-numeric scalars pass through unchanged. Arrays are recursed into.
-     * Type is preserved: an int input yields an int output; a string input yields a
-     * string output.
-     *
-     * @param list<string> $flags Accumulated by reference.
-     * @return mixed The (possibly remapped) value.
-     */
-    private function remapTermValue( string $optionName, mixed $value, TermCrosswalk $crosswalk, array &$flags ): mixed {
-        if ( is_array( $value ) ) {
-            $out = array();
-            foreach ( $value as $k => $v ) {
-                $out[ $k ] = $this->remapTermValue( $optionName, $v, $crosswalk, $flags );
-            }
-            return $out;
-        }
-
-        if ( is_int( $value ) || ( is_string( $value ) && ctype_digit( $value ) && '' !== $value ) ) {
-            $legacyTermId = (int) $value;
-            if ( $legacyTermId > 0 ) {
-                $newTermId = $crosswalk->newTermId( $legacyTermId );
-                if ( null !== $newTermId ) {
-                    // Type-preserving: if original was string, return string.
-                    return is_string( $value ) ? (string) $newTermId : $newTermId;
-                }
-                // Crosswalk not yet available — leave verbatim and flag for self-heal.
-                $flags[] = 'missing_option_id_crosswalk:' . $optionName;
-            }
-        }
-
-        return $value;
     }
 
     /**
