@@ -22,7 +22,9 @@ final class RendererTest extends TestCase {
         Functions\when( 'wp_kses_allowed_html' )->justReturn( array() );
         Functions\when( 'wp_oembed_get' )->justReturn( false );
         Functions\when( 'esc_html__' )->returnArg();
+        Functions\when( 'esc_attr__' )->returnArg();
         Functions\when( '__' )->returnArg();
+        Functions\when( 'get_the_post_thumbnail' )->justReturn( '' );
     }
 
     protected function tearDown(): void {
@@ -105,5 +107,46 @@ final class RendererTest extends TestCase {
         $html = ( new Renderer() )->meta( $this->view( array( 'ts' => 1734775200 ) ) );
         $this->assertStringContainsString( 'December 21, 2025', $html );
         $this->assertStringContainsString( 'sermonator-meta__date', $html );
+    }
+
+    public function test_card_links_title_and_shows_preacher_and_audio_badge(): void {
+        $html = ( new Renderer() )->card( $this->view( array( 'audio' => 'http://x/a.mp3' ) ) );
+        $this->assertStringContainsString( 'sermonator-card', $html );
+        $this->assertStringContainsString( '<a href="http://x/s/">T</a>', $html );
+        $this->assertStringContainsString( 'Pastor John', $html );
+        $this->assertStringContainsString( 'sermonator-card__badge', $html );
+    }
+
+    public function test_card_no_audio_badge_when_no_audio(): void {
+        $html = ( new Renderer() )->card( $this->view() );
+        $this->assertStringNotContainsString( 'sermonator-card__badge', $html );
+    }
+
+    public function test_grid_empty_state(): void {
+        $result = new \Sermonator\Frontend\QueryResult( array(), 0, 0, 1 );
+        $html   = ( new Renderer() )->grid( $result );
+        $this->assertStringContainsString( 'sermonator-grid__empty', $html );
+        $this->assertStringNotContainsString( 'sermonator-card', $html );
+    }
+
+    public function test_grid_renders_cards_with_columns(): void {
+        Functions\when( 'paginate_links' )->justReturn( '' );
+        $result = new \Sermonator\Frontend\QueryResult( array( $this->view(), $this->view() ), 2, 1, 1 );
+        $html   = ( new Renderer() )->grid( $result, array( 'columns' => 4 ) );
+        $this->assertStringContainsString( 'data-columns="4"', $html );
+        $this->assertSame( 2, substr_count( $html, 'sermonator-card"' ) );
+    }
+
+    public function test_pagination_empty_for_single_page(): void {
+        $result = new \Sermonator\Frontend\QueryResult( array( $this->view() ), 1, 1, 1 );
+        $this->assertSame( '', ( new Renderer() )->pagination( $result ) );
+    }
+
+    public function test_pagination_renders_for_multiple_pages(): void {
+        Functions\when( 'paginate_links' )->justReturn( '<ul class="page-numbers"><li>1</li></ul>' );
+        $result = new \Sermonator\Frontend\QueryResult( array( $this->view() ), 25, 3, 1 );
+        $html   = ( new Renderer() )->pagination( $result );
+        $this->assertStringContainsString( 'sermonator-pagination', $html );
+        $this->assertStringContainsString( 'page-numbers', $html );
     }
 }

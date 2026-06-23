@@ -72,6 +72,76 @@ final class Renderer {
         return (string) wp_date( (string) get_option( 'date_format' ), $v->preachedTimestamp );
     }
 
+    /** A compact sermon card for archive/grid lists. */
+    public function card( SermonView $v ): string {
+        $thumb = get_the_post_thumbnail( $v->id, 'medium', array( 'class' => 'sermonator-card__thumb', 'loading' => 'lazy' ) );
+        $thumb = is_string( $thumb ) ? $thumb : '';
+
+        $title = '<a href="' . esc_url( $v->permalink ) . '">' . esc_html( $v->title ) . '</a>';
+
+        $lines = '';
+        $date  = $this->dateLabel( $v );
+        if ( $date !== '' ) {
+            $lines .= '<span class="sermonator-card__date">' . esc_html( $date ) . '</span>';
+        }
+        if ( $v->preachers !== array() ) {
+            $names  = array_map( static fn( $p ) => $p['name'], $v->preachers );
+            $lines .= '<span class="sermonator-card__preacher">' . esc_html( implode( ', ', $names ) ) . '</span>';
+        }
+        if ( $v->biblePassage !== '' ) {
+            $lines .= '<span class="sermonator-card__passage">' . esc_html( $v->biblePassage ) . '</span>';
+        }
+        $badge = $v->audioUrl !== ''
+            ? '<span class="sermonator-card__badge" aria-label="' . esc_attr__( 'Has audio', 'sermonator' ) . '">♪</span>'
+            : '';
+
+        return '<article class="sermonator-card">'
+            . ( $thumb !== '' ? '<a class="sermonator-card__media" href="' . esc_url( $v->permalink ) . '">' . $thumb . '</a>' : '' )
+            . '<div class="sermonator-card__body">'
+            . '<h3 class="sermonator-card__title">' . $title . $badge . '</h3>'
+            . ( $lines !== '' ? '<div class="sermonator-card__meta">' . $lines . '</div>' : '' )
+            . '</div>'
+            . '</article>';
+    }
+
+    /**
+     * A grid of sermon cards with an empty-state and pagination.
+     *
+     * @param array{columns?:int} $opts
+     */
+    public function grid( QueryResult $result, array $opts = array() ): string {
+        if ( $result->isEmpty() ) {
+            return '<p class="sermonator-grid__empty">' . esc_html__( 'No sermons found.', 'sermonator' ) . '</p>';
+        }
+        $columns = isset( $opts['columns'] ) ? max( 1, min( 6, (int) $opts['columns'] ) ) : 3;
+
+        $cards = '';
+        foreach ( $result->sermons as $view ) {
+            $cards .= $this->card( $view );
+        }
+
+        return '<div class="sermonator-grid" data-columns="' . esc_attr( (string) $columns ) . '">' . $cards . '</div>'
+            . $this->pagination( $result );
+    }
+
+    public function pagination( QueryResult $result ): string {
+        if ( $result->totalPages <= 1 ) {
+            return '';
+        }
+        $links = paginate_links( array(
+            'total'     => $result->totalPages,
+            'current'   => $result->page,
+            'type'      => 'list',
+            'prev_text' => esc_html__( '« Previous', 'sermonator' ),
+            'next_text' => esc_html__( 'Next »', 'sermonator' ),
+        ) );
+        if ( ! is_string( $links ) || $links === '' ) {
+            return '';
+        }
+        // paginate_links() returns markup that is already escaped/built by core.
+        return '<nav class="sermonator-pagination" aria-label="' . esc_attr__( 'Sermons pagination', 'sermonator' ) . '">' . $links . '</nav>';
+    }
+
     /**
      * Allowed HTML for a stored video embed. wp_kses_post() strips <iframe>, which would
      * silently delete YouTube/Vimeo embeds, so we extend the post allowlist with iframe (and
