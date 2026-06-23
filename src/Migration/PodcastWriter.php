@@ -109,19 +109,26 @@ final class PodcastWriter {
         }
 
         $postarr = array(
-            'post_type'      => Identifiers::POST_TYPE_PODCAST,
-            'post_title'     => $legacy->post_title,
-            'post_author'    => $legacy->post_author,
-            'post_date'      => $legacy->post_date,
-            'post_date_gmt'  => $legacy->post_date_gmt,
-            'post_status'    => $legacy->post_status,
-            'post_name'      => $legacy->post_name,
-            'comment_status' => $legacy->comment_status,
-            'ping_status'    => $legacy->ping_status,
-            'menu_order'     => $legacy->menu_order,
-            'post_excerpt'   => $legacy->post_excerpt,
-            'post_password'  => $legacy->post_password,
-            'post_content'   => $legacy->post_content,
+            'post_type'              => Identifiers::POST_TYPE_PODCAST,
+            'post_title'             => $legacy->post_title,
+            'post_author'            => $legacy->post_author,
+            'post_date'              => $legacy->post_date,
+            'post_date_gmt'          => $legacy->post_date_gmt,
+            // Preserve the legacy LAST-MODIFIED timestamps verbatim (mirrors
+            // SermonWriter). Without these, wp_insert_post re-stamps
+            // post_modified[_gmt], losing the legacy feed last-modified ordering.
+            'post_modified'          => $legacy->post_modified,
+            'post_modified_gmt'      => $legacy->post_modified_gmt,
+            'post_status'            => $legacy->post_status,
+            'post_name'              => $legacy->post_name,
+            'comment_status'         => $legacy->comment_status,
+            'ping_status'            => $legacy->ping_status,
+            'menu_order'             => $legacy->menu_order,
+            'post_excerpt'           => $legacy->post_excerpt,
+            'post_password'          => $legacy->post_password,
+            'post_content'           => $legacy->post_content,
+            // Preserve the legacy content_filtered cache column verbatim.
+            'post_content_filtered'  => $legacy->post_content_filtered,
             // ATOMIC back-ref: write LEGACY_POST_ID in the SAME insert call so post
             // existence and the back-ref are one operation — a crash can no longer
             // leave a back-ref-less, duplicate-prone orphan. markLegacy still runs
@@ -178,6 +185,10 @@ final class PodcastWriter {
                     $flags[] = 'slug_changed';
                 }
             }
+
+            // Preserve the legacy last-modified timestamps. wp_insert_post FORCES
+            // post_modified[_gmt] to post_date on insert, so stamp them directly.
+            $this->preserveModifiedTimestamps( $newId, $legacy );
         }
 
         // Strip any prior missing_podcast_term_crosswalk:* flags before re-deriving
@@ -370,6 +381,34 @@ final class PodcastWriter {
         }
 
         return $value;
+    }
+
+    /**
+     * Stamp the legacy post_modified / post_modified_gmt onto the new post.
+     * wp_insert_post forces these columns to post_date on INSERT, so we write them
+     * directly via $wpdb and refresh the post cache. Idempotent (no-op when both
+     * columns already match), mirroring SermonWriter.
+     */
+    private function preserveModifiedTimestamps( int $newId, \WP_Post $legacy ): void {
+        $current = get_post( $newId );
+        if ( ! $current instanceof \WP_Post ) {
+            return;
+        }
+        if ( $current->post_modified === $legacy->post_modified
+            && $current->post_modified_gmt === $legacy->post_modified_gmt ) {
+            return;
+        }
+
+        global $wpdb;
+        $wpdb->update(
+            $wpdb->posts,
+            array(
+                'post_modified'     => $legacy->post_modified,
+                'post_modified_gmt' => $legacy->post_modified_gmt,
+            ),
+            array( 'ID' => $newId )
+        );
+        clean_post_cache( $newId );
     }
 
     /**

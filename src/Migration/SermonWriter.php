@@ -185,20 +185,29 @@ final class SermonWriter {
         }
 
         $postarr = array(
-            'post_type'      => Identifiers::POST_TYPE_SERMON,
-            'post_title'     => $legacy->post_title,
-            'post_author'    => $legacy->post_author,
-            'post_date'      => $legacy->post_date,
-            'post_date_gmt'  => $legacy->post_date_gmt,
-            'post_status'    => $legacy->post_status,
-            'post_name'      => $legacy->post_name,
-            'comment_status' => $legacy->comment_status,
-            'ping_status'    => $legacy->ping_status,
-            'menu_order'     => $legacy->menu_order,
-            'post_excerpt'   => $legacy->post_excerpt,
-            'post_password'  => $legacy->post_password,
-            'post_parent'    => $newParent,
-            'post_content'   => $reconciled['content'],
+            'post_type'              => Identifiers::POST_TYPE_SERMON,
+            'post_title'             => $legacy->post_title,
+            'post_author'            => $legacy->post_author,
+            'post_date'              => $legacy->post_date,
+            'post_date_gmt'          => $legacy->post_date_gmt,
+            // Preserve the legacy LAST-MODIFIED timestamps verbatim. Without these,
+            // wp_insert_post stamps post_modified[_gmt] (to post_date on insert),
+            // silently rewriting every migrated record's edit-history timestamp and
+            // corrupting any feed/sitemap/recently-updated ordering keyed on it.
+            'post_modified'          => $legacy->post_modified,
+            'post_modified_gmt'      => $legacy->post_modified_gmt,
+            'post_status'            => $legacy->post_status,
+            'post_name'              => $legacy->post_name,
+            'comment_status'         => $legacy->comment_status,
+            'ping_status'            => $legacy->ping_status,
+            'menu_order'             => $legacy->menu_order,
+            'post_excerpt'           => $legacy->post_excerpt,
+            'post_password'          => $legacy->post_password,
+            'post_parent'            => $newParent,
+            'post_content'           => $reconciled['content'],
+            // Preserve the legacy content_filtered cache column verbatim (a
+            // meaningful legacy wp_posts column; dropping it silently is data loss).
+            'post_content_filtered'  => $legacy->post_content_filtered,
             // ATOMIC back-ref: write the LEGACY_POST_ID in the SAME insert call so
             // post existence and the back-ref are one operation. A crash can no
             // longer leave a back-ref-less, duplicate-prone orphan (the
@@ -265,6 +274,12 @@ final class SermonWriter {
     private function applyPostInsertSpine( int $newId, int $legacyId, \WP_Post $legacy, array $reconciled, array $flags = array(), bool $fresh = false ): array {
         // Back-ref FIRST, immediately after insert (unique → idempotent on resume).
         Crosswalk::markLegacy( $newId, $legacyId );
+
+        // Preserve the legacy last-modified timestamps. wp_insert_post FORCES
+        // post_modified[_gmt] to post_date on insert (it only honours them on an
+        // update), so the $postarr values are ignored and we must stamp the legacy
+        // values directly. Idempotent: only updates when the columns actually differ.
+        $this->preserveModifiedTimestamps( $newId, $legacy );
 
         // post_parent re-translation (IMPORTANT #5): runs on BOTH the fresh-insert
         // and the resume path so a child migrated BEFORE its parent self-heals once
@@ -378,14 +393,25 @@ final class SermonWriter {
         // iframes/shortcodes from an already-clean post on a mere parent re-parent.
         $current = (int) get_post_field( 'post_parent', $newId );
         if ( $current !== (int) $translated ) {
-            kses_remove_filters();
+            // Capture the prior KSES filter state and restore it SYMMETRICALLY
+            // (mirroring insertKsesSafe). wp_update_post merges the existing post
+            // and would otherwise re-run KSES over the (KSES-off-inserted) body,
+            // stripping iframes/shortcodes from an already-clean post on a mere
+            // re-parent. An unconditional kses_init_filters() in finally would leak
+            // KSES ON when a batch orchestrator had disabled it for performance.
+            $kses_on = has_filter( 'content_save_pre', 'wp_filter_post_kses' );
+            if ( $kses_on ) {
+                kses_remove_filters();
+            }
             try {
                 wp_update_post( array(
                     'ID'          => $newId,
                     'post_parent' => (int) $translated,
                 ) );
             } finally {
-                kses_init_filters();
+                if ( $kses_on ) {
+                    kses_init_filters();
+                }
             }
         }
 
@@ -628,6 +654,88 @@ final class SermonWriter {
             $result = wp_set_object_terms( $newId, $newTermIds, $targetTax );
             if ( is_wp_error( $result ) ) {
                 $flags[] = 'term_assign_error:' . $targetTax;
+            }
+        }
+
+        // MUST-FIX #6 — faithful mirror of NATIVE (non-wpfc_) taxonomy assignments.
+        // Only the five wpfc_ taxonomies go through the crosswalk above; a legacy
+        // sermon assigned to category / post_tag / a site-custom taxonomy would
+        // otherwise have those relationships silently dropped. category/post_tag and
+        // any global custom taxonomy are GLOBAL (term ids are universal), so the SAME
+        // term ids apply to the new post — mirror them verbatim via
+        // wp_set_object_terms (idempotent full replace).
+        //
+        // Skipped on a SCOPED repair pass ($onlyTargetTaxonomies non-null): those
+        // passes touch only the flagged wpfc_ taxonomies; re-replacing a native
+        // taxonomy there could clobber an admin-curated assignment on the new post.
+        if ( null === $onlyTargetTaxonomies ) {
+            $flags = $this->mirrorNativeTaxonomies( $newId, $legacyId, $flags, $fresh );
+        }
+
+        return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Mirror every NATIVE taxonomy the legacy sermon is assigned in — every
+     * taxonomy NOT in MappingContract::taxonomyMap() — onto the new sermon, copying
+     * the SAME (global) term ids verbatim. category, post_tag, and site-custom
+     * taxonomies are global, so the legacy term id is also valid on the new post.
+     *
+     * Discovered directly from the term_relationships → term_taxonomy rows (cache-
+     * safe $wpdb read) rather than wp_get_object_taxonomies(), so a taxonomy that is
+     * not registered for the legacy post type at migration time (e.g. category /
+     * post_tag, which core registers only for `post`) is still discovered and never
+     * silently dropped.
+     *
+     * Mirrors the wpfc_ loop's empty-read NO-OP guard (IMPORTANT #10): on a non-fresh
+     * pass a transient empty legacy read does not clobber an existing assignment.
+     *
+     * Legacy term assignments are read READ-ONLY.
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function mirrorNativeTaxonomies( int $newId, int $legacyId, array $flags, bool $fresh ): array {
+        global $wpdb;
+
+        $mappedLegacyTaxonomies = array_keys( MappingContract::taxonomyMap() );
+
+        // Every taxonomy the legacy object is actually assigned in.
+        $taxonomies = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT DISTINCT tt.taxonomy FROM {$wpdb->term_relationships} tr"
+                . " INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_taxonomy_id = tr.term_taxonomy_id"
+                . " WHERE tr.object_id = %d",
+                $legacyId
+            )
+        );
+
+        foreach ( (array) $taxonomies as $taxonomy ) {
+            $taxonomy = (string) $taxonomy;
+            // The five wpfc_ taxonomies are handled by the crosswalk loop — skip.
+            if ( in_array( $taxonomy, $mappedLegacyTaxonomies, true ) ) {
+                continue;
+            }
+
+            $legacyTermIds = wp_get_object_terms( $legacyId, $taxonomy, array( 'fields' => 'ids' ) );
+            if ( is_wp_error( $legacyTermIds ) ) {
+                continue; // unreadable — nothing to mirror.
+            }
+            $legacyTermIds = array_values( array_map( 'intval', (array) $legacyTermIds ) );
+
+            // Empty-read NO-OP on a non-fresh pass (mirrors the wpfc_ loop): never
+            // clobber an existing native assignment with a transient empty read.
+            if ( array() === $legacyTermIds && ! $fresh ) {
+                $existing = wp_get_object_terms( $newId, $taxonomy, array( 'fields' => 'ids' ) );
+                if ( ! is_wp_error( $existing ) && array() !== array_map( 'intval', (array) $existing ) ) {
+                    continue;
+                }
+            }
+
+            // Copy the SAME (global) term ids verbatim (idempotent full replace).
+            $result = wp_set_object_terms( $newId, $legacyTermIds, $taxonomy );
+            if ( is_wp_error( $result ) ) {
+                $flags[] = 'native_term_assign_error:' . $taxonomy;
             }
         }
 
@@ -1085,6 +1193,35 @@ final class SermonWriter {
             }
         }
         return false;
+    }
+
+    /**
+     * Stamp the legacy post_modified / post_modified_gmt onto the new post.
+     * wp_insert_post forces these columns to post_date on INSERT (they are only
+     * honoured on an update), so we write them directly via $wpdb and refresh the
+     * post cache. Idempotent: a no-op when both columns already match (so resume /
+     * orphan-adoption re-entries do not churn the row).
+     */
+    private function preserveModifiedTimestamps( int $newId, \WP_Post $legacy ): void {
+        $current = get_post( $newId );
+        if ( ! $current instanceof \WP_Post ) {
+            return;
+        }
+        if ( $current->post_modified === $legacy->post_modified
+            && $current->post_modified_gmt === $legacy->post_modified_gmt ) {
+            return; // already preserved — idempotent no-op.
+        }
+
+        global $wpdb;
+        $wpdb->update(
+            $wpdb->posts,
+            array(
+                'post_modified'     => $legacy->post_modified,
+                'post_modified_gmt' => $legacy->post_modified_gmt,
+            ),
+            array( 'ID' => $newId )
+        );
+        clean_post_cache( $newId );
     }
 
     /**

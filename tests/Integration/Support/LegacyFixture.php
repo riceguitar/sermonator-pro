@@ -143,6 +143,37 @@ final class LegacyFixture {
     }
 
     /**
+     * Simulate the NATIVE-COLLISION crash window (MUST-FIX #2): the collision
+     * branch inserts a term at the SUFFIXED slug ('$slug-legacy-$id') but stamps
+     * its LEGACY_SLUG ownership marker with the ORIGINAL legacy slug. A crash
+     * between that insert and the back-ref stamp leaves a back-ref-less term whose
+     * own slug is the SUFFIXED slug yet whose LEGACY_SLUG marker is the ORIGINAL.
+     * The original-slug-keyed orphan probe cannot see it; a resume must discover it
+     * via a SUFFIXED-slug probe (LEGACY_SLUG==original) and ADOPT it.
+     *
+     * @param string $suffixedSlug The term's own slug ('$legacySlug-legacy-$id').
+     * @param string $legacySlug   The ORIGINAL legacy slug stamped into LEGACY_SLUG.
+     * @return int The orphan term id (back-ref-less, suffixed slug, original marker).
+     */
+    public function injectCollisionCrashOrphanTerm( string $targetTaxonomy, string $name, string $suffixedSlug, string $legacySlug, string $description = '' ): int {
+        $result = wp_insert_term(
+            wp_slash( $name ),
+            $targetTaxonomy,
+            array( 'slug' => $suffixedSlug, 'description' => wp_slash( $description ) )
+        );
+        if ( is_wp_error( $result ) ) {
+            throw new \RuntimeException( 'injectCollisionCrashOrphanTerm failed: ' . $result->get_error_message() );
+        }
+        $termId = (int) $result['term_id'];
+
+        // LEGACY_SLUG carries the ORIGINAL legacy slug (never the suffixed one),
+        // exactly as the collision branch stamps it before the back-ref.
+        add_term_meta( $termId, \Sermonator\Migration\Crosswalk::LEGACY_SLUG, $legacySlug, true );
+
+        return $termId;
+    }
+
+    /**
      * Simulate the EARLIER crash window — between wp_insert_term and the
      * LEGACY_SLUG ownership stamp. The orphan term carries the legacy NAME and
      * legacy SLUG but NEITHER the LEGACY_SLUG marker NOR the LEGACY_TERM_ID

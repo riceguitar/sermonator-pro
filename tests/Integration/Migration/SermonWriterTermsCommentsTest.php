@@ -91,6 +91,40 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         $this->assertNotContains( 'missing_term_crosswalk:' . $legacyTermId, $result->flags );
     }
 
+    public function test_native_category_and_post_tag_assignments_are_mirrored(): void {
+        // MUST-FIX #6: native (non-wpfc_) taxonomy assignments — category, post_tag,
+        // or a site-custom taxonomy — on a legacy sermon must NOT silently vanish.
+        // category/post_tag are GLOBAL taxonomies (term ids are universal), so the
+        // SAME term ids are copied verbatim onto the migrated sermon. Only the five
+        // wpfc_* taxonomies go through the crosswalk; everything else is mirrored.
+        $legacyId = $this->bareSermon();
+
+        // Seed global-taxonomy terms and assign them to the legacy sermon. (These
+        // taxonomies operate on the relationships table regardless of which post
+        // type they are registered for, exactly as in production.)
+        $catTerm = wp_insert_term( 'Announcements ' . wp_generate_uuid4(), 'category' );
+        $tagTerm = wp_insert_term( 'grace-tag-' . wp_generate_uuid4(), 'post_tag' );
+        $catId   = (int) $catTerm['term_id'];
+        $tagId   = (int) $tagTerm['term_id'];
+
+        wp_set_object_terms( $legacyId, array( $catId ), 'category' );
+        wp_set_object_terms( $legacyId, array( $tagId ), 'post_tag' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        // The SAME global term ids must be present on the migrated sermon.
+        $migratedCats = array_map( 'intval', (array) wp_get_object_terms( $result->newId, 'category', array( 'fields' => 'ids' ) ) );
+        $migratedTags = array_map( 'intval', (array) wp_get_object_terms( $result->newId, 'post_tag', array( 'fields' => 'ids' ) ) );
+
+        $this->assertContains( $catId, $migratedCats, 'native category relationship must be mirrored onto the migrated sermon' );
+        $this->assertContains( $tagId, $migratedTags, 'native post_tag relationship must be mirrored onto the migrated sermon' );
+
+        // Idempotent: a re-run does not duplicate or drop the relationships.
+        ( new SermonWriter() )->write( $legacyId );
+        $migratedCats2 = array_map( 'intval', (array) wp_get_object_terms( $result->newId, 'category', array( 'fields' => 'ids' ) ) );
+        $this->assertSame( array( $catId ), $migratedCats2 );
+    }
+
     public function test_legacy_term_without_crosswalk_flags_and_is_not_assigned(): void {
         // A legacy term that has NOT been migrated must not be silently dropped:
         // a missing_term_crosswalk:<id> flag is recorded, no term is assigned, no

@@ -88,6 +88,16 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         ) );
         add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '<p>The real body.</p>' );
 
+        // Set legacy last-modified + content_filtered directly (wp_insert_post
+        // forces modified to date on insert) so we can assert they are preserved.
+        global $wpdb;
+        $wpdb->update( $wpdb->posts, array(
+            'post_modified'         => '2021-07-09 12:00:00',
+            'post_modified_gmt'     => '2021-07-09 12:00:00',
+            'post_content_filtered' => 'cached filtered body',
+        ), array( 'ID' => $legacyId ) );
+        clean_post_cache( $legacyId );
+
         $result = ( new SermonWriter() )->write( $legacyId );
         $this->assertInstanceOf( WriteResult::class, $result );
         $this->assertTrue( $result->created );
@@ -106,6 +116,10 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertSame( 'A short excerpt.', $new->post_excerpt );
         $this->assertSame( 'secret', $new->post_password );
         $this->assertSame( '<p>The real body.</p>', $new->post_content );
+        // Sweep: last-modified + content_filtered preserved (not re-stamped/dropped).
+        $this->assertSame( '2021-07-09 12:00:00', $new->post_modified, 'post_modified must be preserved' );
+        $this->assertSame( '2021-07-09 12:00:00', $new->post_modified_gmt, 'post_modified_gmt must be preserved' );
+        $this->assertSame( 'cached filtered body', $new->post_content_filtered, 'post_content_filtered must be preserved' );
     }
 
     public function test_iframe_and_shortcode_body_survives_kses(): void {
@@ -584,6 +598,118 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
             (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
             'KSES must remain ON after SermonWriter::write() when it was ON before (symmetric restore)'
         );
+    }
+
+    /**
+     * MUST-FIX #3: reconcilePostParent() must restore KSES to the captured prior
+     * state, not unconditionally ON. With KSES OFF before write() and a non-zero
+     * legacy post_parent that NEWLY resolves to a migrated parent (so wp_update_post
+     * actually runs inside reconcilePostParent), KSES must remain OFF afterwards.
+     * The existing symmetric-restore tests use post_parent=0, never hitting this
+     * branch.
+     */
+    public function test_kses_state_restored_when_parent_resolves_and_off_before(): void {
+        // Force reconcilePostParent's wp_update_post branch to actually fire: a
+        // child migrated BEFORE its parent (parent collapses to 0 + flag), then the
+        // parent is migrated, then a re-write self-heals the parent via
+        // wp_update_post. With KSES OFF before that re-write, the asymmetric finally
+        // (unconditional kses_init_filters) would leave KSES ON. It must stay OFF.
+        $orphanParent = $this->fixture->createSermon();
+        $childLegacy  = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'  => 'KSES Heal Child',
+            'post_status' => 'publish',
+            'post_parent' => $orphanParent,
+        ) );
+        add_post_meta( $childLegacy, LegacyIdentifiers::META_DESCRIPTION, 'child body' );
+
+        $writer = new SermonWriter();
+        $child  = $writer->write( $childLegacy );
+        $this->assertContains( 'post_parent_unresolved:' . $orphanParent, $child->flags );
+        $parent = $writer->write( $orphanParent );
+
+        kses_remove_filters();
+        $this->assertFalse(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'precondition: KSES OFF before the self-heal re-write'
+        );
+
+        $rewrite = $writer->write( $childLegacy );
+
+        // Sanity: the parent self-heal branch (wp_update_post) actually ran.
+        $this->assertSame( $parent->newId, (int) get_post( $child->newId )->post_parent, 'parent must have been re-applied via wp_update_post' );
+        $this->assertNotContains( 'post_parent_unresolved:' . $orphanParent, $rewrite->flags );
+
+        $this->assertFalse(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'KSES must remain OFF after reconcilePostParent ran wp_update_post (symmetric restore)'
+        );
+
+        kses_init_filters();
+    }
+
+    /**
+     * MUST-FIX #3: the same self-heal path with KSES ON before must leave KSES ON
+     * after (the reconcilePostParent restore must not leak in either direction).
+     */
+    public function test_kses_state_restored_when_parent_resolves_and_on_before(): void {
+        $orphanParent = $this->fixture->createSermon();
+        $childLegacy  = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'  => 'KSES Heal Child On',
+            'post_status' => 'publish',
+            'post_parent' => $orphanParent,
+        ) );
+        add_post_meta( $childLegacy, LegacyIdentifiers::META_DESCRIPTION, 'child body' );
+
+        $writer = new SermonWriter();
+        $writer->write( $childLegacy );
+        $writer->write( $orphanParent );
+
+        kses_init_filters();
+        $this->assertTrue( (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ), 'precondition: KSES ON' );
+
+        $writer->write( $childLegacy );
+
+        $this->assertTrue(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'KSES must remain ON after reconcilePostParent ran wp_update_post'
+        );
+    }
+
+    /**
+     * MUST-FIX #4: post_modified / post_modified_gmt must carry the LEGACY
+     * last-modified timestamps, not be re-stamped to migration run time.
+     */
+    public function test_post_modified_preserved_from_legacy(): void {
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'         => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'        => 'Modified Preserve',
+            'post_status'       => 'publish',
+            'post_date'         => '2019-02-03 08:00:00',
+            'post_date_gmt'     => '2019-02-03 08:00:00',
+            'post_content'      => 'Auto blob',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, 'body' );
+
+        // wp_insert_post FORCES post_modified to post_date on insert, so set the
+        // legacy last-modified directly — mirroring how real legacy data (edited
+        // after creation) lives in the DB with modified != date.
+        global $wpdb;
+        $wpdb->update( $wpdb->posts, array(
+            'post_modified'     => '2020-06-15 14:22:31',
+            'post_modified_gmt' => '2020-06-15 14:22:31',
+        ), array( 'ID' => $legacyId ) );
+        clean_post_cache( $legacyId );
+
+        // Sanity: legacy carries the intended modified timestamp.
+        $this->assertSame( '2020-06-15 14:22:31', get_post( $legacyId )->post_modified_gmt );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $new = get_post( $result->newId );
+        $this->assertSame( '2020-06-15 14:22:31', $new->post_modified_gmt, 'post_modified_gmt must carry the legacy value' );
+        $this->assertSame( '2020-06-15 14:22:31', $new->post_modified, 'post_modified must carry the legacy value' );
     }
 
     // ----------------------------------- FIX 3: orphan adoption uniqueness (sermon)

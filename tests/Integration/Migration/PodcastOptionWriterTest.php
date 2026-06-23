@@ -89,6 +89,36 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         $this->assertSame( '1', (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
     }
 
+    public function test_podcast_post_modified_preserved_from_legacy(): void {
+        // MUST-FIX #4: post_modified / post_modified_gmt must carry the LEGACY
+        // last-modified timestamps rather than being re-stamped to run time.
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'         => LegacyIdentifiers::POST_TYPE_PODCAST,
+            'post_title'        => 'Modified Feed',
+            'post_status'       => 'publish',
+            'post_date'         => '2018-01-01 00:00:00',
+            'post_date_gmt'     => '2018-01-01 00:00:00',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Church' ) );
+
+        // wp_insert_post FORCES post_modified to post_date on insert, so set the
+        // legacy last-modified directly — mirroring real edited-after-creation data.
+        global $wpdb;
+        $wpdb->update( $wpdb->posts, array(
+            'post_modified'     => '2019-11-30 09:15:00',
+            'post_modified_gmt' => '2019-11-30 09:15:00',
+        ), array( 'ID' => $legacyId ) );
+        clean_post_cache( $legacyId );
+
+        $this->assertSame( '2019-11-30 09:15:00', get_post( $legacyId )->post_modified_gmt );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $new = get_post( $result->newId );
+        $this->assertSame( '2019-11-30 09:15:00', $new->post_modified_gmt, 'podcast post_modified_gmt must carry the legacy value' );
+        $this->assertSame( '2019-11-30 09:15:00', $new->post_modified, 'podcast post_modified must carry the legacy value' );
+    }
+
     public function test_podcast_settings_term_references_remapped_via_crosswalk(): void {
         // Migrate a legacy series term so the crosswalk can resolve it.
         $legacySeries = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Advent' );

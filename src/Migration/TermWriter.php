@@ -139,6 +139,21 @@ final class TermWriter {
         if ( $slugIsTaken ) {
             $insertSlug = $legacySlug . '-legacy-' . $legacyTermId;
             $flags[]    = 'slug_collision';
+
+            // COLLISION-ORPHAN RECOVERY (MUST-FIX #2). The collision branch inserts
+            // at the SUFFIXED slug but stamps LEGACY_SLUG with the ORIGINAL slug. A
+            // crash between that insert and markLegacyTerm leaves a back-ref-less
+            // term whose OWN slug is the suffixed slug yet whose LEGACY_SLUG marker
+            // is the ORIGINAL — invisible to every probe above (they key on the
+            // original slug). Without recovery, a resume re-runs the collision insert
+            // and either mints a duplicate '-legacy-{id}-2' or trips the guard. Probe
+            // for that orphan by its SUFFIXED slug (LEGACY_SLUG == original) and ADOPT
+            // it. The residual-collision branch below also re-checks it after a
+            // term_exists error (defence-in-depth on the suffixed re-insert).
+            $collisionOrphanId = $this->findBackRefLessTermBySlugMarker( $insertSlug, $legacySlug, $targetTaxonomy );
+            if ( $collisionOrphanId !== null ) {
+                return $this->adoptTerm( $collisionOrphanId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $flags );
+            }
         } else {
             $insertSlug = $legacySlug;
         }
@@ -167,6 +182,18 @@ final class TermWriter {
             $orphanTermId = $this->findBackRefLessTermBySlug( $legacySlug, $targetTaxonomy );
             if ( $orphanTermId !== null ) {
                 return $this->adoptTerm( $orphanTermId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $flags );
+            }
+
+            // MUST-FIX #2 (defence-in-depth): re-check the SUFFIXED-slug collision
+            // orphan here too — the first insert routed to the suffixed slug may have
+            // collided with our own back-ref-less collision orphan (LEGACY_SLUG ==
+            // original). Adopt it rather than re-suffix to '-legacy-{id}-2'.
+            $collisionOrphanId = $this->findBackRefLessTermBySlugMarker( $legacySlug . '-legacy-' . $legacyTermId, $legacySlug, $targetTaxonomy );
+            if ( $collisionOrphanId !== null ) {
+                if ( ! in_array( 'slug_collision', $flags, true ) ) {
+                    $flags[] = 'slug_collision';
+                }
+                return $this->adoptTerm( $collisionOrphanId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $flags );
             }
 
             // Residual no-throw guard (CRITICAL #3, defence-in-depth). The up-front
@@ -318,6 +345,16 @@ final class TermWriter {
                 if ( $this->findBackRefLessTermBySlug( (string) $legacyTerm->slug, $targetTaxonomy ) !== null ) {
                     $mappedCount++;
                 }
+                // MUST-FIX #2: union the SUFFIXED collision slug. A back-ref-less
+                // collision orphan ('$slug-legacy-$id', LEGACY_SLUG == original slug)
+                // is also an un-adopted divergent mapping that must trip the guard.
+                if ( $this->findBackRefLessTermBySlugMarker(
+                    (string) $legacyTerm->slug . '-legacy-' . $legacyTermId,
+                    (string) $legacyTerm->slug,
+                    $targetTaxonomy
+                ) !== null ) {
+                    $mappedCount++;
+                }
                 if ( $mappedCount > 1 ) {
                     throw new \RuntimeException( sprintf(
                         'TermWriter::migrateAll: reconciliation error — legacy term id %d in %s maps to %d new terms in %s.',
@@ -398,6 +435,45 @@ final class TermWriter {
                 $legacySlug,
                 Crosswalk::LEGACY_TERM_ID,
                 $legacySlug,
+                $targetTaxonomy
+            )
+        );
+
+        $ids = array_values( array_map( 'intval', (array) $ids ) );
+
+        return $ids === array() ? null : $ids[0];
+    }
+
+    /**
+     * Find OUR COLLISION crash orphan (MUST-FIX #2): a term whose OWN slug is the
+     * SUFFIXED collision slug ('$legacySlug-legacy-$id') and which carries our
+     * LEGACY_SLUG ownership marker set to the ORIGINAL legacy slug, but NO back-ref.
+     * That signature arises ONLY from the native-collision branch (which inserts at
+     * the suffixed slug yet stamps LEGACY_SLUG with the original) whose run died
+     * before markLegacyTerm. The original-slug-keyed probes cannot see it because
+     * the term's own slug is the suffixed one. A native term never carries
+     * LEGACY_SLUG, so a church term sharing the suffixed slug is never matched.
+     * Reads $wpdb directly (cache-safe).
+     *
+     * @return int|null The orphan term id to adopt, or null if none.
+     */
+    private function findBackRefLessTermBySlugMarker( string $termSlug, string $legacySlugMarker, string $targetTaxonomy ): ?int {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT t.term_id FROM {$wpdb->terms} t"
+                . " INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id"
+                . " INNER JOIN {$wpdb->termmeta} owned"
+                . "   ON owned.term_id = t.term_id AND owned.meta_key = %s AND owned.meta_value = %s"
+                . " LEFT JOIN {$wpdb->termmeta} backref"
+                . "   ON backref.term_id = t.term_id AND backref.meta_key = %s"
+                . " WHERE t.slug = %s AND tt.taxonomy = %s AND backref.meta_id IS NULL"
+                . " ORDER BY t.term_id ASC",
+                Crosswalk::LEGACY_SLUG,
+                $legacySlugMarker,
+                Crosswalk::LEGACY_TERM_ID,
+                $termSlug,
                 $targetTaxonomy
             )
         );
