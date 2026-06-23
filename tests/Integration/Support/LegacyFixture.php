@@ -102,6 +102,39 @@ final class LegacyFixture {
         return $id;
     }
 
+    /**
+     * Insert a legacy comment on a legacy post, READ-ONLY for the writer.
+     *
+     * Accepts an explicit comment_approved so spam/trash comments can be seeded
+     * (get_comments default 'all' excludes those — the writer must use 'any').
+     * Suppresses the spam/trash status sanitization that wp_insert_comment would
+     * otherwise apply by writing the row with the requested status preserved.
+     *
+     * @param array<string,mixed> $args Extra/override comment columns.
+     */
+    public function createComment( int $legacyPostId, string $approved = '1', array $args = array() ): int {
+        $commentarr = array_merge( array(
+            'comment_post_ID'      => $legacyPostId,
+            'comment_author'       => 'Legacy Author',
+            'comment_author_email' => 'legacy@example.com',
+            'comment_content'      => 'Legacy comment body',
+            'comment_approved'     => $approved,
+        ), $args );
+
+        $id = (int) wp_insert_comment( $commentarr );
+
+        // wp_insert_comment may normalize comment_approved; force the requested
+        // status (e.g. 'spam'/'trash') onto the row so the fixture seeds exactly
+        // what real legacy data looks like.
+        if ( $id > 0 && (string) get_comment( $id )->comment_approved !== $approved ) {
+            global $wpdb;
+            $wpdb->update( $wpdb->comments, array( 'comment_approved' => $approved ), array( 'comment_ID' => $id ) );
+            clean_comment_cache( $id );
+        }
+
+        return $id;
+    }
+
     public function setOption( string $name, mixed $value ): void {
         update_option( $name, $value );
     }

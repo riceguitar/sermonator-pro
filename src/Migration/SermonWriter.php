@@ -621,9 +621,13 @@ final class SermonWriter {
      */
     private function copyComments( int $newId, int $legacyId ): array {
         $flags = array();
+        // CRITICAL #1: 'status'=>'any' returns EVERY comment, including spam and
+        // trash. 'all' silently excludes spam/trash, which would drop irreplaceable
+        // parishioner-authored data (and any spam audit trail) before COMPLETE is
+        // stamped. We copy every comment and preserve comment_approved verbatim.
         $legacyComments = get_comments( array(
             'post_id' => $legacyId,
-            'status'  => 'all',
+            'status'  => 'any',
             'orderby' => 'comment_ID',
             'order'   => 'ASC',
             'type'    => '', // every type, including pingbacks/trackbacks
@@ -633,10 +637,19 @@ final class SermonWriter {
         // resume remaps parents correctly and skips already-copied comments.
         $oldToNew = $this->existingCommentMap( $newId );
 
+        // CRITICAL #5: per-comment crash window. wp_insert_comment can succeed and
+        // the process abort BEFORE add_comment_meta(LEGACY_COMMENT_ID). On resume
+        // that un-back-reffed comment is invisible to existingCommentMap() and would
+        // be RE-INSERTED as a duplicate. Before inserting anything, reconcile: probe
+        // the new post for an un-back-reffed comment matching each not-yet-mapped
+        // legacy comment's identity and ADOPT it (stamp the back-ref, add to the
+        // map) so the copy loop skips it instead of duplicating.
+        $oldToNew = $this->reconcileOrphanComments( $newId, $legacyComments, $oldToNew );
+
         foreach ( $legacyComments as $legacy ) {
             $legacyCommentId = (int) $legacy->comment_ID;
 
-            // Already copied (idempotent skip).
+            // Already copied / adopted (idempotent skip).
             if ( isset( $oldToNew[ $legacyCommentId ] ) ) {
                 continue;
             }
@@ -689,7 +702,117 @@ final class SermonWriter {
             $this->copyCommentMeta( $legacyCommentId, $newCommentId );
         }
 
+        // Thread integrity: a CHILD with a LOWER comment_ID than its PARENT is copied
+        // (ascending order) before its parent's new id exists, leaving comment_parent
+        // unresolved (0). Now that the FULL oldToNew map is known, re-parent any new
+        // comment whose legacy parent has since been mapped. Idempotent: only rows
+        // that need it are updated.
+        $this->reparentFromMap( $newId, $legacyComments, $oldToNew );
+
         return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Reconcile the crash window where a comment was inserted on the new post but
+     * its LEGACY_COMMENT_ID back-ref was never stamped (abort between the two
+     * writes). For each not-yet-mapped legacy comment, probe the new post for an
+     * un-back-reffed comment matching its identity (same date_gmt + author_email +
+     * a content hash) and ADOPT it: stamp the back-ref and add it to the map so the
+     * copy loop skips it rather than re-inserting a duplicate.
+     *
+     * Identity match is intentionally strict (date_gmt + email + content hash) so a
+     * genuinely distinct comment is never mis-adopted. Each new orphan is consumed
+     * at most once.
+     *
+     * @param array<int,\WP_Comment>|list<\WP_Comment> $legacyComments
+     * @param array<int,int>                            $oldToNew legacy id → new id
+     * @return array<int,int> The map, extended with any adopted comments.
+     */
+    private function reconcileOrphanComments( int $newId, array $legacyComments, array $oldToNew ): array {
+        // Collect new comments on this post that LACK a back-ref (potential orphans),
+        // keyed by an identity signature. A back-reffed comment is already mapped.
+        $orphansBySig = array();
+        $newComments  = get_comments( array( 'post_id' => $newId, 'status' => 'any', 'number' => 0 ) );
+        foreach ( $newComments as $newComment ) {
+            $newCommentId = (int) $newComment->comment_ID;
+            if ( '' !== (string) get_comment_meta( $newCommentId, Crosswalk::LEGACY_COMMENT_ID, true ) ) {
+                continue; // already back-reffed → already in the map
+            }
+            $sig = $this->commentIdentitySignature( $newComment );
+            $orphansBySig[ $sig ][] = $newCommentId;
+        }
+
+        if ( $orphansBySig === array() ) {
+            return $oldToNew;
+        }
+
+        foreach ( $legacyComments as $legacy ) {
+            $legacyCommentId = (int) $legacy->comment_ID;
+            if ( isset( $oldToNew[ $legacyCommentId ] ) ) {
+                continue; // already mapped via back-ref
+            }
+            $sig = $this->commentIdentitySignature( $legacy );
+            if ( empty( $orphansBySig[ $sig ] ) ) {
+                continue; // no matching orphan to adopt
+            }
+
+            // Adopt the orphan: stamp the back-ref FIRST (idempotency spine) and add
+            // to the map. Consume it so it is not adopted by two legacy comments.
+            $adoptedId = (int) array_shift( $orphansBySig[ $sig ] );
+            add_comment_meta( $adoptedId, Crosswalk::LEGACY_COMMENT_ID, $legacyCommentId, true );
+            $oldToNew[ $legacyCommentId ] = $adoptedId;
+            // Back-fill commentmeta too (the abort may have predated it).
+            $this->copyCommentMeta( $legacyCommentId, $adoptedId );
+        }
+
+        return $oldToNew;
+    }
+
+    /**
+     * A strict identity signature for matching a legacy comment to an un-back-reffed
+     * copy on the new post: GMT date + author email + a hash of the content. These
+     * are preserved verbatim by the copy, so an adopted orphan is the same comment.
+     */
+    private function commentIdentitySignature( \WP_Comment $comment ): string {
+        return implode( "\0", array(
+            (string) $comment->comment_date_gmt,
+            (string) $comment->comment_author_email,
+            md5( (string) $comment->comment_content ),
+        ) );
+    }
+
+    /**
+     * Second-pass thread re-parent: now that the full legacy→new comment map is
+     * known, fix any new comment whose comment_parent could not be resolved on the
+     * single ascending pass (a child with a lower legacy id than its parent). Only
+     * rows whose stored parent differs from the resolved new parent are updated, so
+     * this is idempotent and a no-op when the first pass already resolved everything.
+     *
+     * @param array<int,\WP_Comment>|list<\WP_Comment> $legacyComments
+     * @param array<int,int>                            $oldToNew legacy id → new id
+     */
+    private function reparentFromMap( int $newId, array $legacyComments, array $oldToNew ): void {
+        foreach ( $legacyComments as $legacy ) {
+            $legacyCommentId = (int) $legacy->comment_ID;
+            $legacyParentId  = (int) $legacy->comment_parent;
+            if ( 0 === $legacyParentId
+                || ! isset( $oldToNew[ $legacyCommentId ] )
+                || ! isset( $oldToNew[ $legacyParentId ] ) ) {
+                continue;
+            }
+
+            $newCommentId    = $oldToNew[ $legacyCommentId ];
+            $resolvedParent  = $oldToNew[ $legacyParentId ];
+            $current         = get_comment( $newCommentId );
+            if ( ! $current instanceof \WP_Comment || (int) $current->comment_parent === $resolvedParent ) {
+                continue; // already correct
+            }
+
+            wp_update_comment( array(
+                'comment_ID'     => $newCommentId,
+                'comment_parent' => $resolvedParent,
+            ) );
+        }
     }
 
     /**

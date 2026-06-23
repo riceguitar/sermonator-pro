@@ -586,6 +586,134 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         $this->assertTrue( $hasErrorFlag, 'a wp_set_object_terms WP_Error must surface a flag' );
     }
 
+    public function test_spam_and_trash_comments_are_copied_with_status_preserved(): void {
+        // CRITICAL #1: get_comments(['status'=>'all']) returns ONLY approved+pending,
+        // silently dropping spam/trash before MIGRATION_COMPLETE is stamped. The
+        // writer must use 'status'=>'any' so spam/trash comments copy too, with
+        // their status preserved verbatim (irreplaceable parishioner-authored data).
+        $legacyId  = $this->bareSermon();
+        $approved  = $this->fixture->createComment( $legacyId, '1', array( 'comment_author' => 'Approved', 'comment_content' => 'approved body' ) );
+        $spamId    = $this->fixture->createComment( $legacyId, 'spam', array( 'comment_author' => 'Spammer', 'comment_content' => 'spam body' ) );
+        $trashId   = $this->fixture->createComment( $legacyId, 'trash', array( 'comment_author' => 'Trasher', 'comment_content' => 'trash body' ) );
+
+        // Precondition: the fixture seeded the statuses exactly.
+        $this->assertSame( 'spam', (string) get_comment( $spamId )->comment_approved );
+        $this->assertSame( 'trash', (string) get_comment( $trashId )->comment_approved );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $copied = get_comments( array( 'post_id' => $result->newId, 'status' => 'any' ) );
+        $byLegacy = array();
+        foreach ( $copied as $c ) {
+            $byLegacy[ (int) get_comment_meta( $c->comment_ID, Crosswalk::LEGACY_COMMENT_ID, true ) ] = $c;
+        }
+
+        $this->assertCount( 3, $copied, 'spam/trash comments must NOT be silently dropped' );
+        $this->assertArrayHasKey( $approved, $byLegacy );
+        $this->assertArrayHasKey( $spamId, $byLegacy, 'spam comment must be copied' );
+        $this->assertArrayHasKey( $trashId, $byLegacy, 'trash comment must be copied' );
+
+        // Status preserved verbatim.
+        $this->assertSame( '1', (string) $byLegacy[ $approved ]->comment_approved );
+        $this->assertSame( 'spam', (string) $byLegacy[ $spamId ]->comment_approved );
+        $this->assertSame( 'trash', (string) $byLegacy[ $trashId ]->comment_approved );
+    }
+
+    public function test_resume_after_insert_without_backref_does_not_duplicate(): void {
+        // CRITICAL #5: per-comment crash window — wp_insert_comment succeeds, then
+        // the process aborts BEFORE add_comment_meta(LEGACY_COMMENT_ID). On resume
+        // the un-back-reffed comment must NOT be re-inserted as a duplicate: a
+        // reconciliation/probe pass must adopt the orphan by stamping its back-ref.
+        $legacyId        = $this->bareSermon();
+        $legacyCommentId = $this->fixture->createComment( $legacyId, '1', array(
+            'comment_author'       => 'Resumer',
+            'comment_author_email' => 'resumer@example.com',
+            'comment_content'      => 'Crash-window comment',
+        ) );
+        $legacy = get_comment( $legacyCommentId );
+
+        // First write produces the new post + (normally) a back-reffed copy.
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+        $newId  = $first->newId;
+
+        // Simulate the crash window: an identical comment exists on the NEW post but
+        // is MISSING its LEGACY_COMMENT_ID back-ref (insert succeeded, abort before
+        // the stamp). Strip the back-ref off the copy already made so the resume
+        // sees an orphan it could otherwise duplicate.
+        $copied = get_comments( array( 'post_id' => $newId, 'status' => 'any' ) );
+        $this->assertCount( 1, $copied );
+        delete_comment_meta( (int) $copied[0]->comment_ID, Crosswalk::LEGACY_COMMENT_ID );
+
+        // Crash-inject a partial so the next write RESUMES and re-drives the copy.
+        delete_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE );
+
+        $second = $writer->write( $legacyId );
+        $this->assertTrue( $second->resumed );
+
+        // Exactly ONE comment must exist — the orphan was adopted, not duplicated.
+        $after = get_comments( array( 'post_id' => $newId, 'status' => 'any' ) );
+        $this->assertCount( 1, $after, 'un-back-reffed comment must be adopted, not re-inserted' );
+
+        // And it now carries the back-ref (adopted into the map).
+        $this->assertSame(
+            $legacyCommentId,
+            (int) get_comment_meta( (int) $after[0]->comment_ID, Crosswalk::LEGACY_COMMENT_ID, true ),
+            'the adopted comment must be stamped with its LEGACY_COMMENT_ID back-ref'
+        );
+    }
+
+    public function test_out_of_order_child_id_resolves_parent_in_second_pass(): void {
+        // Thread integrity: when a CHILD comment has a LOWER comment_ID than its
+        // PARENT (out-of-order ids — legacy imports can produce this), a single
+        // ascending pass would copy the child before the parent's new id is known,
+        // leaving comment_parent unresolved (0). A second-pass re-parent from the
+        // full oldToNew map must fix it.
+        $legacyId = $this->bareSermon();
+
+        // Insert the PARENT first to claim a low id, the CHILD second (higher id),
+        // then rewrite the rows so the CHILD has the LOWER comment_ID and points at
+        // the (higher-id) parent — the out-of-order topology.
+        $parentTmp = $this->fixture->createComment( $legacyId, '1', array( 'comment_author' => 'Parent', 'comment_content' => 'parent body' ) );
+        $childTmp  = $this->fixture->createComment( $legacyId, '1', array( 'comment_author' => 'Child', 'comment_content' => 'child body' ) );
+
+        // Ensure parentTmp < childTmp (insertion order guarantees this).
+        $this->assertLessThan( $childTmp, $parentTmp );
+
+        // Swap their ids so the CHILD ends up with the lower id and references the
+        // higher-id parent. We move parent to a brand-new high id.
+        global $wpdb;
+        $highId = $childTmp + 1000;
+        $wpdb->update( $wpdb->comments, array( 'comment_ID' => $highId ), array( 'comment_ID' => $parentTmp ) );
+        // Child (lower id) now points at the parent's NEW high id.
+        $wpdb->update( $wpdb->comments, array( 'comment_parent' => $highId ), array( 'comment_ID' => $childTmp ) );
+        clean_comment_cache( array( $childTmp, $highId ) );
+
+        $parentLegacyId = $highId;
+        $childLegacyId  = $childTmp;
+        $this->assertLessThan( $parentLegacyId, $childLegacyId, 'child id must be lower than parent id' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $copied = get_comments( array( 'post_id' => $result->newId, 'status' => 'any' ) );
+        $this->assertCount( 2, $copied );
+        $byLegacy = array();
+        foreach ( $copied as $c ) {
+            $byLegacy[ (int) get_comment_meta( $c->comment_ID, Crosswalk::LEGACY_COMMENT_ID, true ) ] = $c;
+        }
+        $this->assertArrayHasKey( $parentLegacyId, $byLegacy );
+        $this->assertArrayHasKey( $childLegacyId, $byLegacy );
+
+        // The child's parent must point at the NEW parent id — resolved despite the
+        // out-of-order legacy ids.
+        $this->assertSame(
+            (int) $byLegacy[ $parentLegacyId ]->comment_ID,
+            (int) $byLegacy[ $childLegacyId ]->comment_parent,
+            'out-of-order child must be re-parented to the new parent id'
+        );
+        $this->assertNotSame( 0, (int) $byLegacy[ $childLegacyId ]->comment_parent );
+    }
+
     // ----------------------------------------------------------- COMPLETE-LAST
 
     public function test_migration_complete_set_after_all_steps(): void {
