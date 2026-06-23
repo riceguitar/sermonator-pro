@@ -293,6 +293,147 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         $this->assertCount( 1, get_comments( array( 'post_id' => $first->newId ) ), 'resume must not duplicate comments' );
     }
 
+    public function test_failed_comment_insert_records_flag_not_silent_drop(): void {
+        // Irreplaceable parishioner-authored data must never vanish silently: when
+        // wp_insert_comment returns falsy, a comment_copy_failed:<legacyCommentId>
+        // flag is recorded (and persisted on the new post), and the migration is
+        // not crashed.
+        $legacyId        = $this->bareSermon();
+        $legacyCommentId = (int) wp_insert_comment( array(
+            'comment_post_ID'  => $legacyId,
+            'comment_author'   => 'Mallory',
+            'comment_content'  => 'Will fail to copy',
+            'comment_approved' => '1',
+        ) );
+
+        // Force wp_insert_comment to fail by breaking the INSERT into wp_comments
+        // for the duration of the write. We rewrite the offending INSERT to a no-op
+        // that the DB rejects, so $wpdb->insert returns false → wp_insert_comment
+        // returns false. We do NOT touch the legacy comment row that already exists.
+        global $wpdb;
+        $commentsTable = $wpdb->comments;
+        $break = static function ( $query ) use ( $commentsTable ) {
+            if ( false !== stripos( $query, 'INSERT INTO `' . $commentsTable . '`' )
+                || false !== stripos( $query, 'INSERT INTO ' . $commentsTable ) ) {
+                // Invalid SQL → $wpdb->insert returns false → wp_insert_comment false.
+                return 'INSERT INTO ' . $commentsTable . ' (this_column_does_not_exist) VALUES (1)';
+            }
+            return $query;
+        };
+        add_filter( 'query', $break );
+
+        // Suppress the intentional DB error noise from the forced failure.
+        $suppress = $wpdb->suppress_errors( true );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        remove_filter( 'query', $break );
+        $wpdb->suppress_errors( $suppress );
+
+        // The new post still exists (migration not crashed).
+        $this->assertGreaterThan( 0, $result->newId );
+        // No comment was copied.
+        $this->assertCount( 0, get_comments( array( 'post_id' => $result->newId ) ) );
+
+        // The failure is recorded in the returned flags AND persisted.
+        $this->assertContains( 'comment_copy_failed:' . $legacyCommentId, $result->flags );
+        $persisted = (array) get_post_meta( $result->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertContains( 'comment_copy_failed:' . $legacyCommentId, $persisted );
+    }
+
+    public function test_admin_added_native_term_survives_second_write_of_completed_post(): void {
+        // A completed post with NO open term flag must NOT have its terms clobbered
+        // on a re-run. The COMPLETE-branch repair is gated on an open term flag, so
+        // a term a church admin manually added to the migrated post survives.
+        $legacyTermId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Hope' );
+        $legacyId     = $this->bareSermon();
+        wp_set_object_terms( $legacyId, array( $legacyTermId ), LegacyIdentifiers::TAX_TOPIC );
+        ( new TermWriter() )->migrateAll();
+
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+        // Clean migration: no open term flag persisted.
+        $persistedAfterFirst = (array) get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true );
+        foreach ( $persistedAfterFirst as $flag ) {
+            $this->assertStringStartsNotWith( 'missing_term_crosswalk:', (string) $flag );
+            $this->assertStringStartsNotWith( 'term_assign_error:', (string) $flag );
+        }
+
+        // An admin manually adds a NEW native term in the SAME mapped taxonomy on
+        // the migrated post.
+        $adminTermId = $this->factory->term->create( array(
+            'taxonomy' => Identifiers::TAX_TOPIC,
+            'name'     => 'Admin Added Topic',
+        ) );
+        wp_set_object_terms( $first->newId, array( (int) $adminTermId ), Identifiers::TAX_TOPIC, true );
+
+        $migratedTermId = (int) Crosswalk::findNewTermByLegacyId( $legacyTermId, Identifiers::TAX_TOPIC );
+        $before = array_map( 'intval', wp_get_object_terms( $first->newId, Identifiers::TAX_TOPIC, array( 'fields' => 'ids' ) ) );
+        sort( $before );
+        $this->assertSame(
+            array_values( array_unique( array( $migratedTermId, (int) $adminTermId ) ) ),
+            $before,
+            'precondition: both the migrated and admin-added terms are present'
+        );
+
+        // A second write of the COMPLETE record must NOT clobber the admin term.
+        $second = $writer->write( $legacyId );
+        $this->assertFalse( $second->created );
+        $this->assertFalse( $second->resumed );
+
+        $after = array_map( 'intval', wp_get_object_terms( $first->newId, Identifiers::TAX_TOPIC, array( 'fields' => 'ids' ) ) );
+        sort( $after );
+        $this->assertSame( $before, $after, 'admin-curated term was clobbered by an idempotent re-run' );
+        $this->assertContains( (int) $adminTermId, $after, 'admin-added native term must survive a second write' );
+    }
+
+    public function test_resolving_the_only_flag_clears_the_persisted_flags_row(): void {
+        // When the ONLY open flag is a missing_term_crosswalk and that term later
+        // resolves, the persisted MIGRATION_FLAGS row must be DELETED, not left
+        // stale — writeFlags deletes on an empty flag set. We engineer a legacy
+        // post whose body equals its description so the reconciler produces NO
+        // post_content_preserved backup/flag, leaving the term flag as the sole flag.
+        $legacyTermId = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Eastertide' );
+        $legacyId     = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'No-backup ' . wp_generate_uuid4(),
+            'post_status'  => 'publish',
+            'post_content' => 'identical body',
+        ) );
+        // sermon_description equals post_content → reconciler keeps content, no backup.
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, 'identical body' );
+        wp_set_object_terms( $legacyId, array( $legacyTermId ), LegacyIdentifiers::TAX_SERIES );
+
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+
+        // The ONLY persisted flag is the open missing_term_crosswalk.
+        $persisted = (array) get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertSame(
+            array( 'missing_term_crosswalk:' . $legacyTermId ),
+            array_values( $persisted ),
+            'precondition: the term flag must be the sole flag (no backup flag)'
+        );
+
+        // Resolve the term, then re-write so the self-heal strips the last flag.
+        ( new TermWriter() )->migrateAll();
+        $second = $writer->write( $legacyId );
+
+        $this->assertNotContains( 'missing_term_crosswalk:' . $legacyTermId, $second->flags );
+        $this->assertSame( array(), $second->flags, 'all flags should be cleared after the heal' );
+
+        // The persisted MIGRATION_FLAGS row must be GONE (not a stale empty/old row).
+        $this->assertSame(
+            '',
+            get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true ),
+            'the resolved sole flag must leave NO persisted MIGRATION_FLAGS row'
+        );
+        $this->assertFalse(
+            metadata_exists( 'post', $first->newId, Crosswalk::MIGRATION_FLAGS ),
+            'the MIGRATION_FLAGS meta row must be deleted, not left stale'
+        );
+    }
+
     public function test_wp_error_on_term_set_surfaces_flag_not_crash(): void {
         // A legacy term whose target taxonomy is not registered makes
         // wp_set_object_terms return a WP_Error — we surface a flag, never crash.

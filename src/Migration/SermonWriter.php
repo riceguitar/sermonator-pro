@@ -13,9 +13,11 @@ use Sermonator\Schema\Identifiers;
  * write() is the full pipeline:
  *  - the idempotency gate (resolve via Crosswalk::findNewByLegacyId, status-
  *    agnostic) distinguishes a COMPLETE record (skip the post/body/meta/comments
- *    steps but STILL re-run term repair — "post exists" must never short-circuit
- *    a now-resolvable term) from a stamped-but-PARTIAL record (resume — re-enter
- *    on the existing post, never insert a second one);
+ *    steps, and re-run term repair ONLY when an OPEN term flag is present so a
+ *    now-resolvable term self-heals — but a completed record with no open term
+ *    flag is left untouched, never a full wp_set_object_terms REPLACE that would
+ *    clobber admin-curated terms) from a stamped-but-PARTIAL record (resume —
+ *    re-enter on the existing post, never insert a second one);
  *  - the post is inserted preserving the legacy post columns, with the body
  *    reconciled from (post_content, sermon_description, post_content_temp);
  *  - the insert is wp_slash'd and run with KSES DISABLED so iframes/shortcodes
@@ -68,15 +70,21 @@ final class SermonWriter {
             }
 
             if ( $this->isComplete( $existing ) ) {
-                // COMPLETE — a no-op skip for the post/body/meta/comments steps, but
-                // term repair STILL runs (self-heal): a record migrated while a term
-                // crosswalk was missing must pick the now-available term up on a
-                // later pass — "post exists" must never short-circuit term repair.
-                // Seed from the persisted flags so an open missing_term_crosswalk
-                // flag is re-evaluated (and dropped once it resolves), and so no
-                // unrelated flag is lost by writeFlags()'s replace semantics.
-                $flags = $this->repairTermsOnExisting( $existing, $legacyId, $this->readFlags( $existing ) );
-                return new WriteResult( $existing, false, $flags, false );
+                // COMPLETE — a no-op skip for the post/body/meta/comments steps.
+                // Term repair (self-heal) runs ONLY when there is actually an OPEN
+                // term flag to clear (missing_term_crosswalk:* / term_assign_error:*).
+                // A record migrated while a term crosswalk was missing picks the
+                // now-available term up here; but a completed record with NO open
+                // term flag must NOT be touched — a full wp_set_object_terms REPLACE
+                // on every re-run would silently clobber any term a church admin
+                // manually added to the migrated post (data loss on the NEW post).
+                // Seed from the persisted flags so no unrelated flag is lost.
+                $persisted = $this->readFlags( $existing );
+                if ( $this->hasOpenTermFlag( $persisted ) ) {
+                    $flags = $this->repairTermsOnExisting( $existing, $legacyId, $persisted );
+                    return new WriteResult( $existing, false, $flags, false );
+                }
+                return new WriteResult( $existing, false, $persisted, false );
             }
 
             // Stamped but PARTIAL — RESUME on the existing post (never insert).
@@ -228,8 +236,11 @@ final class SermonWriter {
 
         // Comment copy (Task 14) — depth-first, new ids, remapped parents, stamped
         // with LEGACY_COMMENT_ID so already-copied comments are skipped (idempotent
-        // on resume), commentmeta copied with the unserialize discipline.
-        $this->copyComments( $newId, $legacyId );
+        // on resume), commentmeta copied with the unserialize discipline. A comment
+        // that fails to insert is NEVER a silent drop — it records a
+        // comment_copy_failed:<legacyCommentId> flag (parishioner-authored data is
+        // irreplaceable), threaded back into the canonical flags row.
+        $flags = array_merge( $flags, $this->copyComments( $newId, $legacyId ) );
 
         $this->writeFlags( $newId, $flags );
 
@@ -427,6 +438,24 @@ final class SermonWriter {
     }
 
     /**
+     * Whether any OPEN term flag is present (missing_term_crosswalk:* or
+     * term_assign_error:*). Gates the COMPLETE-branch repair so a completed record
+     * with no open term flag is left untouched (no full-set REPLACE that would
+     * clobber admin-curated terms).
+     *
+     * @param list<string> $flags
+     */
+    private function hasOpenTermFlag( array $flags ): bool {
+        foreach ( $flags as $flag ) {
+            if ( str_starts_with( (string) $flag, 'missing_term_crosswalk:' )
+                || str_starts_with( (string) $flag, 'term_assign_error:' ) ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Drop previously-derived term flags so applyTerms() can re-derive them from
      * the current crosswalk state (a resolved term clears its open flag).
      *
@@ -458,11 +487,18 @@ final class SermonWriter {
      *    karma are preserved verbatim;
      *  - commentmeta is copied with the unserialize discipline (per-key
      *    get_comment_meta(...,false) values, so arrays round-trip);
-     *  - the back-ref is stamped on the new comment immediately after insert.
+     *  - the back-ref is stamped on the new comment immediately after insert;
+     *  - a wp_insert_comment failure is NEVER a silent drop — irreplaceable
+     *    parishioner-authored data records a comment_copy_failed:<legacyCommentId>
+     *    flag (and an error_log entry) so it leaves a forensic trail, rather than
+     *    vanishing. The migration is not crashed on a single bad comment.
      *
      * Legacy comments are read READ-ONLY.
+     *
+     * @return list<string> Comment-copy failure flags (comment_copy_failed:<id>).
      */
-    private function copyComments( int $newId, int $legacyId ): void {
+    private function copyComments( int $newId, int $legacyId ): array {
+        $flags = array();
         $legacyComments = get_comments( array(
             'post_id' => $legacyId,
             'status'  => 'all',
@@ -510,7 +546,17 @@ final class SermonWriter {
             // slashing so wp_insert_comment's unslash round-trips exactly.
             $newCommentId = wp_insert_comment( wp_slash( $commentarr ) );
             if ( ! $newCommentId ) {
-                continue; // do not crash the migration on a single bad comment
+                // Never a silent drop of irreplaceable parishioner-authored data:
+                // record a flag + forensic log, do not crash the whole migration.
+                $flags[] = 'comment_copy_failed:' . $legacyCommentId;
+                // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+                error_log( sprintf(
+                    'SermonWriter: wp_insert_comment failed copying legacy comment %d for legacy post %d (new post %d).',
+                    $legacyCommentId,
+                    $legacyId,
+                    $newId
+                ) );
+                continue;
             }
             $newCommentId = (int) $newCommentId;
 
@@ -520,6 +566,8 @@ final class SermonWriter {
 
             $this->copyCommentMeta( $legacyCommentId, $newCommentId );
         }
+
+        return array_values( array_unique( $flags ) );
     }
 
     /**
@@ -624,6 +672,11 @@ final class SermonWriter {
     private function writeFlags( int $newId, array $flags ): void {
         $flags = array_values( array_unique( $flags ) );
         if ( $flags === array() ) {
+            // The last open flag just resolved (self-heal): delete the canonical
+            // row outright rather than early-returning, which would otherwise leave
+            // a stale MIGRATION_FLAGS row persisted forever — a permanent false
+            // "unmigrated" signal the self-heal contract promises to clear.
+            delete_post_meta( $newId, Crosswalk::MIGRATION_FLAGS );
             return;
         }
         update_post_meta( $newId, Crosswalk::MIGRATION_FLAGS, $flags );
