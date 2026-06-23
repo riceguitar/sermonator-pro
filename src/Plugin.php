@@ -88,5 +88,6 @@ final class Plugin {
             return;
         }
         \WP_CLI::add_command( 'sermonator migration', \Sermonator\Cli\MigrationCommand::class );
+        \WP_CLI::add_command( 'sermonator audio', \Sermonator\Cli\AudioCommand::class );
     }
 }
