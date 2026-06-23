@@ -51,8 +51,11 @@ POST_TYPE_SERMON, … )` with:
 - **`auth_callback`** = `current_user_can( 'edit_post', $objectId )` — the canonical write
   gate (also closes the prior video-embed no-auth gap).
 - per-field **`sanitize_callback`**: `sanitize_text_field` (passage), `esc_url_raw`
-  (audio/video/notes/bulletin URLs), `wp_kses` with the Renderer's video allowlist (embed),
-  `absint` (date, audio_id, size), normalized `0|1` (date_auto).
+  (audio/video/notes/bulletin URLs), `absint` (date, audio_id, size), normalized `0|1`
+  (date_auto). The embed sanitizer calls **the same allowlist source as the Renderer** —
+  `Renderer::allowedVideoHtml()` is extracted to a shared function both call, with a test
+  asserting parity, so a freshly-authored embed and a migrated one can never diverge
+  (time-travel #5).
 - Underscore-protected keys (`_sermonator_audio_size`, `_sermonator_audio_duration`) are
   registered with explicit `show_in_rest` + `auth_callback` so the editor can persist them.
   (Note: these become publicly readable via REST — acceptable, they are already public feed
@@ -88,7 +91,13 @@ only, reading/writing meta via `useEntityProp( 'postType', type, 'meta' )`:
   **on explicit change only** (tenth-man #3) calls `apiFetch /audio-metadata` and writes
   duration/size — never on panel load, so it cannot clobber a migrated/legacy size just by
   opening the post. Plus an "external URL" `TextControl` → `apiFetch?url=` → size on change.
-  Duration/size shown read-only with a manual-override affordance if auto fails.
+  Duration/size shown read-only.
+  - **"Fetch audio details" button (time-travel #3):** an explicit, non-change-gated action
+    that (re)reads the current audio's duration/size on demand — so the migrated back catalog
+    (external URLs, never re-edited) can get durations without re-touching the audio field.
+    It writes only when the user clicks it (so it is still an explicit action, not a load-time
+    clobber). The **Phase-3 `AudioSizeBackfill` should be extended to populate duration too**
+    (currently size-only), giving a bulk path for the whole catalog — recorded as a follow-up.
 - **Video** — URL `TextControl` + embed `TextareaControl`; embed wins when both present
   (mirrors the Renderer).
 - **Notes / Bulletin** — `MediaUpload` (any file) → URL.
@@ -105,6 +114,25 @@ index.asset.php}`. Enqueued on `enqueue_block_editor_assets` using the generated
 `@wordpress/*` APIs; pin `@wordpress/scripts` to the WP-7.0 line; document "rebuild the bundle
 on a major WP upgrade" in the README/build notes. The bundle externalizes `wp.*` (no bundled
 React), so it stays small and uses the site's WP packages.
+
+## 6a. Migration safety — the whole panel is migration-gated (rollback-story #2)
+
+Not just the date normalizer: the **entire authoring write surface is inert during an active
+migration** (phase ∉ `{none, finalized}`). The panel renders a read-only "Migration in
+progress — sermon editing is paused until it finalizes" notice, the REST audio endpoint
+refuses, and the meta `auth_callback`s deny writes. This prevents a stray native-meta edit
+from diverging a record from the detect-time manifest and producing a false `Verifier` failure
+(or, worst case, Finalizing on corrupted data). Implemented as a shared
+`Authoring\MigrationGuard::editingAllowed()` used by the panel-enqueue check, the REST
+permission callback, and the meta auth callbacks.
+
+## 6b. Recovery posture (rollback-story #1)
+
+Postmeta has **no revision history**, so an overwrite of a migrated value is not undoable
+in-WP. Pre-Finalize the legacy source still exists (copy-forward is non-destructive) → re-run
+the migration's per-record write or read the legacy key. Post-Finalize the only recovery is a
+database backup. This is documented, not engineered around (a per-meta audit log is out of
+scope); the migration gate above removes the highest-risk window.
 
 ## 7. Error handling & data safety
 
@@ -136,6 +164,22 @@ bulk authority for migrated/external audio.
   (bundle unmaintainable → CMB2) is the documented exit.
 - **Protected meta now public-readable via REST** — benign for size/duration (already public),
   but a pattern to not repeat for sensitive keys.
+
+### Known long-horizon risks (time-travel-critic, deferred not addressed)
+
+- **Frozen bundle breaks the editor on a future WP minor** (regret #1) — a `@wordpress/
+  components` deprecation could blank the panel since `build/` is never rebuilt. *Mitigation
+  when it bites:* a runtime error-boundary that degrades the panel to a "fields unavailable —
+  update the plugin" notice instead of a white panel, + a CI job that rebuilds and smoke-loads
+  the bundle against the latest WP. Deferred (stable-APIs-only reduces the odds for now).
+- **Date-only may be too coarse for multi-service churches** (regret #2) — 8am/11am/6pm
+  services and podcast pubDate ordering may want the time. *If it bites:* store the full
+  timestamp (already the storage format) and add an optional time field to the picker — all
+  conversion still via `@wordpress/date`. Starting date-only to avoid the timezone landmine.
+- **URL-HEAD audio path is the minority and the support-cost** (regret #4) — most real use is
+  the media picker; external URLs are slow and often return no `Content-Length`. *Mitigation:*
+  lead the UI on the media library, mark the URL field "advanced," set the expectation that an
+  external URL may not yield a size.
 
 ## 10. Out of scope (v1)
 
