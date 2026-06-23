@@ -145,6 +145,20 @@ final class MigrationState {
     }
 
     /**
+     * Clear ALL per-record progress (and the phase-complete markers) so a Rollback
+     * leaves no stale complete/in_progress markers pointing at now-deleted posts and a
+     * re-migration starts from pristine bookkeeping. The lifecycle phase and the
+     * detect-time manifest are intentionally LEFT intact (Rollback retreats the phase
+     * to 'detected' separately, and the manifest is still the legacy-shape oracle).
+     */
+    public function resetRecords(): void {
+        $data                  = $this->load();
+        $data['records']       = array();
+        $data['phaseComplete'] = array();
+        $this->save( $data );
+    }
+
+    /**
      * Capture the detect-time manifest (the legacy-shape oracle).
      */
     public function setManifest( Manifest $m ): void {
