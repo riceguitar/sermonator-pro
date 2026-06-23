@@ -19,8 +19,9 @@ use Sermonator\Schema\Identifiers;
  * The lifecycle PHASE is monotonic:
  *   none → detected → migrating → migrated → verified → finalized
  * advancing exactly one step at a time, never skipping nor moving backward — with
- * the single exception of the Rollback-flagged retreat migrated → detected (so a
- * verified run cannot be silently un-done, and a finalized run can never retreat).
+ * the single exception of the Rollback-flagged retreat to detected from either
+ * migrating (a mid-batch crash) or migrated (a complete-but-unverified run), so a
+ * verified run cannot be silently un-done and a finalized run can never retreat.
  * Re-setting the current phase is an idempotent no-op (safe under resume).
  *
  * PER-RECORD progress (keyed by legacy id) carries state ∈
@@ -53,11 +54,13 @@ final class MigrationState {
      * Allowed:
      *  - the immediate next phase (one step forward);
      *  - the same phase (idempotent no-op);
-     *  - migrated → detected ONLY when $rollback === true (the Rollback retreat).
+     *  - migrated → detected ONLY when $rollback === true (the Rollback retreat);
+     *  - migrating → detected ONLY when $rollback === true (the Rollback retreat
+     *    after a real mid-batch crash that left the phase at 'migrating').
      *
      * Any other transition (a multi-step skip such as detected → finalized, an
      * unflagged backward move, or a flagged retreat from anything other than
-     * migrated) throws and leaves the persisted phase unchanged.
+     * migrating/migrated) throws and leaves the persisted phase unchanged.
      *
      * @throws \InvalidArgumentException on an unknown or illegal transition.
      */
@@ -76,15 +79,20 @@ final class MigrationState {
         }
 
         if ( $rollback ) {
-            // The ONLY sanctioned retreat: a completed-but-unverified migration is
-            // rolled back to detected so it can be re-run. Never from verified
-            // (would silently undo verification) nor from finalized (irreversible).
-            if ( $current === 'migrated' && $phase === 'detected' ) {
+            // The ONLY sanctioned retreats, both to 'detected' so a corrected
+            // migration can re-run:
+            //  - migrated → detected:  a completed-but-unverified migration;
+            //  - migrating → detected: a migration that crashed mid-batch (the phase
+            //    never reached 'migrated'). Rollback still cleans up the partial
+            //    records + un-stamped orphans and must return the lifecycle here.
+            // Never from verified (would silently undo verification) nor from
+            // finalized (irreversible).
+            if ( in_array( $current, array( 'migrated', 'migrating' ), true ) && $phase === 'detected' ) {
                 $this->persistPhase( $data, $phase );
                 return;
             }
             throw new \InvalidArgumentException(
-                sprintf( 'Illegal rollback transition "%s" → "%s" (only migrated → detected is allowed).', $current, $phase )
+                sprintf( 'Illegal rollback transition "%s" → "%s" (only migrating/migrated → detected is allowed).', $current, $phase )
             );
         }
 

@@ -378,6 +378,186 @@ final class RollbackTest extends WP_UnitTestCase {
         $this->assertSame( 'detected', ( new MigrationState() )->phase() );
     }
 
+    /**
+     * REAL abort injected mid-run() during the POST force-delete loop — BEFORE
+     * recountNativeTtIds() runs (that recount happens only after every post is
+     * deleted) — then a resume run() completes idempotently.
+     *
+     * A regression that, e.g., recounted per-post instead of once, or that consumed
+     * the backup before restoring, would corrupt the church's shared native count or
+     * lose the native option on this resumed path. We assert the full happy-path
+     * postconditions hold AFTER the resume: zero back-refs, native option RESTORED to
+     * its true native value, shared native category count restored to its true
+     * pre-migration value, legacy byte-equal.
+     */
+    public function test_rollback_resumes_after_abort_in_post_delete_loop(): void {
+        $data   = $this->seedDataset();
+        $before = $this->legacySnapshot();
+        $nativeCountBefore = $this->sharedCategoryCount( $data['nativeCatTtId'] );
+
+        $this->migrateToCompletion();
+
+        // Abort mid-run(): throw on the FIRST post force-delete. wp_delete_post fires
+        // before_delete_post before removing the row, so the throw aborts run() with
+        // at least one native-relationship strip already done but recountNativeTtIds()
+        // NOT yet reached (it runs only after the whole loop).
+        $thrown = false;
+        $boom   = static function ( $postId ) {
+            throw new \RuntimeException( 'injected abort mid post-delete loop @ ' . $postId );
+        };
+        add_action( 'before_delete_post', $boom, 10, 1 );
+        try {
+            ( new Rollback() )->run();
+        } catch ( \RuntimeException $e ) {
+            $thrown = true;
+        } finally {
+            remove_action( 'before_delete_post', $boom, 10 );
+        }
+        $this->assertTrue( $thrown, 'The injected mid-run abort must have fired.' );
+
+        // Partial state: the abort left the migration NOT fully reversed (back-refs
+        // and the migrated posts still partially present), and the phase has NOT
+        // retreated yet (retreat is the last step).
+        $this->assertSame( 'migrated', ( new MigrationState() )->phase(),
+            'Phase must NOT have retreated yet (abort happened before the retreat step).' );
+
+        // Resume: a fresh run() re-derives every id set from the DB and completes.
+        $result = ( new Rollback() )->run();
+        $this->assertSame( array(), $result['warnings'], 'Resumed rollback completes cleanly.' );
+
+        // Full completion after resume.
+        $this->assertSame( 0, $this->countBackRef( Crosswalk::LEGACY_POST_ID ), 'No post back-refs after resumed rollback.' );
+        $this->assertSame( 0, $this->countTermBackRef( Crosswalk::LEGACY_TERM_ID ), 'No term back-refs after resumed rollback.' );
+        $this->assertSame( 0, $this->countCommentBackRef( Crosswalk::LEGACY_COMMENT_ID ), 'No comment back-refs after resumed rollback.' );
+        $this->assertSame( array(), Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON ) );
+        $this->assertSame( array(), Crosswalk::migratedPostIds( Identifiers::POST_TYPE_PODCAST ) );
+
+        // The backed-up native option is RESTORED (not lost, not left as the migrated
+        // value) on the resumed path.
+        $this->assertSame( array( 'native' => 'preexisting' ), get_option( Identifiers::OPTION_TERM_IMAGES ),
+            'Backed-up native option must be RESTORED on the resumed rollback.' );
+
+        // The HARD CONSTRAINT survives the resume: shared native count back to true.
+        $this->assertSame( $nativeCountBefore, $this->sharedCategoryCount( $data['nativeCatTtId'] ),
+            'Shared native category count must be restored to its TRUE pre-migration value on resume.' );
+
+        $this->assertSame( 'detected', ( new MigrationState() )->phase(), 'Phase retreats to detected after resume.' );
+
+        // INVARIANT: legacy byte-equal even across the aborted-then-resumed rollback.
+        $this->assertEquals( $before, $this->legacySnapshot(), 'Legacy data must be byte-equal after aborted+resumed rollback.' );
+    }
+
+    /**
+     * REAL abort injected mid-run() in the OPTION WINDOW: after the sermonator_*
+     * option row has been delete_option()'d but BEFORE its native value is restored
+     * from OPTION_PRE_MIGRATION_BACKUP — the dangerous instant where the migrated
+     * value is gone and the native value not yet back. A resume must still restore
+     * the native value, proving the backup is NOT consumed before the restore
+     * completes (backup-consumption ordering is safe on resume). If a regression
+     * reversed the delete/restore order or deleted the backup first, the church's
+     * native option would be silently lost here.
+     */
+    public function test_rollback_resumes_after_abort_in_option_restore_window(): void {
+        $data   = $this->seedDataset();
+        $before = $this->legacySnapshot();
+        $nativeCountBefore = $this->sharedCategoryCount( $data['nativeCatTtId'] );
+
+        $this->migrateToCompletion();
+
+        // Sanity: the native option WAS overwritten by migration + backed up.
+        $backup = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        $this->assertIsArray( $backup );
+        $this->assertArrayHasKey( Identifiers::OPTION_TERM_IMAGES, $backup );
+
+        // Abort mid-run() exactly inside the restore: run()'s option loop does
+        // delete_option(OPTION_TERM_IMAGES) THEN update_option(OPTION_TERM_IMAGES,
+        // backupValue). Throwing from pre_update_option_<term_images> aborts AFTER the
+        // delete but BEFORE the restore lands.
+        $thrown = false;
+        $boom   = static function ( $value ) {
+            throw new \RuntimeException( 'injected abort in option restore window' );
+        };
+        add_filter( 'pre_update_option_' . Identifiers::OPTION_TERM_IMAGES, $boom, 10, 1 );
+        try {
+            ( new Rollback() )->run();
+        } catch ( \RuntimeException $e ) {
+            $thrown = true;
+        } finally {
+            remove_filter( 'pre_update_option_' . Identifiers::OPTION_TERM_IMAGES, $boom, 10 );
+        }
+        $this->assertTrue( $thrown, 'The injected option-window abort must have fired.' );
+
+        // The backup must NOT have been deleted yet (it is deleted only AFTER the whole
+        // option loop) — so a resume can still restore from it.
+        $this->assertIsArray( get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP ),
+            'Backup must survive an abort that happened during (not after) the restore loop.' );
+
+        // Resume: a fresh run() completes and RESTORES the native option from backup.
+        $result = ( new Rollback() )->run();
+        $this->assertContains( Identifiers::OPTION_TERM_IMAGES, $result['restored'],
+            'Resumed rollback must restore the native option from the surviving backup.' );
+        $this->assertSame( array( 'native' => 'preexisting' ), get_option( Identifiers::OPTION_TERM_IMAGES ),
+            'Native option must be RESTORED (not lost, not left migrated) on the resumed option-window path.' );
+
+        // Full completion + invariants after resume.
+        $this->assertSame( 0, $this->countBackRef( Crosswalk::LEGACY_POST_ID ) );
+        $this->assertSame( $nativeCountBefore, $this->sharedCategoryCount( $data['nativeCatTtId'] ),
+            'Shared native category count restored to its TRUE value on the option-window resume.' );
+        $this->assertSame( 'detected', ( new MigrationState() )->phase() );
+        $this->assertEquals( $before, $this->legacySnapshot(),
+            'Legacy data must be byte-equal after the option-window abort + resume.' );
+    }
+
+    /**
+     * Rollback of a migration that crashed MID-BATCH (phase==='migrating', never
+     * reached 'migrated') with real un-stamped partial orphans. The contract's
+     * unconditional postcondition — "After run, state → detected" — must hold even
+     * from 'migrating': posts/orphans gone, zero back-refs, AND phase==='detected'.
+     * (Previously rollback silently skipped the retreat from 'migrating', leaving the
+     * lifecycle stuck.)
+     */
+    public function test_rollback_from_migrating_phase_retreats_to_detected(): void {
+        $data   = $this->seedDataset();
+        $before = $this->legacySnapshot();
+        $nativeCountBefore = $this->sharedCategoryCount( $data['nativeCatTtId'] );
+
+        // Drive the migration into the 'migrating' phase but NOT to completion: detect,
+        // then run only enough to enter 'migrating' and finish the terms phase, leaving
+        // sermons/podcasts incomplete (phase stays 'migrating').
+        $orch = new Orchestrator();
+        $orch->detect();
+        $orch->run( 50 ); // enters 'migrating', runs the terms phase
+        $this->assertSame( 'migrating', ( new MigrationState() )->phase(),
+            'Setup must leave the phase at migrating (mid-batch crash simulation).' );
+
+        // Inject a real un-stamped partial-orphan sermonator post (crash residue
+        // between insert and the back-ref stamp) so rollback has something to sweep.
+        $orphan = $this->fixture->injectBackRefLessPostOrphan( Identifiers::POST_TYPE_SERMON, array(
+            'post_title' => 'Mid-batch crash orphan',
+        ) );
+        $this->assertSame( Identifiers::POST_TYPE_SERMON, get_post_type( $orphan ) );
+
+        $rollback = new Rollback();
+        $result   = $rollback->run();
+
+        // Orphan + any migrated residue swept; zero back-refs.
+        $this->assertNull( get_post( $orphan ), 'Un-stamped partial orphan must be swept on a migrating-phase rollback.' );
+        $this->assertSame( 0, $this->countBackRef( Crosswalk::LEGACY_POST_ID ), 'No post back-refs after migrating-phase rollback.' );
+        $this->assertSame( array(), Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON ) );
+        $this->assertSame( array(), Crosswalk::migratedPostIds( Identifiers::POST_TYPE_PODCAST ) );
+
+        // THE postcondition under test: the lifecycle retreats to 'detected' even from
+        // 'migrating' (never left stuck).
+        $this->assertSame( 'detected', ( new MigrationState() )->phase(),
+            'Rollback from migrating MUST retreat the phase to detected.' );
+
+        // Shared native count + legacy invariants still hold.
+        $this->assertSame( $nativeCountBefore, $this->sharedCategoryCount( $data['nativeCatTtId'] ),
+            'Shared native category count must be its TRUE pre-migration value after a migrating-phase rollback.' );
+        $this->assertEquals( $before, $this->legacySnapshot(),
+            'Legacy data must be byte-equal after a migrating-phase rollback.' );
+    }
+
     public function test_rollback_warns_on_admin_edited_migrated_post(): void {
         $this->seedDataset();
         $this->migrateToCompletion();

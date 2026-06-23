@@ -115,6 +115,19 @@ final class MigrationStateTest extends WP_UnitTestCase {
         $this->assertSame( 'detected', $state->phase() );
     }
 
+    public function test_rollback_retreat_from_migrating_to_detected_is_allowed(): void {
+        $state = new MigrationState();
+        $state->set( 'detected' );
+        $state->set( 'migrating' );
+
+        // A real mid-batch crash leaves the phase at 'migrating'. Rollback must be
+        // able to retreat it the SAME single step back to 'detected' (the un-stamped
+        // partial-orphan sweep exists precisely to clean up this crash scenario), so
+        // the lifecycle is never left stuck at 'migrating' after a rollback.
+        $state->set( 'detected', true );
+        $this->assertSame( 'detected', $state->phase() );
+    }
+
     public function test_rollback_flag_does_not_permit_arbitrary_retreat(): void {
         $state = new MigrationState();
         $state->set( 'detected' );

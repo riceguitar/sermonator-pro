@@ -14,8 +14,8 @@ use Sermonator\Schema\Identifiers;
  * swept partial-orphan sermonator posts + comments enumerated via LEGACY_COMMENT_ID
  * + migration-made terms — and restores any native options the migration overwrote
  * from OPTION_PRE_MIGRATION_BACKUP. Legacy wpfc_ / sermonmanager_ data is left
- * byte-for-byte unchanged. After a run the state retreats migrated → detected and
- * ZERO records carry any back-ref.
+ * byte-for-byte unchanged. After a run the state retreats to detected (from either
+ * migrating — a mid-batch crash — or migrated) and ZERO records carry any back-ref.
  *
  * THE HARD CONSTRAINT (B2a fix-10 — shared-taxonomy counts).
  * SermonWriter::mirrorNativeTaxonomies inserts NATIVE (category/post_tag/custom)
@@ -174,11 +174,16 @@ final class Rollback {
         delete_option( Identifiers::OPTION_MIGRATION_PROGRESS );
         delete_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
 
-        // Retreat the lifecycle phase migrated → detected (the only sanctioned
-        // backward move) so a corrected re-migration can proceed. A no-op when the
-        // phase is already at/below detected (e.g. an idempotent second run).
+        // Retreat the lifecycle phase to detected (the only sanctioned backward move)
+        // so a corrected re-migration can proceed. This must fire from BOTH:
+        //  - 'migrated'  — a complete-but-unverified migration, and
+        //  - 'migrating' — a migration that crashed mid-batch (the contract's
+        //    unconditional postcondition is "After run, state → detected"; leaving it
+        //    stuck at 'migrating' after deleting posts + sweeping orphans would
+        //    violate that). A no-op when the phase is already at/below detected (e.g.
+        //    an idempotent second run, or a finalized refusal handled above).
         $phase = $this->state->phase();
-        if ( $phase === 'migrated' ) {
+        if ( $phase === 'migrated' || $phase === 'migrating' ) {
             $this->state->set( 'detected', true );
         }
         // Reset per-record progress so a re-migration starts clean (no stale
