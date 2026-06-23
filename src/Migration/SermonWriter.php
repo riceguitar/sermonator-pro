@@ -865,6 +865,35 @@ final class SermonWriter {
      * @param list<string> $flags
      * @return list<string>
      */
+    /**
+     * Mirror "native" (non-wpfc_) taxonomy assignments from the legacy sermon to the
+     * new Sermonator sermon via DIRECT $wpdb INSERT into wp_term_relationships.
+     *
+     * HARD CONSTRAINT for B2b Rollback:
+     *   This method MUST NOT call wp_set_object_terms() or wp_update_term_count().
+     *   Both of those functions increment wp_term_taxonomy.count immediately, which
+     *   is a SHARED counter (not per-site, not per-migration). Any increment before
+     *   B2b Finalize fires would corrupt the live site's term count — even if the
+     *   migration is later rolled back, the increment cannot be undone retroactively.
+     *   Instead, every term_taxonomy_id whose count is now stale-by-design is recorded
+     *   in OPTION_MIGRATION_PROGRESS[PROGRESS_KEY]['native_term_recount_tt_ids'].
+     *   B2b Finalize runs wp_update_term_count() on that list exactly once after all
+     *   B2a writes are confirmed and the shared counter is safe to touch.
+     *
+     *   B2b Rollback MUST call wp_update_term_count() on the same tt_id list in reverse
+     *   (to decrement counts back to their pre-migration value) before removing the
+     *   term_relationship rows. Failure to do so leaves the count permanently inflated.
+     *
+     * Idempotent: pre-checks each (object_id, term_taxonomy_id) pair before inserting;
+     * already-linked pairs still contribute to the recount list.
+     *
+     * @param int         $newId    New Sermonator post ID.
+     * @param int         $legacyId Legacy Sermon Manager post ID.
+     * @param list<string> $flags   Migration flags accumulated so far.
+     * @param bool        $fresh    True when $newId was JUST inserted (gates no-op
+     *                              guard for empty legacy reads on resume).
+     * @return list<string> Updated $flags.
+     */
     private function mirrorNativeTaxonomies( int $newId, int $legacyId, array $flags, bool $fresh ): array {
         global $wpdb;
 
@@ -1560,13 +1589,36 @@ final class SermonWriter {
      * post cache. Idempotent: a no-op when both columns already match (so resume /
      * orphan-adoption re-entries do not churn the row).
      */
+    /**
+     * Force-preserve ALL legacy date/status columns that wp_insert_post may silently
+     * rewrite, via direct $wpdb->update (which bypasses WP's re-stamp logic).
+     *
+     * Columns restored:
+     *  - post_modified / post_modified_gmt — wp_insert_post forces these to post_date.
+     *  - post_date / post_date_gmt       — WP recomputes post_date_gmt from the site
+     *                                       timezone when the postarr value differs from
+     *                                       get_gmt_from_date(post_date). Preserving
+     *                                       them verbatim retains the legacy church's
+     *                                       original TZ-aware timestamps.
+     *  - post_status                      — A 'future' post whose post_date is already
+     *                                       in the past is silently flipped to 'publish'
+     *                                       by wp_insert_post (via wp_check_post_lock).
+     *                                       Force-restoring 'future' matches the legacy
+     *                                       state exactly.
+     *
+     * Idempotent: reads current columns first and skips the $wpdb->update when all six
+     * columns already match (resume path, COMPLETE-branch self-heal).
+     */
     private function preserveModifiedTimestamps( int $newId, \WP_Post $legacy ): void {
         $current = get_post( $newId );
         if ( ! $current instanceof \WP_Post ) {
             return;
         }
         if ( $current->post_modified === $legacy->post_modified
-            && $current->post_modified_gmt === $legacy->post_modified_gmt ) {
+            && $current->post_modified_gmt === $legacy->post_modified_gmt
+            && $current->post_date === $legacy->post_date
+            && $current->post_date_gmt === $legacy->post_date_gmt
+            && $current->post_status === $legacy->post_status ) {
             return; // already preserved — idempotent no-op.
         }
 
@@ -1576,6 +1628,9 @@ final class SermonWriter {
             array(
                 'post_modified'     => $legacy->post_modified,
                 'post_modified_gmt' => $legacy->post_modified_gmt,
+                'post_date'         => $legacy->post_date,
+                'post_date_gmt'     => $legacy->post_date_gmt,
+                'post_status'       => $legacy->post_status,
             ),
             array( 'ID' => $newId )
         );
