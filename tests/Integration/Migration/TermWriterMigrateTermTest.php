@@ -435,6 +435,106 @@ final class TermWriterMigrateTermTest extends WP_UnitTestCase {
         $this->assertSame( $metaBefore, get_term_meta( $legacyId ) );
     }
 
+    /**
+     * FIX 1 (CRITICAL): A NATIVE term in the target taxonomy that shares the same
+     * NAME as the legacy term but has a DIFFERENT slug must NEVER be adopted.
+     *
+     * Bug scenario: native='Grace' slug='grace-fellowship', legacy='Grace' slug='grace'.
+     * (1) slugIsTaken=false (slug 'grace' is free) → insert 'Grace' at slug 'grace'.
+     * (2) wp_insert_term raises term_exists on the NAME match (non-hierarchical taxonomy).
+     * (3) The residual findBackRefLessTermByName('Grace') returns the NATIVE term.
+     * Before the fix, adoptTerm() would stamp LEGACY_TERM_ID/LEGACY_SLUG onto the native
+     * term — violating "never mutate a native term" and conflating two distinct entities.
+     * After the fix, the fallback requires a LEGACY_SLUG ownership marker; without one
+     * it routes to the deterministic slug-collision suffix branch instead.
+     */
+    public function test_native_term_same_name_different_slug_is_never_adopted_creates_new_term(): void {
+        // Insert a NATIVE term: name='Grace', slug='grace-fellowship'.
+        $native = wp_insert_term( 'Grace', Identifiers::TAX_TOPIC, array( 'slug' => 'grace-fellowship' ) );
+        $this->assertIsArray( $native );
+        $nativeTermId = (int) $native['term_id'];
+
+        // Sanity: native term carries NO ownership markers.
+        $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_SLUG, true ) );
+        $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_TERM_ID, true ) );
+
+        // Snapshot native term state before migration.
+        $nativeSnapshot   = $this->snapshotTerm( $nativeTermId, Identifiers::TAX_TOPIC );
+        $nativeMetaBefore = get_term_meta( $nativeTermId );
+
+        // Legacy term: name='Grace', auto-slug='grace' (different from 'grace-fellowship').
+        $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Grace' );
+        $legacy   = $this->legacyTerm( LegacyIdentifiers::TAX_TOPIC, $legacyId );
+        $this->assertSame( 'grace', $legacy->slug, 'legacy term must have slug "grace"' );
+
+        $countBefore = (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) );
+
+        $writer = new TermWriter();
+        $newId  = $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy );
+
+        // A NEW distinct term must have been created — NOT the native term.
+        $this->assertGreaterThan( 0, $newId );
+        $this->assertNotSame(
+            $nativeTermId,
+            $newId,
+            'migrateTerm() must NEVER adopt a native term (no LEGACY_SLUG ownership marker).'
+        );
+
+        // A new term was inserted (count increased by 1).
+        $this->assertSame(
+            $countBefore + 1,
+            (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) ),
+            'A new term must be created, not adopted from the native term.'
+        );
+
+        // The new term must carry the deterministic suffix slug.
+        $new = get_term( $newId, Identifiers::TAX_TOPIC );
+        $this->assertInstanceOf( WP_Term::class, $new );
+        $this->assertSame(
+            'grace-legacy-' . $legacyId,
+            $new->slug,
+            'New term must have the deterministic slug_collision suffix slug.'
+        );
+        $this->assertSame( 'Grace', $new->name );
+
+        // slug_collision flag must be recorded on the new term.
+        $this->assertContains(
+            'slug_collision',
+            $this->flattenFlags( get_term_meta( $newId, Crosswalk::MIGRATION_FLAGS, false ) ),
+            'slug_collision flag must be recorded on the new term.'
+        );
+
+        // LEGACY_SLUG on the new term records the ORIGINAL legacy slug (not the suffix).
+        $this->assertSame( 'grace', get_term_meta( $newId, Crosswalk::LEGACY_SLUG, true ) );
+
+        // The NATIVE term is byte-for-byte untouched — no back-ref, no LEGACY_SLUG.
+        $this->assertSame(
+            $nativeSnapshot,
+            $this->snapshotTerm( $nativeTermId, Identifiers::TAX_TOPIC ),
+            'Native term columns must be byte-for-byte unchanged after migrateTerm().'
+        );
+        $this->assertSame(
+            $nativeMetaBefore,
+            get_term_meta( $nativeTermId ),
+            'Native term meta must be byte-for-byte unchanged after migrateTerm().'
+        );
+        $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_TERM_ID, true ) );
+        $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_SLUG, true ) );
+
+        // The new term resolves authoritatively via Crosswalk.
+        $this->assertSame( $newId, Crosswalk::findNewTermByLegacyId( $legacyId, Identifiers::TAX_TOPIC ) );
+
+        // Idempotent re-run: same id, no extra term, native still untouched.
+        $second = $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy );
+        $this->assertSame( $newId, $second );
+        $this->assertSame(
+            $nativeSnapshot,
+            $this->snapshotTerm( $nativeTermId, Identifiers::TAX_TOPIC ),
+            'Native term must remain untouched after idempotent re-run.'
+        );
+        $this->assertCount( 1, get_term_meta( $newId, Crosswalk::LEGACY_TERM_ID, false ) );
+    }
+
     /** @param list<mixed> $flagRows @return list<string> */
     private function flattenFlags( array $flagRows ): array {
         $out = array();

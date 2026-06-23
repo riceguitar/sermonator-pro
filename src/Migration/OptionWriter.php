@@ -25,14 +25,20 @@ use Sermonator\Schema\Identifiers;
  *    PODCAST post type, so the new default points at the migrated podcast. An
  *    unresolved id is left out (never a dangling legacy id) — the podcast pass
  *    runs before options, so a resolvable id is normally present;
- *  - KNOWN id-bearing scalar options (sermonator_default_series,
- *    sermonator_default_preacher) embed legacy term ids in their VALUE. These are
- *    translated via TermCrosswalk::newTermId() BEFORE the write so the stored
- *    value always points at the new term. An unresolvable id is left verbatim AND
- *    a missing_option_id_crosswalk:<optionName> flag is recorded under
+ *  - KNOWN id-bearing options (the CLOSED set: sermonator_default_series,
+ *    sermonator_default_preacher, sermonator_default_service_type,
+ *    sermonator_default_book, sermonator_default_topic) embed legacy term ids in
+ *    their VALUE — either as a scalar integer/string OR nested inside an array.
+ *    These are translated recursively via TermCrosswalk::newTermId() BEFORE the
+ *    write so the stored value always points at the new term (type-preserving:
+ *    int→int, string→string). An unresolvable positive id is left verbatim AND a
+ *    missing_option_id_crosswalk:<optionName> flag is recorded under
  *    OPTION_MIGRATION_PROGRESS['options']['option_id_flags'] so a later pass
- *    (once the term is migrated) can re-run and clear it. Attachment ids embedded
- *    in options are SHARED globals — they never change — so they are left verbatim;
+ *    (once the term is migrated) can re-run and clear it. option_id_flags uses
+ *    REPLACE semantics — an empty set on self-heal unconditionally deletes any
+ *    stale flag so the Verifier can gate on "no flags" reliably. Attachment ids
+ *    embedded in options are SHARED globals — they never change — so they are left
+ *    verbatim and are intentionally excluded from TERM_ID_OPTIONS;
  *  - legacy options are NEVER mutated.
  *
  * @phpstan-type MigrateResult array{written: int, backed_up: int}
@@ -42,17 +48,23 @@ final class OptionWriter {
     private const PROGRESS_KEY = 'options';
 
     /**
-     * New option names whose VALUES are a single legacy TERM ID.
-     * These are translated via TermCrosswalk::newTermId() before writing.
+     * The CLOSED set of new option names whose VALUES embed legacy TERM IDs —
+     * either as a top-level scalar or recursively within an array. All are
+     * translated via TermCrosswalk::newTermId() (type-preserving; recursing into
+     * arrays) before writing. Any unresolvable positive id is left verbatim and
+     * flagged with missing_option_id_crosswalk:<optionName>.
      *
      * Attachment ids in options are SHARED globals (same id in both schemas)
-     * and are intentionally excluded from this list — they never need remapping.
+     * and are intentionally excluded — they never need remapping.
      *
      * @var list<string>
      */
     private const TERM_ID_OPTIONS = array(
         'sermonator_default_series',
         'sermonator_default_preacher',
+        'sermonator_default_service_type',
+        'sermonator_default_book',
+        'sermonator_default_topic',
     );
 
     /**
@@ -79,10 +91,11 @@ final class OptionWriter {
             ++$written;
         }
 
-        // Persist any id-crosswalk flags so a later pass can self-heal them.
-        if ( $idFlags !== array() ) {
-            $this->recordOptionFlags( array_values( array_unique( $idFlags ) ) );
-        }
+        // Persist id-crosswalk flags (REPLACE semantics): always call, including
+        // with an empty array, so a self-heal re-run that resolves all ids clears
+        // any stale missing_option_id_crosswalk flags rather than leaving them
+        // forever. Mirrors SermonWriter/PodcastWriter::writeFlags() replace semantics.
+        $this->recordOptionFlags( array_values( array_unique( $idFlags ) ) );
 
         // Remap the default-podcast pointer (legacy post id → new post id).
         if ( $this->migrateDefaultPodcast( $backedUp ) ) {
@@ -96,14 +109,15 @@ final class OptionWriter {
     }
 
     /**
-     * For KNOWN id-bearing scalar options, translate the embedded legacy id to the
-     * new id via TermCrosswalk. Returns the (possibly remapped) value and any
+     * For KNOWN id-bearing options (TERM_ID_OPTIONS), translate all embedded
+     * legacy term ids to new term ids via TermCrosswalk — recursing into arrays
+     * so both scalar and array-valued options are covered (type-preserving:
+     * int→int, string→string). Returns the (possibly remapped) value and any
      * missing-crosswalk flags.
      *
-     * Options whose values embed legacy TERM IDs (sermonator_default_series,
-     * sermonator_default_preacher) are translated via TermCrosswalk::newTermId().
-     * If the crosswalk is unresolvable the value is left VERBATIM and a
-     * missing_option_id_crosswalk:<optionName> flag is returned.
+     * An unresolvable positive id is left VERBATIM and a
+     * missing_option_id_crosswalk:<optionName> flag is returned so a later
+     * self-heal pass can re-run once the term is migrated.
      *
      * Attachment ids are SHARED globals (same id in both schemas) — they do not
      * appear in TERM_ID_OPTIONS and are intentionally left verbatim.
@@ -114,31 +128,78 @@ final class OptionWriter {
         $flags = array();
 
         if ( in_array( $optionName, self::TERM_ID_OPTIONS, true ) ) {
-            // Value is a legacy term id (stored as an integer or numeric string).
-            $legacyTermId = (int) $value;
-            if ( $legacyTermId > 0 ) {
-                $newTermId = $crosswalk->newTermId( $legacyTermId );
-                if ( null !== $newTermId ) {
-                    $value = $newTermId;
-                } else {
-                    // Crosswalk not yet available — leave verbatim and flag for self-heal.
-                    $flags[] = 'missing_option_id_crosswalk:' . $optionName;
-                }
-            }
+            $value = $this->remapTermValue( $optionName, $value, $crosswalk, $flags );
         }
 
         return array( 'value' => $value, 'flags' => $flags );
     }
 
     /**
-     * Record id-crosswalk flags into OPTION_MIGRATION_PROGRESS['options']['option_id_flags'].
-     * These signal that a later migrate() run should re-attempt id translation once
-     * the relevant TermWriter has run.
+     * Recursively translate legacy term ids embedded in a value (scalar or array).
+     *
+     * Positive integer values (int or numeric string) are looked up via
+     * TermCrosswalk::newTermId(). An unresolvable positive id is left verbatim and
+     * appends a missing_option_id_crosswalk:<optionName> flag. Non-positive or
+     * non-numeric scalars pass through unchanged. Arrays are recursed into.
+     * Type is preserved: an int input yields an int output; a string input yields a
+     * string output.
+     *
+     * @param list<string> $flags Accumulated by reference.
+     * @return mixed The (possibly remapped) value.
+     */
+    private function remapTermValue( string $optionName, mixed $value, TermCrosswalk $crosswalk, array &$flags ): mixed {
+        if ( is_array( $value ) ) {
+            $out = array();
+            foreach ( $value as $k => $v ) {
+                $out[ $k ] = $this->remapTermValue( $optionName, $v, $crosswalk, $flags );
+            }
+            return $out;
+        }
+
+        if ( is_int( $value ) || ( is_string( $value ) && ctype_digit( $value ) && '' !== $value ) ) {
+            $legacyTermId = (int) $value;
+            if ( $legacyTermId > 0 ) {
+                $newTermId = $crosswalk->newTermId( $legacyTermId );
+                if ( null !== $newTermId ) {
+                    // Type-preserving: if original was string, return string.
+                    return is_string( $value ) ? (string) $newTermId : $newTermId;
+                }
+                // Crosswalk not yet available — leave verbatim and flag for self-heal.
+                $flags[] = 'missing_option_id_crosswalk:' . $optionName;
+            }
+        }
+
+        return $value;
+    }
+
+    /**
+     * Persist id-crosswalk flags into OPTION_MIGRATION_PROGRESS['options']['option_id_flags']
+     * with REPLACE semantics: an empty $flags array DELETES the sub-key so a
+     * self-heal re-run leaves the flags absent rather than a stale array. Mirrors
+     * SermonWriter/PodcastWriter::writeFlags() replace semantics — a Verifier gating
+     * on empty flags reads "never-clean" unless the sub-key is actually absent.
      *
      * @param list<string> $flags
      */
     private function recordOptionFlags( array $flags ): void {
-        $this->updateProgress( 'option_id_flags', $flags );
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        if ( ! is_array( $progress ) ) {
+            $progress = array();
+        }
+        if ( ! isset( $progress[ self::PROGRESS_KEY ] ) || ! is_array( $progress[ self::PROGRESS_KEY ] ) ) {
+            $progress[ self::PROGRESS_KEY ] = array();
+        }
+
+        if ( $flags === array() ) {
+            // Replace semantics: empty → remove the sub-key entirely.
+            unset( $progress[ self::PROGRESS_KEY ]['option_id_flags'] );
+        } else {
+            $progress[ self::PROGRESS_KEY ]['option_id_flags'] = $flags;
+        }
+
+        if ( ! add_option( Identifiers::OPTION_MIGRATION_PROGRESS, $progress ) ) {
+            update_option( Identifiers::OPTION_MIGRATION_PROGRESS, $progress );
+        }
     }
 
     /**

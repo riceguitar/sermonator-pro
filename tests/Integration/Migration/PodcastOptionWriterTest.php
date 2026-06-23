@@ -1009,4 +1009,100 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
             'option_id_flags must contain the missing-crosswalk flag for sermonator_default_series'
         );
     }
+
+    // ----------------------------------- FIX 2: array-valued embedded term id remap
+
+    /**
+     * FIX 2a: An option whose value is an ARRAY embedding a legacy term id must have
+     * that id remapped recursively via TermCrosswalk. Non-integer elements must pass
+     * through verbatim (type-preserving). Covers the array-recursion gap: previously
+     * only scalar TERM_ID_OPTIONS were remapped; array values were copied verbatim.
+     */
+    public function test_option_array_valued_embedded_term_id_remapped(): void {
+        $legacyTermId = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Array Series ' . wp_generate_uuid4() );
+        ( new TermWriter() )->migrateAll();
+        $newTermId = Crosswalk::findNewTermByLegacyId( $legacyTermId, Identifiers::TAX_SERIES );
+        $this->assertNotNull( $newTermId, 'TermWriter must produce a crosswalk for the legacy term' );
+
+        // Array value: one legacy term id + one verbatim non-integer entry.
+        $this->fixture->setOption( 'sermonmanager_default_series', array( 0 => $legacyTermId, 'extra' => 'keep' ) );
+
+        ( new OptionWriter() )->migrate();
+
+        $stored = get_option( 'sermonator_default_series' );
+        $this->assertIsArray( $stored, 'Array-valued option must remain an array after remap.' );
+        $this->assertSame(
+            (int) $newTermId,
+            $stored[0],
+            'Legacy term id at index 0 must be remapped to the new term id.'
+        );
+        $this->assertSame(
+            'keep',
+            $stored['extra'],
+            'Non-integer "extra" key must pass through verbatim.'
+        );
+    }
+
+    /**
+     * FIX 2b: An array-valued option with an unresolvable legacy term id must leave
+     * that id verbatim AND record a missing_option_id_crosswalk flag.
+     */
+    public function test_option_unresolvable_array_term_id_left_verbatim_and_flagged(): void {
+        // Non-existent term id — no crosswalk will exist.
+        $this->fixture->setOption( 'sermonmanager_default_series', array( 0 => 99998 ) );
+
+        ( new OptionWriter() )->migrate();
+
+        $stored = get_option( 'sermonator_default_series' );
+        $this->assertIsArray( $stored, 'Option must remain an array.' );
+        $this->assertSame( 99998, $stored[0], 'Unresolvable term id must be left verbatim.' );
+
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        $this->assertIsArray( $progress );
+        $this->assertContains(
+            'missing_option_id_crosswalk:sermonator_default_series',
+            $progress['options']['option_id_flags'] ?? array(),
+            'A missing_option_id_crosswalk flag must be recorded for the unresolvable array-embedded id.'
+        );
+    }
+
+    // ----------------------------------- FIX 3: replace-semantics for option_id_flags
+
+    /**
+     * FIX 3: option_id_flags must use REPLACE semantics. After a term is migrated and
+     * OptionWriter is re-run, the stale missing_option_id_crosswalk flag must be
+     * CLEARED (sub-key absent/empty) — not left forever because $idFlags was empty and
+     * recordOptionFlags() was skipped. A Verifier gating on "no flags" must read clean.
+     */
+    public function test_option_id_flags_cleared_on_self_heal_after_term_migrated(): void {
+        $legacyTermId = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Self Heal ' . wp_generate_uuid4() );
+        $this->fixture->setOption( 'sermonmanager_default_series', (string) $legacyTermId );
+
+        // First migrate() — crosswalk missing, flag must be set.
+        ( new OptionWriter() )->migrate();
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        $this->assertContains(
+            'missing_option_id_crosswalk:sermonator_default_series',
+            $progress['options']['option_id_flags'] ?? array(),
+            'precondition: flag must be set when crosswalk is missing'
+        );
+
+        // Migrate the term (crosswalk now exists).
+        ( new TermWriter() )->migrateAll();
+        $newTermId = Crosswalk::findNewTermByLegacyId( $legacyTermId, Identifiers::TAX_SERIES );
+        $this->assertNotNull( $newTermId );
+
+        // Second migrate() — crosswalk resolves, flag must be CLEARED.
+        ( new OptionWriter() )->migrate();
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        $this->assertNotContains(
+            'missing_option_id_crosswalk:sermonator_default_series',
+            $progress['options']['option_id_flags'] ?? array(),
+            'option_id_flags must be cleared on self-heal after the term is migrated'
+        );
+
+        // Option must now hold the NEW term id.
+        $stored = get_option( 'sermonator_default_series' );
+        $this->assertSame( (string) $newTermId, (string) $stored );
+    }
 }

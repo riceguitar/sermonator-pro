@@ -49,7 +49,10 @@ use WP_Term;
  *   flag. The match is narrowed to NAME-AND-SLUG (not name alone) so a church's
  *   NATIVE term that shares only the SLUG (a DIFFERENT name) is still protected by
  *   the deterministic-suffix branch and never adopted. A residual no-throw guard
- *   in the term_exists fallback covers WP builds that raise on a NAME-only match.
+ *   in the term_exists fallback covers WP builds that raise on a NAME-only match,
+ *   but ONLY adopts when the candidate carries a LEGACY_SLUG ownership marker —
+ *   a native same-name/different-slug term (no marker) routes to the deterministic
+ *   suffix instead of being stamped with our back-refs (CRITICAL guard).
  * - Write ordering (crash-safety): LEGACY_SLUG ownership marker FIRST, then the
  *   back-refs (term_id + tt_id), then flags (COMPLETE-LAST) — all only after a
  *   confirmed, non-error insert (never before the is_wp_error guard).
@@ -202,23 +205,35 @@ final class TermWriter {
             // WordPress. But on a WP build that raises term_exists on a NAME-only
             // match (no slug match) the deterministic re-insert below could THROW and
             // wedge the migration. Rather than throw, adopt the colliding back-ref-
-            // less SAME-NAME term as a last resort (stamp the back-ref, never edit
-            // the term). Only fires when no distinct term could be created — strictly
-            // better than a permanent wedge. No spurious slug_collision when the
-            // orphan already sits at the legacy slug.
+            // less SAME-NAME term as a last resort — BUT ONLY if it carries our
+            // LEGACY_SLUG ownership marker (the unambiguous 'ours' signal; a native
+            // term NEVER carries LEGACY_SLUG). Without this guard the fallback would
+            // stamp LEGACY_TERM_ID/LEGACY_TERM_TT_ID/LEGACY_SLUG onto a church's
+            // OWN term whose name matches but whose slug differs — violating the
+            // invariant "never mutate a native term" and conflating two distinct
+            // entities irreversibly after Finalize strips the back-refs.
+            // A native same-name term (no marker) falls through to the deterministic
+            // suffix branch below — a recoverable collision is always safer than an
+            // unrecoverable native-term mutation.
             $sameNameOrphanId = $this->findBackRefLessTermByName( $name, $targetTaxonomy );
             if ( $sameNameOrphanId !== null ) {
-                $orphanSlug    = (string) get_term( $sameNameOrphanId, $targetTaxonomy )->slug;
-                $adoptionFlags = $flags;
-                if ( $orphanSlug === $legacySlug ) {
-                    $adoptionFlags = array_values( array_filter(
-                        $adoptionFlags,
-                        static function ( $flag ): bool {
-                            return $flag !== 'slug_collision';
-                        }
-                    ) );
+                $hasOwnershipMarker = '' !== (string) get_term_meta( $sameNameOrphanId, Crosswalk::LEGACY_SLUG, true );
+                if ( $hasOwnershipMarker ) {
+                    // OUR crash orphan — safe to adopt.
+                    $orphanSlug    = (string) get_term( $sameNameOrphanId, $targetTaxonomy )->slug;
+                    $adoptionFlags = $flags;
+                    if ( $orphanSlug === $legacySlug ) {
+                        $adoptionFlags = array_values( array_filter(
+                            $adoptionFlags,
+                            static function ( $flag ): bool {
+                                return $flag !== 'slug_collision';
+                            }
+                        ) );
+                    }
+                    return $this->adoptTerm( $sameNameOrphanId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $adoptionFlags );
                 }
-                return $this->adoptTerm( $sameNameOrphanId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $adoptionFlags );
+                // No LEGACY_SLUG marker — this is a NATIVE same-name term.
+                // Fall through to the deterministic '$slug-legacy-$id' suffix branch.
             }
 
             $deterministicSlug = $legacySlug . '-legacy-' . $legacyTermId;
