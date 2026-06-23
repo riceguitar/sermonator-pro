@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/podcast-subscribe",
+  "title": "Podcast Subscribe",
+  "category": "widgets",
+  "icon": "rss",
+  "description": "Subscribe links (RSS, Apple Podcasts, Spotify) for a sermon podcast.",
+  "textdomain": "sermonator",
+  "attributes": {
+    "podcastId": { "type": "number", "default": 0 },
+    "showRss": { "type": "boolean", "default": true },
+    "showApple": { "type": "boolean", "default": true },
+    "showSpotify": { "type": "boolean", "default": true }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}

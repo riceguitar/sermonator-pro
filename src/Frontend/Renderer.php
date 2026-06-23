@@ -151,6 +151,25 @@ final class Renderer {
     }
 
     /**
+     * Subscribe links for a podcast (RSS / Apple / Spotify …). Pure: takes resolved
+     * {label,url,service} entries.
+     *
+     * @param list<array{label:string,url:string,service:string}> $links
+     */
+    public function subscribeLinks( array $links, string $label = '' ): string {
+        if ( $links === array() ) {
+            return '';
+        }
+        $buttons = '';
+        foreach ( $links as $link ) {
+            $buttons .= '<a class="sermonator-subscribe__link sermonator-subscribe__link--' . esc_attr( $link['service'] ) . '"'
+                . ' href="' . esc_url( $link['url'] ) . '">' . esc_html( $link['label'] ) . '</a>';
+        }
+        $heading = $label !== '' ? '<span class="sermonator-subscribe__label">' . esc_html( $label ) . '</span>' : '';
+        return '<div class="sermonator-subscribe">' . $heading . $buttons . '</div>';
+    }
+
+    /**
      * Allowed HTML for a stored video embed. wp_kses_post() strips <iframe>, which would
      * silently delete YouTube/Vimeo embeds, so we extend the post allowlist with iframe (and
      * <video>/<source> for self-hosted) limited to safe, embed-relevant attributes.

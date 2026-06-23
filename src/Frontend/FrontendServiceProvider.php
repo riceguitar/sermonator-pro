@@ -10,6 +10,7 @@ use Sermonator\Frontend\Blocks\VideoBlock;
 use Sermonator\Frontend\Blocks\SermonCardBlock;
 use Sermonator\Frontend\Blocks\SermonGridBlock;
 use Sermonator\Frontend\Blocks\TaxonomyFilterBlock;
+use Sermonator\Frontend\Blocks\PodcastSubscribeBlock;
 use Sermonator\Frontend\Feed\PodcastFeed;
 
 /**
@@ -44,6 +45,7 @@ final class FrontendServiceProvider {
         ( new SermonCardBlock() )->register();
         ( new SermonGridBlock() )->register();
         ( new TaxonomyFilterBlock() )->register();
+        ( new PodcastSubscribeBlock() )->register();
 
         ( new BlockTemplates() )->register();
     }
