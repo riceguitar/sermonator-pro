@@ -201,6 +201,37 @@ final class LegacyFixture {
         return $id;
     }
 
+    /**
+     * Create a legacy podcast whose sm_podcast_settings meta row holds a
+     * SERIALIZED STRING (not an array). Sermon Manager historically stored the
+     * settings as a serialized string in a single meta row; reading it back via
+     * get_post_meta(...,true) WP auto-unserializes, but a row whose stored bytes
+     * are a serialized string (because it was double-serialized / stored as a
+     * string) round-trips through get_post_meta(...,false) as a STRING. We
+     * reproduce that exact on-disk shape: add_post_meta with a pre-serialized
+     * string, wp_slash'd so the backslashes/quotes survive and the row holds the
+     * literal serialized payload as a string value.
+     *
+     * @param array<string,mixed> $settings The settings to serialize into the row.
+     */
+    public function createPodcastWithSerializedStringSettings( array $settings, string $title = 'Feed' ): int {
+        $id = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_PODCAST,
+            'post_title'  => $title,
+            'post_status' => 'publish',
+        ) );
+
+        // Store the settings as a SERIALIZED STRING value. wp_slash so
+        // add_post_meta's internal wp_unslash leaves the serialized payload
+        // byte-intact; get_post_meta(...,false) then returns this as a string
+        // (WP only auto-unserializes once, and the stored scalar is a string that
+        // happens to BE a serialized array — the exact legacy shape).
+        $serialized = serialize( $settings );
+        add_post_meta( $id, LegacyIdentifiers::META_PODCAST_SETTINGS, wp_slash( $serialized ) );
+
+        return $id;
+    }
+
     public function setOption( string $name, mixed $value ): void {
         update_option( $name, $value );
     }

@@ -26,9 +26,14 @@ use Sermonator\Schema\Identifiers;
  *    serialized. The settings key is renamed sm_podcast_settings →
  *    sermonator_podcast_settings, and any taxonomy/term reference inside it is
  *    remapped through TermCrosswalk (legacy taxonomy slug → new taxonomy slug,
- *    legacy term id → new term id);
- *  - MIGRATION_COMPLETE is written LAST, after every step, so an abort anywhere
- *    before it leaves a stamped-but-partial post the gate resumes.
+ *    legacy term id → new term id). A string-valued (serialized) settings row is
+ *    maybe_unserialize()d first so the legacy serialized-string shape is remapped
+ *    and re-stored as an array rather than copied verbatim with dangling refs;
+ *  - MIGRATION_COMPLETE is written LAST, after every step, but is WITHHELD while a
+ *    missing_podcast_term_crosswalk:* flag is open (a feed scoped to a not-yet-
+ *    migrated legacy term): the record stays stamped-but-PARTIAL so the gate
+ *    resumes it and applyMeta() re-remaps the term once it is migrated (self-heal),
+ *    clearing the flag — never a feed scoped to a dead legacy term forever.
  *
  * Legacy data (posts, meta) is read READ-ONLY; shared attachment posts are
  * referenced by id and never mutated.
@@ -51,16 +56,33 @@ final class PodcastWriter {
             }
 
             if ( $this->isComplete( $existing ) ) {
-                // COMPLETE — a no-op skip. A podcast has no self-healing term/comment
-                // steps (its term references live inside settings meta, already
-                // remapped on the writing pass), so a completed podcast is left
-                // entirely untouched.
-                return new WriteResult( $existing, false, $this->readFlags( $existing ), false );
+                // COMPLETE — normally a no-op skip. But a podcast's feed-scope term
+                // references live inside settings meta; if a record was somehow
+                // stamped COMPLETE while a filter-term crosswalk was still missing
+                // (e.g. an older writer that did not withhold COMPLETE), re-run ONLY
+                // the meta remap so the now-available term self-heals and the open
+                // missing_podcast_term_crosswalk flag clears. A completed record with
+                // NO open term flag is left entirely untouched (no re-write).
+                $persisted = $this->readFlags( $existing );
+                if ( $this->hasOpenTermCrosswalkFlag( $persisted ) ) {
+                    $flags = array_merge(
+                        $this->stripTermCrosswalkFlags( $persisted ),
+                        $this->applyMeta( $existing, $legacyId )
+                    );
+                    $flags = array_values( array_unique( $flags ) );
+                    $this->writeFlags( $existing, $flags );
+                    return new WriteResult( $existing, false, $flags, false );
+                }
+                return new WriteResult( $existing, false, $persisted, false );
             }
 
             // Stamped but PARTIAL — RESUME on the existing post (never insert).
             $flags = $this->applyPostInsertSpine( $existing, $legacyId, $this->readFlags( $existing ) );
-            $this->markComplete( $existing );
+            // COMPLETE is WITHHELD while a podcast filter term is still unresolved
+            // so the record stays in this resume leg and applyMeta() re-remaps it on
+            // the next write (self-heal) once the term is migrated — never a feed
+            // scoped to a dead legacy term, stamped-complete-and-skipped-forever.
+            $this->markCompleteUnlessTermCrosswalkOpen( $existing, $flags );
 
             return new WriteResult( $existing, false, $flags, true );
         }
@@ -95,8 +117,13 @@ final class PodcastWriter {
         // --- Crash-safety spine: back-ref FIRST, then idempotent meta. ---
         $flags = $this->applyPostInsertSpine( $newId, $legacyId, array() );
 
-        // MIGRATION_COMPLETE is written LAST.
-        $this->markComplete( $newId );
+        // MIGRATION_COMPLETE is written LAST — but WITHHELD while a podcast filter
+        // term is still unresolved (missing_podcast_term_crosswalk:*). Stamping
+        // COMPLETE with that flag open would scope the feed to a dead legacy term id
+        // forever and route every re-run to the no-op COMPLETE branch (the term
+        // would never self-heal). Leaving the record stamped-but-PARTIAL keeps it in
+        // the resume leg so applyMeta() re-remaps it once the term is migrated.
+        $this->markCompleteUnlessTermCrosswalkOpen( $newId, $flags );
 
         return new WriteResult( $newId, true, $flags );
     }
@@ -133,6 +160,10 @@ final class PodcastWriter {
             }
         }
 
+        // Strip any prior missing_podcast_term_crosswalk:* flags before re-deriving
+        // them from this pass's remap, so a term that has since been migrated clears
+        // its open flag (self-heal) — mirroring SermonWriter's term-flag strip.
+        $flags = $this->stripTermCrosswalkFlags( $flags );
         $flags = array_merge( $flags, $this->applyMeta( $newId, $legacyId ) );
 
         $this->writeFlags( $newId, $flags );
@@ -177,8 +208,23 @@ final class PodcastWriter {
 
             delete_post_meta( $newId, $newKey );
             foreach ( $values as $value ) {
-                if ( $isSettings && is_array( $value ) ) {
-                    $value = $this->remapSettingsTerms( $value );
+                if ( $isSettings ) {
+                    // SM historically stores sm_podcast_settings as a SERIALIZED
+                    // STRING, not an array. get_post_meta(...,false) returns that
+                    // verbatim string (WP auto-unserializes only one level). If the
+                    // string maybe_unserialize()s to an array, remap + re-store as an
+                    // array (core re-serializes); otherwise record a flag so the
+                    // unremapped settings are not silently shipped with dangling refs.
+                    if ( is_string( $value ) ) {
+                        $maybe = maybe_unserialize( $value );
+                        if ( is_array( $maybe ) ) {
+                            $value = $this->remapSettingsTerms( $maybe, $flags );
+                        } else {
+                            $flags[] = 'podcast_settings_unremapped';
+                        }
+                    } elseif ( is_array( $value ) ) {
+                        $value = $this->remapSettingsTerms( $value, $flags );
+                    }
                 }
                 add_post_meta( $newId, $newKey, $value );
             }
@@ -195,23 +241,26 @@ final class PodcastWriter {
      *
      *  - rename each legacy taxonomy-slug key to its NEW taxonomy slug;
      *  - translate each legacy term id to its NEW term id via TermCrosswalk;
-     *  - leave an unresolved term id (never migrated) in place so the feed scope is
-     *    not silently dropped — it is recoverable, and a non-term key passes
-     *    through verbatim.
+     *  - an unresolved term id (never migrated) is left in place so the feed scope
+     *    is not silently dropped (recoverable) AND records a
+     *    missing_podcast_term_crosswalk:<id> flag so the record can be WITHHELD from
+     *    MIGRATION_COMPLETE and self-healed once the term is migrated. A non-term
+     *    key passes through verbatim.
      *
      * Non-taxonomy keys (itunes_author, explicit, …) are copied unchanged.
      *
-     * @param array<mixed> $settings
+     * @param array<mixed>  $settings
+     * @param list<string>  $flags    Threaded by reference; unresolved term ids append a flag.
      * @return array<mixed>
      */
-    private function remapSettingsTerms( array $settings ): array {
+    private function remapSettingsTerms( array $settings, array &$flags ): array {
         $taxonomyMap = MappingContract::taxonomyMap();
         $out         = array();
 
         foreach ( $settings as $key => $value ) {
             if ( is_string( $key ) && isset( $taxonomyMap[ $key ] ) ) {
                 $newKey      = $taxonomyMap[ $key ];
-                $out[ $newKey ] = $this->remapTermValue( $value );
+                $out[ $newKey ] = $this->remapTermValue( $value, $flags );
                 continue;
             }
             $out[ $key ] = $value;
@@ -222,16 +271,19 @@ final class PodcastWriter {
 
     /**
      * Translate a legacy term-id reference (scalar or list) to the new term id(s).
-     * An unresolved id is left as-is (never a silent drop).
+     * An unresolved id is left as-is (never a silent drop) AND records a
+     * missing_podcast_term_crosswalk:<id> flag so the caller can withhold COMPLETE
+     * and self-heal it on a later pass once the term is migrated.
      *
-     * @param mixed $value
+     * @param mixed        $value
+     * @param list<string> $flags Threaded by reference.
      * @return mixed
      */
-    private function remapTermValue( $value ) {
+    private function remapTermValue( $value, array &$flags ) {
         if ( is_array( $value ) ) {
             $mapped = array();
             foreach ( $value as $k => $v ) {
-                $mapped[ $k ] = $this->remapTermValue( $v );
+                $mapped[ $k ] = $this->remapTermValue( $v, $flags );
             }
             return $mapped;
         }
@@ -241,6 +293,9 @@ final class PodcastWriter {
             if ( null !== $new ) {
                 return is_string( $value ) ? (string) $new : $new;
             }
+            // Unresolved — never a silent drop. Leave the legacy id in place and
+            // flag it so COMPLETE is withheld and the id self-heals later.
+            $flags[] = 'missing_podcast_term_crosswalk:' . (int) $value;
         }
 
         return $value;
@@ -284,6 +339,58 @@ final class PodcastWriter {
     /** Write the MIGRATION_COMPLETE flag LAST (replace/unique — idempotent). */
     private function markComplete( int $newId ): void {
         update_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE, '1' );
+    }
+
+    /**
+     * Stamp MIGRATION_COMPLETE only when no missing_podcast_term_crosswalk:* flag
+     * is open. A podcast feed scoped to an unresolved (not-yet-migrated) legacy
+     * term must NOT be stamped complete: doing so would scope the feed to a dead
+     * legacy term id forever (undetectable by the Verifier) and route every re-run
+     * to the no-op COMPLETE branch so the term never self-heals. Leaving the record
+     * stamped-but-PARTIAL keeps it in the resume leg so applyMeta() re-remaps it on
+     * the next write once the term is migrated — mirroring SermonWriter's
+     * complete-unless-open-flag discipline.
+     *
+     * @param list<string> $flags
+     */
+    private function markCompleteUnlessTermCrosswalkOpen( int $newId, array $flags ): void {
+        if ( $this->hasOpenTermCrosswalkFlag( $flags ) ) {
+            return;
+        }
+        $this->markComplete( $newId );
+    }
+
+    /**
+     * Whether any OPEN podcast filter-term crosswalk flag is present
+     * (missing_podcast_term_crosswalk:*). Gates COMPLETE so a feed scoped to a
+     * dead legacy term is never stamped-complete-and-skipped-forever.
+     *
+     * @param list<string> $flags
+     */
+    private function hasOpenTermCrosswalkFlag( array $flags ): bool {
+        foreach ( $flags as $flag ) {
+            if ( str_starts_with( (string) $flag, 'missing_podcast_term_crosswalk:' ) ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Drop previously-derived missing_podcast_term_crosswalk:* flags so a remap
+     * pass can re-derive them from the current crosswalk state (a term that has
+     * since been migrated clears its open flag — self-heal).
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function stripTermCrosswalkFlags( array $flags ): array {
+        return array_values( array_filter(
+            $flags,
+            static function ( $flag ): bool {
+                return ! str_starts_with( (string) $flag, 'missing_podcast_term_crosswalk:' );
+            }
+        ) );
     }
 
     /** Whether a migrated post has been marked complete. */

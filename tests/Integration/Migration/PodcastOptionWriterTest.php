@@ -135,6 +135,97 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         $this->assertSame( array( (int) $newA, (int) $newB ), $stored[ Identifiers::TAX_TOPIC ] );
     }
 
+    /**
+     * IMPORTANT #7: a podcast whose feed is scoped to a taxonomy term that has
+     * NOT YET been migrated must NOT be stamped MIGRATION_COMPLETE with a dead
+     * legacy term id left verbatim in its settings. The unresolved term must
+     * record a missing_podcast_term_crosswalk:<legacyId> flag and WITHHOLD
+     * COMPLETE so the record stays resumable; a re-run AFTER the term is migrated
+     * must self-heal (remap the id, clear the flag, finally stamp COMPLETE).
+     */
+    public function test_podcast_unresolved_filter_term_flags_and_withholds_complete_then_self_heals(): void {
+        // A legacy series term exists but is NOT migrated yet (no crosswalk).
+        $legacySeries = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Advent' );
+        $this->assertNull(
+            ( new \Sermonator\Migration\TermCrosswalk() )->newTermId( $legacySeries ),
+            'precondition: legacy term not yet migrated'
+        );
+
+        $settings = array(
+            'itunes_author'               => 'Church',
+            LegacyIdentifiers::TAX_SERIES => $legacySeries,
+        );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings );
+
+        $writer = new PodcastWriter();
+        $first  = $writer->write( $legacyId );
+
+        // Flagged with the unresolved legacy term id, NOT stamped COMPLETE.
+        $flags = get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertIsArray( $flags );
+        $this->assertContains( 'missing_podcast_term_crosswalk:' . $legacySeries, $flags );
+        $this->assertSame(
+            '',
+            (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'MIGRATION_COMPLETE must be WITHHELD while a podcast filter term is unresolved'
+        );
+        // The legacy term id is still preserved in settings under the new taxonomy
+        // key (never a silent drop) so the feed scope is recoverable.
+        $stored = get_post_meta( $first->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertSame( $legacySeries, $stored[ Identifiers::TAX_SERIES ] );
+
+        // Now migrate the term and re-run: the record must self-heal.
+        ( new TermWriter() )->migrateAll();
+        $newSeries = Crosswalk::findNewTermByLegacyId( $legacySeries, Identifiers::TAX_SERIES );
+        $this->assertNotNull( $newSeries );
+
+        $second = $writer->write( $legacyId );
+        $this->assertSame( $first->newId, $second->newId, 'no second insert' );
+
+        // The flag is cleared and COMPLETE is finally stamped.
+        $healedFlags = get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $healedFlags = is_array( $healedFlags ) ? $healedFlags : array();
+        $this->assertNotContains( 'missing_podcast_term_crosswalk:' . $legacySeries, $healedFlags );
+        $this->assertSame( '1', (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+
+        // The term id inside settings is now the NEW term id.
+        $healed = get_post_meta( $first->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertSame( (int) $newSeries, $healed[ Identifiers::TAX_SERIES ] );
+    }
+
+    /**
+     * IMPORTANT #8: SM historically stores sm_podcast_settings as a SERIALIZED
+     * STRING, not an array. The remap branch only fired on is_array($value), so a
+     * string-valued settings row was copied verbatim with dangling legacy term
+     * refs. The writer must maybe_unserialize() a string value, remap it, and
+     * re-store it as an ARRAY (core re-serializes) under the new key.
+     */
+    public function test_podcast_settings_serialized_string_value_is_unserialized_and_remapped(): void {
+        $legacySeries = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Lent' );
+        ( new TermWriter() )->migrateAll();
+        $newSeries = Crosswalk::findNewTermByLegacyId( $legacySeries, Identifiers::TAX_SERIES );
+        $this->assertNotNull( $newSeries );
+
+        $settings = array(
+            'itunes_author'               => 'Church',
+            LegacyIdentifiers::TAX_SERIES => $legacySeries,
+        );
+        $legacyId = $this->fixture->createPodcastWithSerializedStringSettings( $settings );
+
+        // Precondition: the legacy row holds a STRING value, not an array.
+        $rawLegacy = get_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, false );
+        $this->assertIsString( $rawLegacy[0], 'fixture must seed a serialized STRING value' );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        // Stored as an ARRAY under the new key, with the term remapped.
+        $stored = get_post_meta( $result->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertIsArray( $stored, 'a serialized-string settings value must be re-stored as an array' );
+        $this->assertArrayNotHasKey( LegacyIdentifiers::TAX_SERIES, $stored );
+        $this->assertSame( (int) $newSeries, $stored[ Identifiers::TAX_SERIES ] );
+        $this->assertSame( 'Church', $stored['itunes_author'] );
+    }
+
     public function test_podcast_body_kses_safe_iframe_survives(): void {
         $iframe   = '<iframe src="https://example.com/feed"></iframe>';
         $legacyId = $this->fixture->createPodcastWithSettings( array( 'itunes_author' => 'C' ), 'Feed', $iframe );
