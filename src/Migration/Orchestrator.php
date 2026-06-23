@@ -227,15 +227,99 @@ final class Orchestrator {
     /**
      * Terms: TermWriter::migrateAll is itself idempotent and resumable, so we run
      * it to completion in one phase call. It migrates all 5 taxonomies (orphans
-     * included). On a clean run we mark the terms phase complete — the gate for
-     * sermons/artwork/podcasts.
+     * included).
      *
-     * @return list<string> Flags surfaced by the term writer.
+     * ZERO-MISSING-CROSSWALK GATE (the contract the sermon/artwork/podcast gates
+     * depend on). The plan's must_handle requires the terms phase be marked
+     * complete ONLY when "TermWriter::migrateAll completed with zero missing
+     * crosswalks for sermon-referenced taxonomies" — not merely "the terms phase
+     * ran once". We therefore enforce that contract here as an explicit condition
+     * rather than trusting that migrateAll() always throws on every failure mode:
+     *
+     *  (1) migrateAll() THROWS on a WP_Error legacy-taxonomy read and on a >1
+     *      divergent mapping. We CATCH that throw, surface it as an open
+     *      legacy_terms_failed flag, and leave the terms phase INCOMPLETE so the
+     *      sermon/artwork/podcast gates stay closed (no partial-terms migration is
+     *      ever allowed to unlock the records that reference those terms).
+     *  (2) After a non-throwing run we INDEPENDENTLY re-verify, via the back-ref
+     *      crosswalk, that every legacy term in every sermon-referenced taxonomy
+     *      resolved to exactly one migrated counterpart. Any legacy term without a
+     *      counterpart is a missing crosswalk: we surface
+     *      missing_term_crosswalk:<taxonomy>:<legacyTermId> and REFUSE
+     *      markPhaseComplete('terms'). Re-callable: a later run() retries the term
+     *      phase and, once the gap closes, marks it complete.
+     *
+     * This makes the gate "terms migrated with zero missing crosswalks", and is
+     * proven by tests that drive a taxonomy-read failure (terms NOT complete,
+     * sermons stay gated) and a clean run (terms complete).
+     *
+     * @return list<string> Flags surfaced by the term writer (plus any gate flags).
      */
     private function runTermPhase(): array {
-        $result = $this->termWriter->migrateAll();
+        // Legacy reads (here and inside migrateAll) must work with the legacy
+        // plugin DEACTIVATED — re-register the legacy taxonomies first.
+        LegacySchemaRegistrar::ensureRegistered();
+
+        try {
+            $result = $this->termWriter->migrateAll();
+        } catch ( \Throwable $e ) {
+            // A genuine failure (WP_Error read, >1 divergent mapping). Surface it
+            // and leave terms INCOMPLETE so nothing that references terms unlocks.
+            return array( 'legacy_terms_failed:' . $e->getMessage() );
+        }
+
+        $flags = array_values( (array) ( $result['flags'] ?? array() ) );
+
+        // Independent zero-missing-crosswalk gate over EVERY sermon-referenced
+        // taxonomy. Only when it is fully satisfied do we open the gate.
+        $missing = $this->missingTermCrosswalks();
+        if ( $missing !== array() ) {
+            return array_values( array_merge( $flags, $missing ) );
+        }
+
         $this->state->markPhaseComplete( self::PHASE_TERMS );
-        return array_values( (array) ( $result['flags'] ?? array() ) );
+        return $flags;
+    }
+
+    /**
+     * Enumerate sermon-referenced legacy taxonomies and assert every legacy term
+     * resolved to a migrated counterpart via the back-ref crosswalk. Returns one
+     * missing_term_crosswalk:<taxonomy>:<legacyTermId> flag per gap (empty when the
+     * terms migration is genuinely complete). Read-only.
+     *
+     * @return list<string>
+     */
+    private function missingTermCrosswalks(): array {
+        LegacySchemaRegistrar::ensureRegistered();
+
+        $missing = array();
+        foreach ( LegacyIdentifiers::sermonTaxonomies() as $legacyTaxonomy ) {
+            $targetTaxonomy = MappingContract::taxonomyMap()[ $legacyTaxonomy ] ?? null;
+            if ( $targetTaxonomy === null ) {
+                continue;
+            }
+
+            $terms = get_terms( array(
+                'taxonomy'   => $legacyTaxonomy,
+                'hide_empty' => false,
+            ) );
+
+            if ( is_wp_error( $terms ) ) {
+                // A read failure here is the same class of gap migrateAll throws on;
+                // treat it as a hard miss so the gate stays closed.
+                $missing[] = 'legacy_taxonomy_unreadable:' . $legacyTaxonomy;
+                continue;
+            }
+
+            foreach ( (array) $terms as $legacyTerm ) {
+                $legacyTermId = (int) $legacyTerm->term_id;
+                if ( Crosswalk::findNewTermByLegacyId( $legacyTermId, $targetTaxonomy ) === null ) {
+                    $missing[] = 'missing_term_crosswalk:' . $legacyTaxonomy . ':' . $legacyTermId;
+                }
+            }
+        }
+
+        return array_values( $missing );
     }
 
     /**

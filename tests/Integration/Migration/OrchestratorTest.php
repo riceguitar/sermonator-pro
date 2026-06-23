@@ -313,6 +313,188 @@ final class OrchestratorTest extends WP_UnitTestCase {
         $this->assertEquals( $before, $this->legacySnapshot(), 'Legacy byte-equal across crash/resume.' );
     }
 
+    /**
+     * The genuinely-risky resume path: a REAL mid-write abort that leaves a
+     * stamped-but-PARTIAL post (back-ref present, MIGRATION_COMPLETE ABSENT —
+     * WriteResult case 3), which is the entire reason the in_progress spine exists.
+     *
+     * The prior crash test only ran a sermon to CLEAN completion then re-ran over
+     * the already-COMPLETE record (case 2), never exercising the partial path. Here
+     * we inject the abort directly: after terms complete, we seed for legacy sermon
+     * #1 exactly the post the SermonWriter would leave if it died after inserting
+     * the post + atomic back-ref but before stamping MIGRATION_COMPLETE, and record
+     * it in_progress on MigrationState (as Orchestrator::runPostBatch does before
+     * calling write()). Then a FRESH Orchestrator with the REAL writer resumes.
+     *
+     * Asserts: (a) the aborted legacy id is recorded in_progress (not complete)
+     * after the abort; (b) the resumed run completes it WITHOUT creating a duplicate
+     * — still exactly 3 migrated, one per legacy id, MIGRATION_COMPLETE now present
+     * on every counterpart; (c) the legacy snapshot is byte-equal across the
+     * abort+resume.
+     */
+    public function test_real_mid_write_abort_resumes_without_duplicate_sermons(): void {
+        $data   = $this->seedDataset();
+        $before = $this->legacySnapshot();
+
+        $orch = new Orchestrator();
+        $orch->detect();
+
+        // Complete the terms phase (its bounded loop) so the sermon gate is open.
+        $guard = 0;
+        while ( ! ( new MigrationState() )->phaseComplete( 'terms' ) && $guard < 20 ) {
+            $orch->run( 1 );
+            $guard++;
+        }
+        $this->assertTrue( ( new MigrationState() )->phaseComplete( 'terms' ) );
+
+        // --- Inject the REAL mid-write abort for legacy sermon #1. ---
+        $abortedLegacyId = $data['sermons'][0];
+        $legacy          = get_post( $abortedLegacyId );
+        $this->assertInstanceOf( \WP_Post::class, $legacy );
+
+        // Insert the new post with the SAME atomic back-ref the real writer writes
+        // in its insert (meta_input => [LEGACY_POST_ID => legacyId]) but WITHHOLD
+        // MIGRATION_COMPLETE — the exact stamped-but-partial residue of a crash
+        // after insert but before the LAST step.
+        $partialNewId = (int) wp_insert_post( array(
+            'post_type'    => Identifiers::POST_TYPE_SERMON,
+            'post_title'   => $legacy->post_title,
+            'post_status'  => $legacy->post_status,
+            'post_name'    => $legacy->post_name,
+            'post_content' => $legacy->post_content,
+            'meta_input'   => array( Crosswalk::LEGACY_POST_ID => $abortedLegacyId ),
+        ) );
+        $this->assertGreaterThan( 0, $partialNewId );
+        // The partial post carries the back-ref but NOT the completion stamp.
+        $this->assertSame(
+            (string) $abortedLegacyId,
+            (string) get_post_meta( $partialNewId, Crosswalk::LEGACY_POST_ID, true )
+        );
+        $this->assertEmpty(
+            get_post_meta( $partialNewId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'The injected abort must leave MIGRATION_COMPLETE absent (partial).'
+        );
+
+        // Record it in_progress exactly as runPostBatch does BEFORE the write that
+        // never finished — so the durable state reflects the abort.
+        ( new MigrationState() )->recordRecord( $abortedLegacyId, 'in_progress', null, array() );
+
+        // (a) The aborted id is recorded in_progress (distinct from complete).
+        $rec = ( new MigrationState() )->record( $abortedLegacyId );
+        $this->assertNotNull( $rec );
+        $this->assertSame( 'in_progress', $rec['state'], 'Aborted record must be in_progress after the abort.' );
+
+        // --- Resume with a FRESH Orchestrator (real writer). ---
+        delete_option( Orchestrator::OPTION_LOCK ); // the aborted process never released it.
+        $resumed = new Orchestrator();
+
+        $guard = 0;
+        do {
+            $progress = $resumed->run( 1 );
+            $guard++;
+        } while ( $progress['phase'] !== 'migrated' && $guard < 100 );
+
+        $this->assertSame( 'migrated', ( new MigrationState() )->phase() );
+
+        // (b) No duplicate: exactly 3 migrated sermons, one per legacy id, and the
+        // previously-partial counterpart is the SAME post id (resumed, not re-inserted).
+        $this->assertCount( 3, Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON ),
+            'Resume must complete the partial in place — never insert a duplicate.' );
+        foreach ( $data['sermons'] as $legacyId ) {
+            $newId = Crosswalk::findNewByLegacyId( $legacyId, Identifiers::POST_TYPE_SERMON );
+            $this->assertNotNull( $newId, 'Every legacy sermon has a migrated counterpart.' );
+            $this->assertNotEmpty(
+                get_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE, true ),
+                'Every counterpart carries MIGRATION_COMPLETE after resume.'
+            );
+        }
+        $this->assertSame(
+            $partialNewId,
+            Crosswalk::findNewByLegacyId( $abortedLegacyId, Identifiers::POST_TYPE_SERMON ),
+            'The resumed counterpart is the SAME post the abort left partial (no second insert).'
+        );
+        $resumedRec = ( new MigrationState() )->record( $abortedLegacyId );
+        $this->assertNotNull( $resumedRec );
+        $this->assertSame( 'complete', $resumedRec['state'], 'The aborted record is recorded complete after resume.' );
+
+        // (c) INVARIANT: legacy byte-equal across the abort + resume.
+        $this->assertEquals( $before, $this->legacySnapshot(), 'Legacy byte-equal across abort/resume.' );
+    }
+
+    /**
+     * The zero-missing-crosswalk precondition gate, enforced as a CONDITION (not
+     * merely "the terms phase ran once"). When a sermon-referenced legacy taxonomy
+     * read FAILS (a WP_Error — the class of failure TermWriter::migrateAll throws
+     * on), the terms phase must NOT be marked complete, the failure must surface as
+     * an open flag, and the sermon gate must stay CLOSED (no sermon written).
+     *
+     * We inject the read failure deterministically via the terms_pre_query filter
+     * (returning a WP_Error for one sermon taxonomy) so migrateAll() throws; the
+     * Orchestrator catches it, leaves terms incomplete, and surfaces the failure.
+     */
+    public function test_terms_gate_stays_closed_on_missing_crosswalk_taxonomy_read_failure(): void {
+        $data   = $this->seedDataset();
+        $before = $this->legacySnapshot();
+
+        $orch = new Orchestrator();
+        $orch->detect();
+
+        // Inject a legacy-taxonomy READ FAILURE for one sermon-referenced taxonomy.
+        $failingTaxonomy = LegacyIdentifiers::TAX_PREACHER;
+        $injector = static function ( $terms, $query ) use ( $failingTaxonomy ) {
+            $queried = (array) ( $query->query_vars['taxonomy'] ?? array() );
+            if ( in_array( $failingTaxonomy, $queried, true ) ) {
+                return new \WP_Error( 'sermonator_test_injected', 'injected legacy taxonomy read failure' );
+            }
+            return $terms;
+        };
+        add_filter( 'terms_pre_query', $injector, 10, 2 );
+
+        try {
+            $progress = $orch->run( 50 );
+        } finally {
+            remove_filter( 'terms_pre_query', $injector, 10 );
+        }
+
+        // The terms phase must NOT be complete (the gate stays closed).
+        $this->assertFalse(
+            ( new MigrationState() )->phaseComplete( 'terms' ),
+            'Terms must NOT be marked complete when a sermon-referenced taxonomy read fails.'
+        );
+
+        // The failure is surfaced as an open flag (not swallowed).
+        $this->assertNotEmpty( $progress['flags'], 'A terms read failure must surface a flag.' );
+        $surfaced = implode( '|', $progress['flags'] );
+        $this->assertStringContainsString( 'legacy_terms_failed', $surfaced,
+            'The terms read failure must surface as a legacy_terms_failed flag.' );
+
+        // Sermons stay GATED: the public sermon batch refuses while terms incomplete.
+        $this->assertFalse( $orch->runSermonBatch( 50 ),
+            'Sermon batch must be refused while the terms gate is closed.' );
+
+        // And nothing was migrated (no sermon, no podcast, no option write).
+        $this->assertCount( 0, Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON ),
+            'No sermon may be written while the terms gate is closed.' );
+        $this->assertCount( 0, Crosswalk::migratedPostIds( Identifiers::POST_TYPE_PODCAST ),
+            'No podcast may be written while the terms gate is closed.' );
+
+        // INVARIANT: legacy byte-equal (read-only) even on the failure path.
+        $this->assertEquals( $before, $this->legacySnapshot(), 'Legacy byte-equal on the gated-failure path.' );
+
+        // RECOVERY: once the injected failure is gone, a re-run completes the terms
+        // phase (the gate reopens) — proving the gate is a re-evaluated condition,
+        // not a one-shot latch.
+        $guard = 0;
+        while ( ! ( new MigrationState() )->phaseComplete( 'terms' ) && $guard < 20 ) {
+            $orch->run( 50 );
+            $guard++;
+        }
+        $this->assertTrue( ( new MigrationState() )->phaseComplete( 'terms' ),
+            'After the read failure clears, the terms phase completes on a re-run.' );
+        $this->assertTrue( $orch->runSermonBatch( 50 ),
+            'Once terms complete, the sermon gate opens.' );
+    }
+
     public function test_run_never_sets_verified_itself(): void {
         $this->seedDataset();
 
