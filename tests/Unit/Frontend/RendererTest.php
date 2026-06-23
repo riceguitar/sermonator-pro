@@ -18,6 +18,8 @@ final class RendererTest extends TestCase {
         Functions\when( 'esc_attr' )->returnArg();
         Functions\when( 'esc_url' )->returnArg();
         Functions\when( 'wp_kses_post' )->returnArg();
+        Functions\when( 'wp_kses' )->returnArg();
+        Functions\when( 'wp_kses_allowed_html' )->justReturn( array() );
         Functions\when( 'esc_html__' )->returnArg();
         Functions\when( '__' )->returnArg();
     }

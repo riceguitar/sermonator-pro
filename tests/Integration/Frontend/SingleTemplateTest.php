@@ -60,8 +60,10 @@ final class SingleTemplateTest extends WP_UnitTestCase {
         $this->assertTrue( have_posts() );
         the_post();
 
-        $out = apply_filters( 'the_content', 'BODY' );
-        $this->assertSame( 'BODY', trim( (string) $out ), 'Auto-append must be OFF by default (single emitter).' );
+        $out = (string) apply_filters( 'the_content', 'BODY' );
+        // wpautop wraps the body; what matters is that NO sermon meta was appended.
+        $this->assertStringContainsString( 'BODY', $out );
+        $this->assertStringNotContainsString( 'sermonator-meta', $out, 'Auto-append must be OFF by default (single emitter).' );
         wp_reset_postdata();
     }
 

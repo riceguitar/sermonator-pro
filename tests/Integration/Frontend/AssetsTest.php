@@ -9,6 +9,13 @@ use Sermonator\Frontend\Assets;
 use Sermonator\Schema\Identifiers as ID;
 
 final class AssetsTest extends WP_UnitTestCase {
+    protected function setUp(): void {
+        parent::setUp();
+        // Reset the style/script registries so enqueue state does not leak between tests.
+        $GLOBALS['wp_styles']  = null;
+        $GLOBALS['wp_scripts'] = null;
+    }
+
     public function test_handles_registered(): void {
         ( new Assets() )->register();
         $this->assertTrue( wp_style_is( Assets::STYLE_HANDLE, 'registered' ) );

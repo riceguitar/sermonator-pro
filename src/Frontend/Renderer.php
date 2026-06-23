@@ -51,7 +51,7 @@ final class Renderer {
 
     public function video( SermonView $v ): string {
         if ( $v->videoEmbed !== '' ) {
-            return '<div class="sermonator-video">' . wp_kses_post( $v->videoEmbed ) . '</div>';
+            return '<div class="sermonator-video">' . wp_kses( $v->videoEmbed, $this->allowedVideoHtml() ) . '</div>';
         }
         if ( $v->videoUrl !== '' ) {
             return '<div class="sermonator-video">'
@@ -66,6 +66,47 @@ final class Renderer {
             return '';
         }
         return (string) wp_date( (string) get_option( 'date_format' ), $v->preachedTimestamp );
+    }
+
+    /**
+     * Allowed HTML for a stored video embed. wp_kses_post() strips <iframe>, which would
+     * silently delete YouTube/Vimeo embeds, so we extend the post allowlist with iframe (and
+     * <video>/<source> for self-hosted) limited to safe, embed-relevant attributes.
+     *
+     * @return array<string,array<string,bool>>
+     */
+    private function allowedVideoHtml(): array {
+        $allowed           = wp_kses_allowed_html( 'post' );
+        $allowed['iframe'] = array(
+            'src'             => true,
+            'width'           => true,
+            'height'          => true,
+            'frameborder'     => true,
+            'allow'           => true,
+            'allowfullscreen' => true,
+            'title'           => true,
+            'loading'         => true,
+            'referrerpolicy'  => true,
+            'name'            => true,
+            'class'           => true,
+            'style'           => true,
+            'sandbox'         => true,
+        );
+        $allowed['video']  = array(
+            'src'      => true,
+            'width'    => true,
+            'height'   => true,
+            'controls' => true,
+            'preload'  => true,
+            'poster'   => true,
+            'class'    => true,
+            'style'    => true,
+        );
+        $allowed['source'] = array(
+            'src'  => true,
+            'type' => true,
+        );
+        return $allowed;
     }
 
     private function row( string $key, string $label, string $valueHtml ): string {

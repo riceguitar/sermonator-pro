@@ -19,8 +19,17 @@ final class BlockTemplates {
             return;
         }
 
+        $name = 'sermonator//single-' . ID::POST_TYPE_SERMON;
+
+        // Idempotent: register_block_template() emits a _doing_it_wrong on a duplicate, so
+        // guard against a second call within the same request.
+        if ( class_exists( '\WP_Block_Templates_Registry' )
+            && \WP_Block_Templates_Registry::get_instance()->is_registered( $name ) ) {
+            return;
+        }
+
         register_block_template(
-            'sermonator//single-' . ID::POST_TYPE_SERMON,
+            $name,
             array(
                 'title'       => __( 'Single Sermon', 'sermonator' ),
                 'description' => __( 'Default Sermonator single-sermon layout.', 'sermonator' ),
