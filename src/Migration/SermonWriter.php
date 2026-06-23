@@ -976,10 +976,13 @@ final class SermonWriter {
                 continue; // already correct
             }
 
-            wp_update_comment( array(
-                'comment_ID'     => $newCommentId,
-                'comment_parent' => $resolvedParent,
-            ) );
+            global $wpdb;
+            $wpdb->update(
+                $wpdb->comments,
+                array( 'comment_parent' => $resolvedParent ),
+                array( 'comment_ID' => $newCommentId )
+            );
+            clean_comment_cache( $newCommentId );
         }
     }
 

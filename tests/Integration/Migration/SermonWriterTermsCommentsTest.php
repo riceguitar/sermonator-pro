@@ -876,6 +876,179 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         );
     }
 
+    public function test_out_of_order_reparent_preserves_comment_content_and_date_gmt(): void {
+        // FIX 1: reparentFromMap() used wp_update_comment() which re-runs KSES on
+        // the comment body (stripping iframes/shortcodes for user_id=0 comments)
+        // and recomputes comment_date_gmt. The fix uses $wpdb->update() on only
+        // comment_parent + clean_comment_cache().
+        $legacyId = $this->bareSermon();
+
+        // Out-of-order topology: child has lower id than parent.
+        // First, insert two comments in "normal" order to get IDs, then swap them.
+        $parentTmp = $this->fixture->createComment( $legacyId, '1', array(
+            'comment_author'  => 'Parent Author',
+            'comment_content' => 'parent body',
+        ) );
+        // Child body contains iframe AND shortcode — exactly what KSES strips for user_id=0.
+        $childBody        = '<iframe src="https://media.example/clip.mp4"></iframe>[audio mp3="https://media.example/clip.mp3"]';
+        $childDateGmt     = '2021-06-15 14:30:00';
+        $childTmp  = (int) wp_insert_comment( array(
+            'comment_post_ID'      => $legacyId,
+            'comment_author'       => 'Child Author',
+            'comment_author_email' => 'child@example.com',
+            'comment_content'      => $childBody,
+            'comment_approved'     => '1',
+            'comment_date_gmt'     => $childDateGmt,
+            'comment_date'         => $childDateGmt,
+            'user_id'              => 0, // parishioner — no unfiltered_html cap
+        ) );
+
+        // Swap so CHILD has lower id than PARENT (out-of-order topology).
+        global $wpdb;
+        $highId = $childTmp + 1000;
+        $wpdb->update( $wpdb->comments, array( 'comment_ID' => $highId ), array( 'comment_ID' => $parentTmp ) );
+        $wpdb->update( $wpdb->comments, array( 'comment_parent' => $highId ), array( 'comment_ID' => $childTmp ) );
+        clean_comment_cache( array( $childTmp, $highId ) );
+
+        $parentLegacyId = $highId;
+        $childLegacyId  = $childTmp;
+        $this->assertLessThan( $parentLegacyId, $childLegacyId, 'child id must be lower than parent id' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $copied = get_comments( array( 'post_id' => $result->newId, 'status' => 'any' ) );
+        $this->assertCount( 2, $copied );
+
+        $byLegacy = array();
+        foreach ( $copied as $c ) {
+            $legacyRef = (int) get_comment_meta( $c->comment_ID, Crosswalk::LEGACY_COMMENT_ID, true );
+            $byLegacy[ $legacyRef ] = $c;
+        }
+        $this->assertArrayHasKey( $parentLegacyId, $byLegacy );
+        $this->assertArrayHasKey( $childLegacyId, $byLegacy );
+
+        $newChild = $byLegacy[ $childLegacyId ];
+
+        // 1. comment_content must be BYTE-EQUAL (no KSES stripping of iframe/shortcode).
+        $this->assertSame(
+            $childBody,
+            $newChild->comment_content,
+            'reparentFromMap must NOT re-run KSES on the comment body — iframe + shortcode must survive verbatim'
+        );
+
+        // 2. comment_date_gmt must be BYTE-EQUAL (not mutated by wp_update_comment).
+        $this->assertSame(
+            $childDateGmt,
+            $newChild->comment_date_gmt,
+            'reparentFromMap must NOT mutate comment_date_gmt'
+        );
+
+        // 3. comment_parent resolves correctly to the new parent id (not 0).
+        $newParent = $byLegacy[ $parentLegacyId ];
+        $this->assertSame(
+            (int) $newParent->comment_ID,
+            (int) $newChild->comment_parent,
+            'out-of-order child must be re-parented to the new parent id'
+        );
+        $this->assertNotSame( 0, (int) $newChild->comment_parent );
+    }
+
+    public function test_fully_loaded_legacy_sermon_is_immutable_across_write_and_resume(): void {
+        // HARDENING: every legacy row (post, post_meta, term assignments, comments,
+        // comment_meta) must be byte-for-byte unchanged after write() + resume().
+        global $wpdb;
+
+        // 1. Create the legacy sermon with specific date_gmt and iframe content.
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'     => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'    => 'Immutability Sermon ' . wp_generate_uuid4(),
+            'post_status'   => 'publish',
+            'post_date_gmt' => '2020-03-08 10:00:00',
+            'post_date'     => '2020-03-08 10:00:00',
+            'post_content'  => '<iframe src="https://video.example/sermon"></iframe>',
+        ) );
+        $this->assertGreaterThan( 0, $legacyId );
+
+        // 2. Add meta: scalar + array.
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '' );
+        add_post_meta( $legacyId, 'sermon_date', '1583661600' );
+        add_post_meta( $legacyId, 'custom_array_meta', array( 'key' => 'value', 'nested' => array( 1, 2, 3 ) ) );
+
+        // 3. Add 2 terms in two different legacy taxonomies — NOT migrated (open flags).
+        $preacherTermId = $this->fixture->createTerm( LegacyIdentifiers::TAX_PREACHER, 'Immutable Preacher' );
+        $seriesTermId   = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Immutable Series' );
+        wp_set_object_terms( $legacyId, array( $preacherTermId ), LegacyIdentifiers::TAX_PREACHER );
+        wp_set_object_terms( $legacyId, array( $seriesTermId ), LegacyIdentifiers::TAX_SERIES );
+
+        // 4. Add a parent comment + child reply.
+        $parentCommentId = (int) wp_insert_comment( array(
+            'comment_post_ID'      => $legacyId,
+            'comment_author'       => 'Immutable Parent',
+            'comment_author_email' => 'parent@example.com',
+            'comment_content'      => 'Parent comment body',
+            'comment_approved'     => '1',
+        ) );
+        $childCommentId = (int) wp_insert_comment( array(
+            'comment_post_ID'      => $legacyId,
+            'comment_author'       => 'Immutable Child',
+            'comment_author_email' => 'child@example.com',
+            'comment_content'      => 'Child reply body',
+            'comment_approved'     => '1',
+            'comment_parent'       => $parentCommentId,
+        ) );
+
+        // 5. Add commentmeta on the parent comment.
+        add_comment_meta( $parentCommentId, 'rating', 5 );
+        add_comment_meta( $parentCommentId, 'legacy_extra', array( 'x' => 1 ) );
+
+        // 6. Force-set comment_count to non-zero.
+        $wpdb->update( $wpdb->posts, array( 'comment_count' => 2 ), array( 'ID' => $legacyId ) );
+        clean_post_cache( $legacyId );
+
+        // SNAPSHOT BEFORE write.
+        $beforePost       = get_post( $legacyId, ARRAY_A );
+        $beforeMeta       = get_post_meta( $legacyId );
+        $beforePreacher   = wp_get_object_terms( $legacyId, LegacyIdentifiers::TAX_PREACHER, array( 'fields' => 'ids' ) );
+        $beforeSeries     = wp_get_object_terms( $legacyId, LegacyIdentifiers::TAX_SERIES, array( 'fields' => 'ids' ) );
+        $beforeComments   = array_map(
+            static function ( $c ) { return get_comment( $c->comment_ID, ARRAY_A ); },
+            get_comments( array( 'post_id' => $legacyId, 'status' => 'any', 'orderby' => 'comment_ID', 'order' => 'ASC' ) )
+        );
+        $beforeParentCmeta = get_comment_meta( $parentCommentId );
+        $beforeChildCmeta  = get_comment_meta( $childCommentId );
+
+        // 7. Run write().
+        $writer = new SermonWriter();
+        $result = $writer->write( $legacyId );
+        $newId  = $result->newId;
+        $this->assertGreaterThan( 0, $newId );
+
+        // 8. Resume: drop COMPLETE and write again.
+        delete_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE );
+        $writer->write( $legacyId );
+
+        // SNAPSHOT AFTER.
+        $afterPost        = get_post( $legacyId, ARRAY_A );
+        $afterMeta        = get_post_meta( $legacyId );
+        $afterPreacher    = wp_get_object_terms( $legacyId, LegacyIdentifiers::TAX_PREACHER, array( 'fields' => 'ids' ) );
+        $afterSeries      = wp_get_object_terms( $legacyId, LegacyIdentifiers::TAX_SERIES, array( 'fields' => 'ids' ) );
+        $afterComments    = array_map(
+            static function ( $c ) { return get_comment( $c->comment_ID, ARRAY_A ); },
+            get_comments( array( 'post_id' => $legacyId, 'status' => 'any', 'orderby' => 'comment_ID', 'order' => 'ASC' ) )
+        );
+        $afterParentCmeta = get_comment_meta( $parentCommentId );
+        $afterChildCmeta  = get_comment_meta( $childCommentId );
+
+        // Assert every legacy row is byte-for-byte unchanged.
+        $this->assertSame( $beforePost,        $afterPost,        'Legacy post row was mutated by the writer' );
+        $this->assertSame( $beforeMeta,        $afterMeta,        'Legacy post_meta was mutated by the writer' );
+        $this->assertSame( $beforePreacher,    $afterPreacher,    'Legacy wpfc_preacher term assignment was mutated' );
+        $this->assertSame( $beforeSeries,      $afterSeries,      'Legacy wpfc_sermon_series term assignment was mutated' );
+        $this->assertSame( $beforeComments,    $afterComments,    'Legacy comments were mutated by the writer' );
+        $this->assertSame( $beforeParentCmeta, $afterParentCmeta, 'Legacy parent comment_meta was mutated by the writer' );
+        $this->assertSame( $beforeChildCmeta,  $afterChildCmeta,  'Legacy child comment_meta was mutated by the writer' );
+    }
+
     // ------------------------------------------------------ READ-ONLY LEGACY
 
     public function test_legacy_comments_byte_equal_before_and_after(): void {

@@ -65,12 +65,11 @@ final class PodcastWriter {
                 // NO open term flag is left entirely untouched (no re-write).
                 $persisted = $this->readFlags( $existing );
                 if ( $this->hasOpenTermCrosswalkFlag( $persisted ) ) {
-                    $flags = array_merge(
-                        $this->stripTermCrosswalkFlags( $persisted ),
-                        $this->applyMeta( $existing, $legacyId )
-                    );
-                    $flags = array_values( array_unique( $flags ) );
+                    $flags = $this->applyScopedSettingsRemap( $existing, $legacyId, $persisted );
                     $this->writeFlags( $existing, $flags );
+                    if ( ! $this->hasOpenTermCrosswalkFlag( $flags ) ) {
+                        $this->markComplete( $existing );
+                    }
                     return new WriteResult( $existing, false, $flags, false );
                 }
                 return new WriteResult( $existing, false, $persisted, false );
@@ -188,6 +187,45 @@ final class PodcastWriter {
         $flags = array_merge( $flags, $this->applyMeta( $newId, $legacyId ) );
 
         $this->writeFlags( $newId, $flags );
+
+        return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Scoped self-heal for the COMPLETE-branch: re-derives ONLY the
+     * sermonator_podcast_settings meta key from the legacy sm_podcast_settings,
+     * remapping any term references via the current crosswalk. All other meta keys
+     * on the new podcast are left entirely untouched — protecting post-migration
+     * admin edits (itunes_image, enclosure, subtitle, etc.).
+     *
+     * Returns the updated flags list (term crosswalk flags re-derived from this
+     * remap pass; other flags from $flags are preserved as-is).
+     *
+     * @param list<string> $flags Current persisted flags.
+     * @return list<string> Updated flags (crosswalk flags re-derived from this remap).
+     */
+    private function applyScopedSettingsRemap( int $newId, int $legacyId, array $flags ): array {
+        // Strip prior crosswalk flags so this pass can re-derive the current state.
+        $flags = $this->stripTermCrosswalkFlags( $flags );
+
+        $values = get_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, false );
+        $values = is_array( $values ) ? array_values( $values ) : array();
+
+        delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
+
+        foreach ( $values as $value ) {
+            if ( is_string( $value ) ) {
+                $maybe = maybe_unserialize( $value );
+                if ( is_array( $maybe ) ) {
+                    $value = $this->remapSettingsTerms( $maybe, $flags );
+                } else {
+                    $flags[] = 'podcast_settings_unremapped';
+                }
+            } elseif ( is_array( $value ) ) {
+                $value = $this->remapSettingsTerms( $value, $flags );
+            }
+            add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $value ) );
+        }
 
         return array_values( array_unique( $flags ) );
     }

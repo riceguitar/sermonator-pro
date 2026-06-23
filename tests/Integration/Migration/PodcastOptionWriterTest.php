@@ -570,6 +570,91 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         $this->assertSame( 'mediaelement', get_option( 'sermonator_player' ) );
     }
 
+    public function test_complete_podcast_with_open_term_flag_self_heal_does_not_clobber_admin_meta(): void {
+        // FIX 2: the COMPLETE-branch self-heal called applyMeta() which overwrote ALL
+        // meta keys unconditionally — clobbering any admin edits made post-migration.
+        // The fix scopes the self-heal to ONLY the sermonator_podcast_settings key.
+
+        // 1. Create a legacy podcast with settings containing an unmigrated term.
+        $legacySeries = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Self-Heal Series' );
+        $settings = array(
+            'itunes_author'               => 'Church Author',
+            LegacyIdentifiers::TAX_SERIES => $legacySeries,
+        );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings );
+
+        // Also give it a verbatim meta key on legacy (to verify it stays on the new post).
+        add_post_meta( $legacyId, 'itunes_image', 'https://legacy.example/art.jpg' );
+
+        $writer = new PodcastWriter();
+
+        // 2. First write: WITHHELD from COMPLETE due to unresolved term.
+        $first = $writer->write( $legacyId );
+        $this->assertContains(
+            'missing_podcast_term_crosswalk:' . $legacySeries,
+            (array) get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true )
+        );
+        $this->assertSame(
+            '',
+            (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'precondition: COMPLETE must be withheld while term is unresolved'
+        );
+
+        // 3. Stamp MIGRATION_COMPLETE manually (simulate an older writer that completed
+        //    despite the open flag — the exact bug scenario).
+        update_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, '1' );
+
+        // 4. Admin edits the new podcast: sets itunes_image to a new value.
+        update_post_meta( $first->newId, 'itunes_image', 'https://admin-edited.example/art.jpg' );
+        $this->assertSame(
+            'https://admin-edited.example/art.jpg',
+            get_post_meta( $first->newId, 'itunes_image', true ),
+            'precondition: admin-edited value is set'
+        );
+
+        // 5. Migrate the term.
+        ( new TermWriter() )->migrateAll();
+        $newSeries = Crosswalk::findNewTermByLegacyId( $legacySeries, Identifiers::TAX_SERIES );
+        $this->assertNotNull( $newSeries );
+
+        // 6. Second write: goes through COMPLETE-branch self-heal.
+        $second = $writer->write( $legacyId );
+        $this->assertSame( $first->newId, $second->newId, 'no second insert' );
+        $this->assertFalse( $second->created );
+        $this->assertFalse( $second->resumed );
+
+        // 7. Assert: flag is cleared.
+        $healedFlags = (array) get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertNotContains(
+            'missing_podcast_term_crosswalk:' . $legacySeries,
+            $healedFlags,
+            'the open term flag must be cleared after self-heal'
+        );
+
+        // 8. Assert: settings contain the NEW term id.
+        $healed = get_post_meta( $first->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertIsArray( $healed );
+        $this->assertSame(
+            (int) $newSeries,
+            $healed[ Identifiers::TAX_SERIES ],
+            'settings must contain the remapped new term id after self-heal'
+        );
+
+        // 9. Assert: admin-edited itunes_image SURVIVES (was not clobbered).
+        $this->assertSame(
+            'https://admin-edited.example/art.jpg',
+            get_post_meta( $first->newId, 'itunes_image', true ),
+            'admin-edited itunes_image must NOT be clobbered by the COMPLETE-branch self-heal'
+        );
+
+        // 10. Assert: MIGRATION_COMPLETE is still stamped.
+        $this->assertSame(
+            '1',
+            (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'MIGRATION_COMPLETE must remain stamped after self-heal'
+        );
+    }
+
     public function test_legacy_options_untouched_byte_equal(): void {
         $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
         $this->fixture->setOption( 'sermonmanager_template', array( 'a' => 1 ) );
