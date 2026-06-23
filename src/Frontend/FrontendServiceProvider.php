@@ -12,6 +12,7 @@ use Sermonator\Frontend\Blocks\SermonGridBlock;
 use Sermonator\Frontend\Blocks\TaxonomyFilterBlock;
 use Sermonator\Frontend\Blocks\PodcastSubscribeBlock;
 use Sermonator\Frontend\Feed\PodcastFeed;
+use Sermonator\Frontend\Seo\SeoHead;
 
 /**
  * Wires the read-only front-end display layer: dynamic blocks, block templates (FSE), the
@@ -32,6 +33,7 @@ final class FrontendServiceProvider {
         ( new ArchiveOrdering() )->hook();
         ( new Shortcode() )->hook();
         ( new PodcastFeed() )->hook();
+        ( new SeoHead() )->hook();
         $this->assets->hook();
     }
 
