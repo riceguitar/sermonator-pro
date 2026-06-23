@@ -26,14 +26,39 @@ final class DateNormalizer {
         if (false === $parsed['year'] || false === $parsed['month'] || false === $parsed['day']) {
             return null;
         }
-        // Any relative component ('+1 day', 'ago', 'next year' that still produced
-        // a y/m/d via 'now') taints the result — reject if date_parse recorded one.
-        if (!empty($parsed['relative'])) {
-            return null;
+        // Any relative OFFSET ('+1 day', 'ago', 'next year') that synthesised a
+        // y/m/d via 'now' taints the result — reject it. But date_parse also files
+        // a bare weekday NAME ('Sun, 01 May 2021', 'Sunday May 1 2021') under
+        // 'relative' (as 'weekday'), and those carry an explicit y+m+d already
+        // established concrete above. Only the numeric offset fields are fatal; a
+        // weekday alongside a concrete y/m/d is fine (pervasive in RSS/podcast).
+        // NOTE: pure-relative shapes ('+1 day') never reach here — they leave
+        // y/m/d false and are rejected by the all-present guard above.
+        $rel = $parsed['relative'] ?? array();
+        if (is_array($rel)) {
+            foreach (array('year', 'month', 'day', 'hour', 'minute', 'second') as $field) {
+                if (!empty($rel[$field])) {
+                    return null;
+                }
+            }
         }
 
+        // Build from the EXPLICIT parsed calendar fields rather than re-parsing the
+        // raw string. date_parse already established a concrete, non-overflow y/m/d
+        // above; constructing from those components anchors to $tz AND neutralises a
+        // misleading weekday directive. PHP's DateTimeImmutable would otherwise treat
+        // a weekday name ('Sun, 01 May 2021', even when 01 May 2021 is a Saturday) as
+        // a "roll forward to next Sunday" instruction, drifting the companion a day
+        // off the authoritative explicit date.
+        $hour   = false === $parsed['hour'] ? 0 : (int) $parsed['hour'];
+        $minute = false === $parsed['minute'] ? 0 : (int) $parsed['minute'];
+        $second = false === $parsed['second'] ? 0 : (int) $parsed['second'];
         try {
-            $dt = new \DateTimeImmutable($raw, $tz);   // anchors date-only strings to $tz
+            $dt = (new \DateTimeImmutable('now', $tz))->setDate(
+                (int) $parsed['year'],
+                (int) $parsed['month'],
+                (int) $parsed['day']
+            )->setTime($hour, $minute, $second);
         } catch (\Exception $e) {
             return null;
         }

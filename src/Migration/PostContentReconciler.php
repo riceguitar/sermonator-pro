@@ -36,8 +36,13 @@ final class PostContentReconciler {
         // backed up (single canonical home = its own meta row → no double-flag).
         $pieces = array();
         if ( self::isUniqueSubstantive( $oldPostContent, $representedCorpus ) ) {
-            $visibleText = self::visibleText( $oldPostContent );
-            if ( $visibleText !== '' ) {
+            // A structural payload (iframe/audio/video/img/embed/object/shortcode)
+            // carries irreplaceable data that strip_tags() empties — so it must be
+            // kept REGARDLESS of visible text. Only the purely-textual branch keeps
+            // the visibleText !== '' suppression (a blank-after-strip text blob has
+            // nothing to preserve).
+            if ( self::hasStructuralPayload( $oldPostContent, $representedCorpus )
+                || self::visibleText( $oldPostContent ) !== '' ) {
                 $pieces[] = $oldPostContent;
             }
         }

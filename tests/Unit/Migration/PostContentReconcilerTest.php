@@ -58,6 +58,34 @@ final class PostContentReconcilerTest extends TestCase {
         $this->assertFalse( $out['flag'] );
     }
 
+    public function test_iframe_only_blob_with_empty_description_is_preserved(): void {
+        // MUST-FIX #1: a media-only blob has NO visible text after strip_tags, but
+        // hasStructuralPayload() is true — the embed must be backed up and flagged,
+        // never dropped to nowhere.
+        $out = PostContentReconciler::reconcile( '<iframe src="https://player.example/embed/1"></iframe>', null );
+        $this->assertNotNull( $out['backup'], 'iframe-only blob must be backed up' );
+        $this->assertSame( '<iframe src="https://player.example/embed/1"></iframe>', $out['backup'] );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_audio_only_blob_with_empty_description_is_preserved(): void {
+        $out = PostContentReconciler::reconcile( '<audio src="https://media.example/s.mp3"></audio>', '' );
+        $this->assertNotNull( $out['backup'], 'audio-only blob must be backed up' );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_video_only_blob_with_empty_description_is_preserved(): void {
+        $out = PostContentReconciler::reconcile( '<video><source src="https://media.example/s.mp4"></video>', null );
+        $this->assertNotNull( $out['backup'], 'video-only blob must be backed up' );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_embed_only_blob_with_empty_description_is_preserved(): void {
+        $out = PostContentReconciler::reconcile( '<embed src="https://media.example/s.swf">', null );
+        $this->assertNotNull( $out['backup'], 'embed-only blob must be backed up' );
+        $this->assertTrue( $out['flag'] );
+    }
+
     public function test_shortcode_blob_not_discarded_even_if_text_contained(): void {
         $out = PostContentReconciler::reconcile( '[audio src="x.mp3"]Intro', '<p>Intro</p>', null );
         $this->assertNotNull( $out['backup'] );   // shortcode carries data the plain text doesn't

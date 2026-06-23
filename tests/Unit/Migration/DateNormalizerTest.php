@@ -38,6 +38,25 @@ final class DateNormalizerTest extends TestCase {
         // would otherwise roll it over to March. Reject rather than mis-anchor.
         $this->assertNull(DateNormalizer::normalize('2021-02-30', new \DateTimeZone('UTC')));
     }
+    public function test_weekday_bearing_concrete_dates_parse(): void {
+        // MUST-FIX #5: date_parse classifies the weekday name as a "relative"
+        // component, but the y/m/d are all explicitly present — these are concrete
+        // calendar dates pervasive in RSS/podcast exports and must normalize to an
+        // int, not be rejected by the blanket relative guard.
+        $this->assertSame(
+            gmmktime(0, 0, 0, 5, 1, 2021),
+            DateNormalizer::normalize('Sun, 01 May 2021', new \DateTimeZone('UTC'))
+        );
+        $this->assertSame(
+            gmmktime(0, 0, 0, 5, 1, 2021),
+            DateNormalizer::normalize('Sunday May 1 2021', new \DateTimeZone('UTC'))
+        );
+    }
+    public function test_pure_relative_still_rejected_after_weekday_fix(): void {
+        // The weekday fix must NOT reopen the digit-bearing relative hole.
+        $this->assertNull(DateNormalizer::normalize('+1 day', new \DateTimeZone('UTC')));
+        $this->assertNull(DateNormalizer::normalize('2 weeks ago', new \DateTimeZone('UTC')));
+    }
     public function test_real_concrete_dates_still_parse(): void {
         // The reject must NOT regress real legacy dates.
         $this->assertIsInt(DateNormalizer::normalize('2021-01-01', new \DateTimeZone('UTC')));
