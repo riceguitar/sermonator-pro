@@ -96,16 +96,27 @@ final class FeedBuilder {
     }
 
     private function cdata( string $name, string $value ): string {
+        $value = $this->stripInvalidXml( $value );
         // Guard against the CDATA terminator appearing in the content.
         $safe = str_replace( ']]>', ']]]]><![CDATA[>', $value );
         return '<' . $name . '><![CDATA[' . $safe . ']]></' . $name . '>' . "\n";
     }
 
     private function text( string $value ): string {
-        return htmlspecialchars( $value, ENT_QUOTES | ENT_XML1, 'UTF-8' );
+        return htmlspecialchars( $this->stripInvalidXml( $value ), ENT_QUOTES | ENT_XML1, 'UTF-8' );
     }
 
     private function attr( string $value ): string {
-        return htmlspecialchars( $value, ENT_QUOTES | ENT_XML1, 'UTF-8' );
+        return htmlspecialchars( $this->stripInvalidXml( $value ), ENT_QUOTES | ENT_XML1, 'UTF-8' );
+    }
+
+    /**
+     * Remove C0 control characters that are illegal in XML 1.0 (everything below 0x20 except
+     * tab, LF and CR). A single such byte — easily pasted into a sermon title or carried in
+     * post content — otherwise makes the WHOLE feed not-well-formed and every client (Apple
+     * included) rejects every episode. Neither htmlspecialchars nor CDATA neutralises these.
+     */
+    private function stripInvalidXml( string $value ): string {
+        return (string) preg_replace( '/[\x00-\x08\x0B\x0C\x0E-\x1F]/u', '', $value );
     }
 }

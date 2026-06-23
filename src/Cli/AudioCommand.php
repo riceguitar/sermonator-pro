@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Sermonator\Cli;
 
 use Sermonator\Frontend\Feed\AudioSizeBackfill;
+use Sermonator\Migration\MigrationState;
 
 /**
  * WP-CLI: maintain sermon audio metadata for the podcast feed. Thin wrapper over
@@ -41,6 +42,18 @@ final class AudioCommand {
         if ( ! empty( $assoc_args['rollback'] ) ) {
             $result = $service->rollback();
             \WP_CLI::success( sprintf( 'Rolled back %d enclosure size(s).', $result['removed'] ) );
+            return;
+        }
+
+        // Do not write the native size meta while a migration owns that key (it maps legacy
+        // _wpfc_sermon_size → _sermonator_audio_size and re-writes it on resume). Allow only
+        // when there is no migration in flight or it is fully finalized.
+        $phase = ( new MigrationState() )->phase();
+        if ( ! in_array( $phase, array( 'none', 'finalized' ), true ) ) {
+            \WP_CLI::error( sprintf(
+                'A migration is in progress (phase: %s). Finalize or roll back the migration before backfilling audio sizes.',
+                $phase
+            ) );
             return;
         }
 

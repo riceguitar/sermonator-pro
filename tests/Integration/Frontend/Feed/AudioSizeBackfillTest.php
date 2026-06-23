@@ -94,6 +94,15 @@ final class AudioSizeBackfillTest extends WP_UnitTestCase {
         $this->assertSame( '', get_post_meta( $post, ID::META_AUDIO_SIZE, true ) );
     }
 
+    public function test_rejects_absurdly_large_size(): void {
+        $id     = $this->sermonWithAudio( 'http://x/huge.mp3' );
+        $huge   = new AudioSizeBackfill( static fn(): int => 9_999_999_999_999 ); // > 4 GB cap
+        $result = $huge->run();
+        $this->assertSame( 0, $result['written'], 'A bogus huge size must be rejected, not persisted.' );
+        $this->assertSame( 1, $result['failed'] );
+        $this->assertSame( '', get_post_meta( $id, ID::META_AUDIO_SIZE, true ) );
+    }
+
     public function test_idempotent_second_run_no_new_writes(): void {
         $this->sermonWithAudio( 'http://x/a.mp3' );
         $this->backfill()->run();

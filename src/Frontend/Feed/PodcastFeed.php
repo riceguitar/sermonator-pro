@@ -62,6 +62,11 @@ final class PodcastFeed {
         $result   = ( new SermonQuery() )->run( array( 'perPage' => self::MAX_ITEMS ) );
         $resolver = new EnclosureResolver();
 
+        if ( $result->total > self::MAX_ITEMS ) {
+            // Observable, not silent: older episodes beyond the cap are not in the feed.
+            do_action( 'sermonator_feed_truncated', $result->total, self::MAX_ITEMS );
+        }
+
         $items = array();
         foreach ( $result->sermons as $view ) {
             $enc = $resolver->resolve( $view->id );

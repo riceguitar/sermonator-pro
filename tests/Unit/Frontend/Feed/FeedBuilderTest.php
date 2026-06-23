@@ -86,4 +86,26 @@ final class FeedBuilderTest extends TestCase {
         $xml = ( new FeedBuilder() )->build( $this->config(), array( $this->item() ) );
         $this->assertStringContainsString( '<description><![CDATA[A sermon on John 1.]]></description>', $xml );
     }
+
+    public function test_strips_invalid_xml_control_characters(): void {
+        $item = new FeedItem(
+            title: "Bad\x0CTitle\x0B",      // form-feed + vertical tab (illegal in XML 1.0)
+            link: 'http://example.com/x/',
+            guid: 'sermonator-9',
+            description: "Body with a \x1B escape byte.",
+            pubTimestamp: 1734775200,
+            audioUrl: 'http://example.com/x.mp3',
+            audioType: 'audio/mpeg',
+            audioSize: 100,
+            duration: '',
+            explicit: false
+        );
+
+        $xml = ( new FeedBuilder() )->build( $this->config(), array( $item ) );
+
+        $this->assertNotFalse( simplexml_load_string( $xml ), 'A control char must NOT break the whole feed.' );
+        $this->assertStringContainsString( 'BadTitle', $xml );
+        $this->assertStringNotContainsString( "\x0C", $xml );
+        $this->assertStringNotContainsString( "\x1B", $xml );
+    }
 }
