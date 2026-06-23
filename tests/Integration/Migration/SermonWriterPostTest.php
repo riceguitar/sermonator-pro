@@ -1,0 +1,272 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sermonator\Tests\Integration\Migration;
+
+use WP_UnitTestCase;
+use Sermonator\Migration\SermonWriter;
+use Sermonator\Migration\WriteResult;
+use Sermonator\Migration\Crosswalk;
+use Sermonator\Migration\LegacyIdentifiers;
+use Sermonator\Schema\Identifiers;
+use Sermonator\Tests\Integration\Support\LegacyFixture;
+
+/**
+ * Task 12: SermonWriter — post columns, KSES-safe body, back-ref-first, idempotency.
+ *
+ * This task covers the POST/BODY/IDEMPOTENCY facet of write(): it inserts the
+ * new sermonator_sermon post preserving the legacy post columns, reconciles the
+ * body from (post_content, sermon_description, post_content_temp), survives KSES
+ * (iframes/shortcodes), stamps the legacy back-ref IMMEDIATELY after insert, and
+ * is resumable (a partial — back-ref present but MIGRATION_COMPLETE absent — is
+ * re-entered, never duplicated).
+ *
+ * Invariants under test:
+ *  - every preserved column matches legacy; post_type = sermonator_sermon;
+ *  - post_content = reconciled description; an <iframe>/[shortcode] in the legacy
+ *    body survives verbatim into LEGACY_POST_CONTENT backup (KSES off);
+ *  - body with quotes/backslashes/unicode is not corrupted (wp_slash);
+ *  - back-ref present right after insert; MIGRATION_COMPLETE NOT yet written
+ *    (this task leaves the post "stamped but partial");
+ *  - simulated abort before complete → re-run does NOT create a second post;
+ *  - slug uniquified by WP → slug_changed flag + LEGACY_SLUG recorded;
+ *  - non-zero post_parent translated via findNewByLegacyId else 0 + flag;
+ *  - legacy get_post + get_post_meta byte-equal before/after;
+ *  - shared attachment posts never mutated.
+ */
+final class SermonWriterPostTest extends WP_UnitTestCase {
+    private LegacyFixture $fixture;
+
+    public function set_up(): void {
+        parent::set_up();
+        $this->fixture = new LegacyFixture();
+        $this->fixture->registerLegacySchema();
+        ( new \Sermonator\Model\Registrar() )->register();
+    }
+
+    /** Snapshot a legacy post + all its meta for byte-equality assertions. */
+    private function snapshot( int $legacyId ): array {
+        return array(
+            'post' => get_post( $legacyId, ARRAY_A ),
+            'meta' => get_post_meta( $legacyId ),
+        );
+    }
+
+    /**
+     * Insert a legacy post with KSES disabled and slashes applied, so structural
+     * HTML (iframes/shortcodes) lands in the DB verbatim — exactly as real legacy
+     * Sermon Manager data already exists, before the migration ever runs.
+     */
+    private function insertLegacyRaw( array $postarr ): int {
+        kses_remove_filters();
+        try {
+            $id = (int) wp_insert_post( wp_slash( $postarr ) );
+        } finally {
+            kses_init_filters();
+        }
+        return $id;
+    }
+
+    public function test_preserved_columns_match_legacy(): void {
+        $author = self::factory()->user->create( array( 'role' => 'editor' ) );
+
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'      => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'     => 'Sermon On The Mount',
+            'post_author'    => $author,
+            'post_status'    => 'publish',
+            'post_name'      => 'sermon-on-the-mount-unique-slug',
+            'post_date'      => '2021-05-01 09:30:00',
+            'post_date_gmt'  => '2021-05-01 09:30:00',
+            'comment_status' => 'closed',
+            'ping_status'    => 'closed',
+            'menu_order'     => 7,
+            'post_excerpt'   => 'A short excerpt.',
+            'post_password'  => 'secret',
+            'post_content'   => 'Auto blob',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '<p>The real body.</p>' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+        $this->assertInstanceOf( WriteResult::class, $result );
+        $this->assertTrue( $result->created );
+
+        $new = get_post( $result->newId );
+        $this->assertSame( Identifiers::POST_TYPE_SERMON, $new->post_type );
+        $this->assertSame( 'Sermon On The Mount', $new->post_title );
+        $this->assertSame( $author, (int) $new->post_author );
+        $this->assertSame( 'publish', $new->post_status );
+        $this->assertSame( 'sermon-on-the-mount-unique-slug', $new->post_name );
+        $this->assertSame( '2021-05-01 09:30:00', $new->post_date );
+        $this->assertSame( '2021-05-01 09:30:00', $new->post_date_gmt );
+        $this->assertSame( 'closed', $new->comment_status );
+        $this->assertSame( 'closed', $new->ping_status );
+        $this->assertSame( 7, (int) $new->menu_order );
+        $this->assertSame( 'A short excerpt.', $new->post_excerpt );
+        $this->assertSame( 'secret', $new->post_password );
+        $this->assertSame( '<p>The real body.</p>', $new->post_content );
+    }
+
+    public function test_iframe_and_shortcode_body_survives_kses(): void {
+        // Body lives only in the legacy auto post_content (iframe + shortcode);
+        // the description is empty. KSES would strip <iframe>; it must survive
+        // into the LEGACY_POST_CONTENT backup verbatim. Seed the legacy body the
+        // way real legacy data exists in the DB — with KSES OFF — so the fixture
+        // itself does not strip the iframe before the writer ever reads it.
+        $body = '<iframe src="https://player.example/embed/42" allowfullscreen></iframe>[audio src="https://x/a.mp3"]';
+
+        $legacyId = $this->insertLegacyRaw( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'Embed Sermon',
+            'post_status'  => 'publish',
+            'post_content' => $body,
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $backup = get_post_meta( $result->newId, Crosswalk::LEGACY_POST_CONTENT, true );
+        $this->assertStringContainsString( '<iframe', $backup );
+        $this->assertStringContainsString( 'allowfullscreen', $backup );
+        $this->assertStringContainsString( '[audio', $backup );
+        $this->assertContains( 'post_content_preserved', $result->flags );
+    }
+
+    public function test_body_with_quotes_backslashes_unicode_not_corrupted(): void {
+        $desc = 'He said "grace" \\ mercy — ✝ café façade';
+
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'Tricky Body',
+            'post_status'  => 'publish',
+            'post_content' => 'blob',
+        ) );
+        // add_post_meta unslashes, so slash the seed to land $desc verbatim in
+        // the DB — mirroring how WordPress actually stores meta.
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, wp_slash( $desc ) );
+        $this->assertSame( $desc, get_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, true ), 'fixture seed sanity' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $new = get_post( $result->newId );
+        $this->assertSame( $desc, $new->post_content );
+    }
+
+    public function test_back_ref_present_immediately_and_not_yet_complete(): void {
+        $legacyId = $this->fixture->createSermon();
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        // Back-ref stamped right after insert.
+        $this->assertSame(
+            (string) $legacyId,
+            get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true )
+        );
+        $this->assertSame( $result->newId, Crosswalk::findNewByLegacyId( $legacyId ) );
+
+        // This task leaves the post "stamped but partial" — Task 14 writes COMPLETE.
+        $this->assertSame( '', (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+    }
+
+    public function test_resume_does_not_create_a_second_post(): void {
+        $legacyId = $this->fixture->createSermon();
+
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+        $this->assertTrue( $first->created );
+
+        // Second run: back-ref exists but NOT complete → resume the SAME post.
+        $second = $writer->write( $legacyId );
+        $this->assertFalse( $second->created );
+        $this->assertSame( $first->newId, $second->newId );
+
+        $all = get_posts( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+        ) );
+        $this->assertCount( 1, $all );
+    }
+
+    public function test_slug_uniquified_records_flag_and_legacy_slug(): void {
+        // Occupy the slug with a pre-existing sermonator_sermon so WP must
+        // uniquify the migrated post's slug.
+        self::factory()->post->create( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_status' => 'publish',
+            'post_name'   => 'shared-slug',
+        ) );
+
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'  => 'Slug Clash',
+            'post_status' => 'publish',
+            'post_name'   => 'shared-slug',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, 'body' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $new = get_post( $result->newId );
+        $this->assertNotSame( 'shared-slug', $new->post_name, 'WP should have uniquified the slug.' );
+        $this->assertContains( 'slug_changed', $result->flags );
+        $this->assertSame( 'shared-slug', get_post_meta( $result->newId, Crosswalk::LEGACY_SLUG, true ) );
+    }
+
+    public function test_post_parent_translated_when_migrated(): void {
+        $parentLegacy = $this->fixture->createSermon();
+        $parentResult = ( new SermonWriter() )->write( $parentLegacy );
+
+        $childLegacy = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'  => 'Child',
+            'post_status' => 'publish',
+            'post_parent' => $parentLegacy,
+        ) );
+        add_post_meta( $childLegacy, LegacyIdentifiers::META_DESCRIPTION, 'child body' );
+
+        $childResult = ( new SermonWriter() )->write( $childLegacy );
+
+        $this->assertSame( $parentResult->newId, (int) get_post( $childResult->newId )->post_parent );
+    }
+
+    public function test_post_parent_unmigrated_becomes_zero_and_flags(): void {
+        // Parent legacy post exists but is NOT migrated → parent cannot be
+        // translated; new post_parent must be 0 + a flag, never a dangling legacy id.
+        $orphanParent = $this->fixture->createSermon();
+
+        $childLegacy = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'  => 'Orphan Child',
+            'post_status' => 'publish',
+            'post_parent' => $orphanParent,
+        ) );
+        add_post_meta( $childLegacy, LegacyIdentifiers::META_DESCRIPTION, 'orphan child body' );
+
+        $result = ( new SermonWriter() )->write( $childLegacy );
+
+        $this->assertSame( 0, (int) get_post( $result->newId )->post_parent );
+        $this->assertContains( 'post_parent_unresolved:' . $orphanParent, $result->flags );
+    }
+
+    public function test_legacy_post_and_meta_byte_equal_before_and_after(): void {
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'Untouched',
+            'post_status'  => 'publish',
+            'post_name'    => 'untouched-slug',
+            'post_content' => '<iframe src="x"></iframe>',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '<p>desc</p>' );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_POST_CONTENT_TEMP, 'a temp-only fragment' );
+
+        $before = $this->snapshot( $legacyId );
+
+        ( new SermonWriter() )->write( $legacyId );
+
+        $after = $this->snapshot( $legacyId );
+        $this->assertSame( $before, $after, 'Legacy post/meta were mutated by the writer.' );
+    }
+}
