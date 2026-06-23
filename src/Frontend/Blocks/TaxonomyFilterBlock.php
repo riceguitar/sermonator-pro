@@ -19,6 +19,7 @@ final class TaxonomyFilterBlock extends AbstractBlock {
             return '';
         }
         $hideEmpty = ! isset( $attributes['hideEmpty'] ) || (bool) $attributes['hideEmpty'];
+        $showCount = ! isset( $attributes['showCount'] ) || (bool) $attributes['showCount'];
 
         $terms = get_terms( array(
             'taxonomy'   => $taxonomy,
@@ -41,6 +42,6 @@ final class TaxonomyFilterBlock extends AbstractBlock {
         $taxObject = get_taxonomy( $taxonomy );
         $label     = ( $taxObject && isset( $taxObject->labels->name ) ) ? (string) $taxObject->labels->name : '';
 
-        return ( new Renderer() )->taxonomyLinks( $resolved, $label );
+        return ( new Renderer() )->taxonomyLinks( $resolved, $label, $showCount );
     }
 }

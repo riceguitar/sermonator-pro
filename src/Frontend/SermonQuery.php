@@ -32,9 +32,15 @@ final class SermonQuery {
             'post_status'            => 'publish',
             'posts_per_page'         => $perPage,
             'paged'                  => $page,
-            'meta_key'               => ID::META_DATE,
-            'orderby'                => 'meta_value_num',
-            'order'                  => $order,
+            // Order by preached date, but LEFT-JOIN so a sermon without sermonator_date is
+            // still listed (sorted last) rather than INNER-JOIN-dropped. Falls back to
+            // post_date as a tiebreaker / for dateless rows.
+            'meta_query'             => array(
+                'relation' => 'OR',
+                'preached' => array( 'key' => ID::META_DATE, 'type' => 'NUMERIC', 'compare' => 'EXISTS' ),
+                'undated'  => array( 'key' => ID::META_DATE, 'compare' => 'NOT EXISTS' ),
+            ),
+            'orderby'                => array( 'preached' => $order, 'date' => 'DESC' ),
             'ignore_sticky_posts'    => true,
             'no_found_rows'          => false,
             'update_post_term_cache' => true,

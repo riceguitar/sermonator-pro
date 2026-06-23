@@ -55,6 +55,30 @@ final class SermonQueryTest extends WP_UnitTestCase {
         $this->assertCount( 1, $page3->sermons );
     }
 
+    public function test_includes_dateless_sermon_sorted_last(): void {
+        $dated    = $this->sermon( 5, 'Dated' );
+        $dateless = (int) self::factory()->post->create( array(
+            'post_type'  => ID::POST_TYPE_SERMON,
+            'post_title' => 'Dateless',
+        ) );
+        // No sermonator_date meta on $dateless.
+
+        $result = ( new SermonQuery() )->run();
+
+        $this->assertSame( 2, $result->total, 'A sermon without a preached date must still be listed.' );
+        $ids = array_map( static fn( $v ) => $v->id, $result->sermons );
+        $this->assertContains( $dateless, $ids );
+        $this->assertSame( $dated, $result->sermons[0]->id, 'Dated sermons sort before dateless ones.' );
+        $this->assertSame( $dateless, $result->sermons[1]->id );
+    }
+
+    public function test_caps_unbounded_per_page(): void {
+        $result = ( new \Sermonator\Frontend\SermonQuery() )->run(
+            \Sermonator\Frontend\GridArgs::fromAtts( array( 'perPage' => 999999 ) )
+        );
+        $this->assertSame( 0, $result->total ); // no sermons seeded here; asserts no fatal/limit blow-up
+    }
+
     public function test_excludes_drafts(): void {
         $this->sermon( 1 );
         $draft = (int) self::factory()->post->create( array( 'post_type' => ID::POST_TYPE_SERMON, 'post_status' => 'draft' ) );

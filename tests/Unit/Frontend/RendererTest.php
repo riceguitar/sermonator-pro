@@ -130,23 +130,17 @@ final class RendererTest extends TestCase {
     }
 
     public function test_grid_renders_cards_with_columns(): void {
-        Functions\when( 'paginate_links' )->justReturn( '' );
         $result = new \Sermonator\Frontend\QueryResult( array( $this->view(), $this->view() ), 2, 1, 1 );
         $html   = ( new Renderer() )->grid( $result, array( 'columns' => 4 ) );
         $this->assertStringContainsString( 'data-columns="4"', $html );
         $this->assertSame( 2, substr_count( $html, 'sermonator-card"' ) );
     }
 
-    public function test_pagination_empty_for_single_page(): void {
-        $result = new \Sermonator\Frontend\QueryResult( array( $this->view() ), 1, 1, 1 );
-        $this->assertSame( '', ( new Renderer() )->pagination( $result ) );
-    }
-
-    public function test_pagination_renders_for_multiple_pages(): void {
-        Functions\when( 'paginate_links' )->justReturn( '<ul class="page-numbers"><li>1</li></ul>' );
-        $result = new \Sermonator\Frontend\QueryResult( array( $this->view() ), 25, 3, 1 );
-        $html   = ( new Renderer() )->pagination( $result );
-        $this->assertStringContainsString( 'sermonator-pagination', $html );
-        $this->assertStringContainsString( 'page-numbers', $html );
+    public function test_taxonomy_links_respects_show_count_false(): void {
+        $terms = array( array( 'name' => 'Grace', 'url' => 'http://x/g', 'count' => 4 ) );
+        $with  = ( new Renderer() )->taxonomyLinks( $terms, 'Topics', true );
+        $without = ( new Renderer() )->taxonomyLinks( $terms, 'Topics', false );
+        $this->assertStringContainsString( 'sermonator-termlist__count', $with );
+        $this->assertStringNotContainsString( 'sermonator-termlist__count', $without );
     }
 }

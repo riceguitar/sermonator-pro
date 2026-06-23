@@ -24,9 +24,14 @@ final class ArchiveOrdering {
         if ( ! $this->isSermonArchive( $query ) ) {
             return;
         }
-        $query->set( 'meta_key', ID::META_DATE );
-        $query->set( 'orderby', 'meta_value_num' );
-        $query->set( 'order', 'DESC' );
+        // LEFT-JOIN ordering so a sermon without sermonator_date still appears (sorted last)
+        // instead of being INNER-JOIN-dropped from the archive. post_date is the tiebreaker.
+        $query->set( 'meta_query', array(
+            'relation' => 'OR',
+            'preached' => array( 'key' => ID::META_DATE, 'type' => 'NUMERIC', 'compare' => 'EXISTS' ),
+            'undated'  => array( 'key' => ID::META_DATE, 'compare' => 'NOT EXISTS' ),
+        ) );
+        $query->set( 'orderby', array( 'preached' => 'DESC', 'date' => 'DESC' ) );
     }
 
     private function isSermonArchive( \WP_Query $query ): bool {

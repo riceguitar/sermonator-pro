@@ -105,7 +105,10 @@ final class Renderer {
     }
 
     /**
-     * A grid of sermon cards with an empty-state and pagination.
+     * A grid of sermon cards with an empty-state. Embedded grids (block/shortcode) show a
+     * fixed count and do NOT paginate — paginated browsing is the job of the sermon archive
+     * (which uses the theme's own pagination on the main query). This avoids generating
+     * pagination links that cannot resolve for a secondary query on a static page.
      *
      * @param array{columns?:int} $opts
      */
@@ -120,8 +123,7 @@ final class Renderer {
             $cards .= $this->card( $view );
         }
 
-        return '<div class="sermonator-grid" data-columns="' . esc_attr( (string) $columns ) . '">' . $cards . '</div>'
-            . $this->pagination( $result );
+        return '<div class="sermonator-grid" data-columns="' . esc_attr( (string) $columns ) . '">' . $cards . '</div>';
     }
 
     /**
@@ -130,14 +132,14 @@ final class Renderer {
      *
      * @param list<array{name:string,url:string,count:int}> $terms
      */
-    public function taxonomyLinks( array $terms, string $label = '' ): string {
+    public function taxonomyLinks( array $terms, string $label = '', bool $showCount = true ): string {
         if ( $terms === array() ) {
             return '';
         }
         $items = '';
         foreach ( $terms as $t ) {
             $text = esc_html( $t['name'] );
-            if ( $t['count'] > 0 ) {
+            if ( $showCount && $t['count'] > 0 ) {
                 $text .= ' <span class="sermonator-termlist__count">(' . esc_html( (string) $t['count'] ) . ')</span>';
             }
             $items .= $t['url'] !== ''
@@ -146,24 +148,6 @@ final class Renderer {
         }
         $heading = $label !== '' ? '<h2 class="sermonator-termlist__label">' . esc_html( $label ) . '</h2>' : '';
         return '<nav class="sermonator-termlist">' . $heading . '<ul>' . $items . '</ul></nav>';
-    }
-
-    public function pagination( QueryResult $result ): string {
-        if ( $result->totalPages <= 1 ) {
-            return '';
-        }
-        $links = paginate_links( array(
-            'total'     => $result->totalPages,
-            'current'   => $result->page,
-            'type'      => 'list',
-            'prev_text' => esc_html__( '« Previous', 'sermonator' ),
-            'next_text' => esc_html__( 'Next »', 'sermonator' ),
-        ) );
-        if ( ! is_string( $links ) || $links === '' ) {
-            return '';
-        }
-        // paginate_links() returns markup that is already escaped/built by core.
-        return '<nav class="sermonator-pagination" aria-label="' . esc_attr__( 'Sermons pagination', 'sermonator' ) . '">' . $links . '</nav>';
     }
 
     /**

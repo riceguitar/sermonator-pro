@@ -38,7 +38,9 @@ final class GridArgs {
         }
 
         return array(
-            'perPage'    => isset( $atts['perPage'] ) ? max( 1, (int) $atts['perPage'] ) : 12,
+            // Clamp to a sane ceiling so an embedded grid/shortcode cannot hydrate an
+            // unbounded number of posts (count="999999" DoS).
+            'perPage'    => isset( $atts['perPage'] ) ? max( 1, min( 100, (int) $atts['perPage'] ) ) : 12,
             'page'       => self::currentPage(),
             'columns'    => isset( $atts['columns'] ) ? max( 1, min( 6, (int) $atts['columns'] ) ) : 3,
             'order'      => ( isset( $atts['order'] ) && strtoupper( (string) $atts['order'] ) === 'ASC' ) ? 'ASC' : 'DESC',
