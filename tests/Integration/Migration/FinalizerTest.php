@@ -132,6 +132,20 @@ final class FinalizerTest extends WP_UnitTestCase {
         ) );
     }
 
+    /** New comment ids that still carry the LEGACY_COMMENT_ID back-ref, ascending. */
+    private function commentsWithLegacyBackRef(): array {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT DISTINCT comment_id FROM {$wpdb->commentmeta} WHERE meta_key = %s ORDER BY comment_id ASC",
+                Crosswalk::LEGACY_COMMENT_ID
+            )
+        );
+
+        return array_values( array_map( 'intval', (array) $ids ) );
+    }
+
     // -------------------------------------------------------------------------
     // Gating: refuses unless verified + fresh + confirmed
     // -------------------------------------------------------------------------
@@ -270,6 +284,58 @@ final class FinalizerTest extends WP_UnitTestCase {
     }
 
     // -------------------------------------------------------------------------
+    // Comment back-refs: LEGACY_COMMENT_ID lives in COMMENT meta, not post meta —
+    // the allowlist strip must reach it (design-notes item 19 / B2b review).
+    // -------------------------------------------------------------------------
+
+    public function test_successful_finalize_strips_comment_legacy_back_ref(): void {
+        $data = $this->seedDataset();
+        $this->migrateAndVerify();
+
+        // The seeded legacy comment was copied onto the migrated sermon and stamped
+        // with LEGACY_COMMENT_ID. Before finalize that back-ref exists (and points at
+        // the legacy comment id about to be orphaned by the legacy-post delete).
+        $newSermon = Crosswalk::findNewByLegacyId( $data['sermons'][0], Identifiers::POST_TYPE_SERMON );
+        $this->assertNotNull( $newSermon );
+
+        $migratedComments = get_comments( array(
+            'post_id' => $newSermon,
+            'status'  => 'any',
+            'fields'  => 'ids',
+            'number'  => 0,
+        ) );
+        $this->assertNotEmpty( $migratedComments, 'Setup: the migrated sermon must carry a copied comment.' );
+
+        $taggedBefore = array();
+        foreach ( $migratedComments as $cid ) {
+            if ( '' !== (string) get_comment_meta( (int) $cid, Crosswalk::LEGACY_COMMENT_ID, true ) ) {
+                $taggedBefore[] = (int) $cid;
+            }
+        }
+        $this->assertNotEmpty( $taggedBefore, 'Setup: a migrated comment must carry LEGACY_COMMENT_ID.' );
+
+        $result = ( new Finalizer() )->run( true );
+        $this->assertNull( $result['refused'] );
+
+        // The migrated comments SURVIVE (the church's records) but carry NO
+        // _sermonator_legacy_comment_id (it pointed at a now-deleted legacy comment).
+        foreach ( $migratedComments as $cid ) {
+            $this->assertInstanceOf( \WP_Comment::class, get_comment( (int) $cid ),
+                "Migrated comment {$cid} must survive finalize." );
+            $this->assertSame( '', (string) get_comment_meta( (int) $cid, Crosswalk::LEGACY_COMMENT_ID, true ),
+                "Migrated comment {$cid} must NOT retain _sermonator_legacy_comment_id after finalize." );
+        }
+
+        // Zero comment back-refs remain anywhere.
+        $this->assertSame( array(), $this->commentsWithLegacyBackRef(),
+            'No comment may retain LEGACY_COMMENT_ID after a successful finalize.' );
+
+        // The stripped count includes the comment back-ref rows (not just post meta).
+        $this->assertGreaterThanOrEqual( count( $taggedBefore ) + 1, $result['stripped'],
+            'stripped must count comment back-refs in addition to post-meta back-refs.' );
+    }
+
+    // -------------------------------------------------------------------------
     // Per-counterpart only — never on cardinality equality
     // -------------------------------------------------------------------------
 
@@ -381,5 +447,95 @@ final class FinalizerTest extends WP_UnitTestCase {
 
         $this->assertSame( $authoritative, $stored,
             'Native shared count must be recounted to its true authoritative value at finalize (never left stale).' );
+    }
+
+    // -------------------------------------------------------------------------
+    // Crash/resume on the DESTRUCTIVE step (B2b review): finalize is non-atomic;
+    // an abort mid legacy-post-delete loop must NOT wedge the migration. A resume
+    // must complete to 'finalized' with no double-delete and a correct final state.
+    // -------------------------------------------------------------------------
+
+    public function test_finalize_resumes_after_abort_mid_legacy_delete_loop(): void {
+        $data = $this->seedDataset();
+        $this->migrateAndVerify();
+
+        // Snapshot the migrated records that must survive (church's authoritative set).
+        $migratedSermons = Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON );
+        $this->assertNotEmpty( $migratedSermons );
+
+        // Inject a REAL abort: throw on the FIRST legacy-post force-delete.
+        // wp_delete_post fires before_delete_post before removing the row, so the
+        // throw aborts run() with at least one counterpart already MARKED finalized
+        // (mark precedes delete) and the loop interrupted partway.
+        $thrown = false;
+        $boom   = static function ( $postId ) {
+            throw new \RuntimeException( 'injected abort mid finalize delete loop @ ' . $postId );
+        };
+        add_action( 'before_delete_post', $boom, 10, 1 );
+        try {
+            ( new Finalizer() )->run( true );
+        } catch ( \RuntimeException $e ) {
+            $thrown = true;
+        } finally {
+            remove_action( 'before_delete_post', $boom, 10 );
+        }
+        $this->assertTrue( $thrown, 'The injected mid-finalize abort must have fired.' );
+
+        // Partial state: phase has NOT advanced to 'finalized' yet (that is the last
+        // step, after the whole loop). It must NOT have retreated either — it is still
+        // 'verified', so GATE 1 still passes on the resume.
+        $this->assertSame( 'verified', ( new MigrationState() )->phase(),
+            'Phase must still be verified after a mid-loop abort (finalized is set last).' );
+
+        // Resume: a fresh run() must COMPLETE — not refuse forever — even though the
+        // first legacy id was already marked finalized (and its back-ref counterpart
+        // may already be partially stripped). This is the anti-wedge guarantee.
+        $result = ( new Finalizer() )->run( true );
+        $this->assertNull( $result['refused'],
+            'A resumed finalize must complete, not refuse forever, after a partial destructive abort.' );
+
+        // Every verified legacy post is gone (no leak: the marked-but-not-yet-deleted
+        // id from the abort is re-deleted idempotently on resume).
+        foreach ( $data['sermons'] as $legacyId ) {
+            $this->assertNull( get_post( $legacyId ), "Legacy sermon {$legacyId} must be deleted after resume." );
+        }
+        $this->assertNull( get_post( $data['podcast'] ), 'Legacy podcast must be deleted after resume.' );
+
+        // No double-delete of the migrated records: they survive intact.
+        foreach ( $migratedSermons as $newId ) {
+            $this->assertInstanceOf( \WP_Post::class, get_post( $newId ),
+                "Migrated sermon {$newId} must survive the aborted+resumed finalize." );
+            $this->assertSame( '', (string) get_post_meta( $newId, Crosswalk::LEGACY_POST_ID, true ),
+                'LEGACY_POST_ID stripped after resume.' );
+        }
+
+        // All back-refs gone (post + comment) — the full happy-path postcondition.
+        $this->assertSame( array(), $this->commentsWithLegacyBackRef(),
+            'No comment back-ref may survive the aborted+resumed finalize.' );
+        $this->assertFalse( get_option( 'sermonmanager_general', false ),
+            'Migrated legacy option deleted after resume.' );
+
+        // Final state correct.
+        $this->assertSame( 'finalized', ( new MigrationState() )->phase(),
+            'A resumed finalize must reach the finalized terminal phase.' );
+    }
+
+    public function test_finalize_is_idempotent_on_resume_no_double_delete(): void {
+        $data = $this->seedDataset();
+        $this->migrateAndVerify();
+
+        $first = ( new Finalizer() )->run( true );
+        $this->assertNull( $first['refused'] );
+        $this->assertSame( 'finalized', ( new MigrationState() )->phase() );
+        $deletedPosts = $first['deleted']['posts'];
+        $this->assertNotEmpty( $deletedPosts );
+
+        // A second run on the finalized phase must REFUSE (GATE 1), deleting nothing
+        // more — the terminal phase is the natural idempotency stop.
+        $second = ( new Finalizer() )->run( true );
+        $this->assertIsString( $second['refused'], 'A second finalize on the finalized phase must refuse.' );
+        $this->assertSame( array(), $second['deleted']['posts'] );
+        $this->assertSame( 0, $second['stripped'] );
+        $this->assertSame( 'finalized', ( new MigrationState() )->phase() );
     }
 }

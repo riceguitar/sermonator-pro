@@ -34,7 +34,10 @@ use Sermonator\Schema\Identifiers;
  *     allowlist (Crosswalk::strippableBackRefs()) from the migrated counterpart —
  *     NEVER LEGACY_POST_CONTENT (the preserved divergent body) and never a
  *     MIGRATION_FLAGS row carrying an unresolved divergence flag (defence-in-depth:
- *     the fresh rescan already guarantees none is open);
+ *     the fresh rescan already guarantees none is open). The allowlist includes
+ *     LEGACY_COMMENT_ID, which lives on the migrated COMMENTS (comment meta), not on
+ *     the post — so the strip reaches into the migrated post's comments and removes
+ *     the now-dangling legacy-comment back-ref there too;
  *   - delete the migrated legacy OPTIONS (the live sermonmanager_* set + the legacy
  *     artwork options + the legacy default-podcast pointer), since their target
  *     sermonator_* counterparts were verified present;
@@ -50,8 +53,36 @@ use Sermonator\Schema\Identifiers;
  * deliberate conservative choice (see the must_handle).
  *
  * After success, state → 'finalized'; Rollback then refuses outright.
+ *
+ * CRASH/RESUME (the destructive step is non-atomic). A single run() deletes legacy
+ * posts one counterpart at a time; an abort between counterparts would otherwise wedge
+ * the migration: the deleted legacy id has no resolvable counterpart on a fresh rescan
+ * (its back-ref was already stripped), so the rescan would report it missing → !complete
+ * → Finalize would REFUSE forever, with no Rollback recovery for a force-deleted legacy
+ * post. To prevent that, each counterpart is recorded in
+ * OPTION_MIGRATION_PROGRESS[PROGRESS_KEY]['finalized_legacy_ids'] BEFORE its legacy
+ * delete, and:
+ *   - the GATE-2 fresh rescan runs against an EFFECTIVE manifest with those finalized
+ *     ids subtracted (checksums removed + sermons/podcasts counts decremented), so an
+ *     already-finalized id is expected-absent rather than "missing" — the rescan stays
+ *     a pure clean-oracle over the REMAINING work;
+ *   - the per-counterpart op is fully idempotent (delete is guarded by get_post(); the
+ *     meta/comment strips are no-ops when the rows are already gone), so the loop is
+ *     re-run for EVERY manifest id on resume — a mark-before-delete abort still gets its
+ *     legacy delete completed (no leak), and a completed delete is never repeated.
+ * The state advances to 'finalized' only after the whole loop, so a mid-loop abort
+ * leaves the phase at 'verified' and GATE 1 still admits the resume.
  */
 final class Finalizer {
+    /**
+     * Sub-key under OPTION_MIGRATION_PROGRESS where the destructive step records its
+     * own resume bookkeeping. Holds 'finalized_legacy_ids': the list of legacy POST
+     * ids whose destructive finalize was ENTERED (marked BEFORE the legacy delete).
+     * On resume these ids are treated as expected-absent by the fresh drift rescan so
+     * a mid-loop abort does not wedge the migration into a "missing forever" refusal.
+     */
+    public const PROGRESS_KEY = 'finalize';
+
     private MigrationState $state;
     private Verifier $verifier;
 
@@ -118,7 +149,26 @@ final class Finalizer {
             );
         }
 
-        $report = $this->verifier->verify( $manifest );
+        // RESUME DRAIN: a prior run may have aborted mid-loop, leaving counterparts that
+        // were MARKED finalized but whose legacy delete + back-ref strip did not finish.
+        // Complete those idempotently FIRST so the live DB matches the reduced manifest
+        // before the gate — a drained id's legacy post is gone and its back-ref stripped,
+        // so the rescan's expected/live/surplus cross-checks are all consistent. (On a
+        // first, never-aborted run the finalized set is empty and this is a no-op.)
+        $stripped = 0;
+        foreach ( $this->finalizedLegacyIds() as $legacyId ) {
+            $newType   = $manifest->checksum( $legacyId ) !== null
+                ? Identifiers::POST_TYPE_SERMON
+                : Identifiers::POST_TYPE_PODCAST;
+            $stripped += $this->finalizeCounterpart( $legacyId, $newType, $deleted );
+        }
+
+        // Subtract the finalized (now-drained) counterparts from the manifest so the
+        // fresh rescan does not report a deliberately-deleted legacy id as missing and
+        // wedge the resume. Over REMAINING work it stays a strict clean-oracle.
+        $rescanManifest = $this->manifestExcludingFinalized( $manifest );
+
+        $report = $this->verifier->verify( $rescanManifest );
         if ( ! $report->complete ) {
             return $this->refuse(
                 $deleted,
@@ -132,8 +182,6 @@ final class Finalizer {
         }
 
         // --- All gates passed. Begin the irreversible destructive step. ------------
-
-        $stripped = 0;
 
         // (1) Per verified POST counterpart: delete the legacy post + strip allowlist
         // back-refs from the migrated counterpart. Driven from the manifest's
@@ -204,16 +252,32 @@ final class Finalizer {
             return 0;
         }
 
-        // Delete the verified legacy source (force — past trash).
+        // Resume bookkeeping: record this counterpart as entered BEFORE the irreversible
+        // delete, so a mid-loop abort leaves it expected-absent on the next GATE-2
+        // rescan (no "missing forever" wedge). The whole op below is idempotent, so a
+        // re-run after an abort completes any delete that did not finish (no leak) and
+        // never double-deletes one that did.
+        $this->markCounterpartFinalized( $legacyId );
+
+        // Delete the verified legacy source (force — past trash). Idempotent: the
+        // get_post() guard skips a re-run whose legacy post is already gone.
         if ( get_post( $legacyId ) instanceof \WP_Post ) {
             wp_delete_post( $legacyId, true );
             $deleted['posts'][] = $legacyId;
         }
 
         // Strip ONLY the allowlist back-refs from the migrated counterpart. Never
-        // LEGACY_POST_CONTENT, never the MIGRATION_FLAGS row.
+        // LEGACY_POST_CONTENT, never the MIGRATION_FLAGS row. The post-meta keys live
+        // on the post; LEGACY_COMMENT_ID lives on the migrated COMMENTS, so it is
+        // stripped from the post's comments in a second pass below. All strips are
+        // idempotent (delete_*_meta is a no-op when the row is already gone, and the
+        // existence check means a resumed pass counts 0 for already-stripped rows).
         $stripped = 0;
         foreach ( self::stripAllowlist() as $key ) {
+            if ( $key === Crosswalk::LEGACY_COMMENT_ID ) {
+                // Comment meta, not post meta — handled in the comment pass below.
+                continue;
+            }
             // Count the rows that actually existed before deletion (a record may not
             // carry every allowlist key, e.g. a podcast vs a sermon).
             $existing = get_post_meta( $newId, $key, false );
@@ -221,6 +285,41 @@ final class Finalizer {
                 $stripped += count( $existing );
             }
             delete_post_meta( $newId, $key );
+        }
+
+        // Comment back-refs: LEGACY_COMMENT_ID was written via add_comment_meta onto the
+        // migrated post's COPIED comments (SermonWriter), pointing at a legacy comment id
+        // that the legacy-post force-delete above has just orphaned. Strip it from every
+        // comment of the migrated counterpart so no migrated comment retains a dangling
+        // legacy reference. Folded into $stripped.
+        if ( in_array( Crosswalk::LEGACY_COMMENT_ID, self::stripAllowlist(), true ) ) {
+            $stripped += $this->stripCommentBackRefs( $newId );
+        }
+
+        return $stripped;
+    }
+
+    /**
+     * Strip LEGACY_COMMENT_ID from every comment of a migrated post. Returns the number
+     * of comment back-ref rows removed (for the $stripped total). Idempotent: a comment
+     * with no back-ref contributes 0 and delete_comment_meta is a harmless no-op.
+     */
+    private function stripCommentBackRefs( int $newPostId ): int {
+        $commentIds = get_comments( array(
+            'post_id' => $newPostId,
+            'status'  => 'any',
+            'fields'  => 'ids',
+            'number'  => 0,
+        ) );
+
+        $stripped = 0;
+        foreach ( (array) $commentIds as $commentId ) {
+            $commentId = (int) $commentId;
+            $existing  = get_comment_meta( $commentId, Crosswalk::LEGACY_COMMENT_ID, false );
+            if ( is_array( $existing ) && $existing !== array() ) {
+                $stripped += count( $existing );
+            }
+            delete_comment_meta( $commentId, Crosswalk::LEGACY_COMMENT_ID );
         }
 
         return $stripped;
@@ -243,6 +342,87 @@ final class Finalizer {
             }
         }
         return false;
+    }
+
+    /**
+     * Record a legacy POST id as entered into the destructive finalize, persisted in
+     * OPTION_MIGRATION_PROGRESS[PROGRESS_KEY]['finalized_legacy_ids'] BEFORE the legacy
+     * delete fires. On a mid-loop abort this is what lets the GATE-2 rescan treat the id
+     * as expected-absent on resume (rather than reporting it missing forever).
+     */
+    private function markCounterpartFinalized( int $legacyId ): void {
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        if ( ! is_array( $progress ) ) {
+            $progress = array();
+        }
+        if ( ! isset( $progress[ self::PROGRESS_KEY ] ) || ! is_array( $progress[ self::PROGRESS_KEY ] ) ) {
+            $progress[ self::PROGRESS_KEY ] = array();
+        }
+
+        $ids = $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids'] ?? array();
+        $ids = is_array( $ids ) ? array_map( 'intval', $ids ) : array();
+        if ( ! in_array( $legacyId, $ids, true ) ) {
+            $ids[] = $legacyId;
+        }
+
+        $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids'] = array_values( array_unique( $ids ) );
+        update_option( Identifiers::OPTION_MIGRATION_PROGRESS, $progress );
+    }
+
+    /**
+     * The legacy POST ids already entered into the destructive finalize on a prior
+     * (possibly aborted) run.
+     *
+     * @return list<int>
+     */
+    private function finalizedLegacyIds(): array {
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        if ( ! is_array( $progress )
+            || ! isset( $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids'] )
+            || ! is_array( $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids'] ) ) {
+            return array();
+        }
+
+        return array_values( array_unique( array_map(
+            'intval',
+            $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids']
+        ) ) );
+    }
+
+    /**
+     * Build a derived manifest with the already-finalized legacy ids subtracted, so the
+     * GATE-2 fresh rescan does not flag a deliberately-deleted legacy id as missing on a
+     * resumed run. Removes each finalized id's checksum and decrements the matching
+     * sermons/podcasts count (podcasts are count-only in the manifest, so their count
+     * guard would otherwise fire on a shrunk live set). On a first, never-aborted run
+     * the finalized set is empty and this returns an equivalent manifest unchanged.
+     */
+    private function manifestExcludingFinalized( Manifest $manifest ): Manifest {
+        $finalized = $this->finalizedLegacyIds();
+        if ( $finalized === array() ) {
+            return $manifest;
+        }
+
+        $data      = $manifest->toArray();
+        $counts    = $data['counts'];
+        $checksums = $data['checksums'];
+
+        foreach ( $finalized as $legacyId ) {
+            if ( isset( $checksums[ $legacyId ] ) ) {
+                // A checksummed id is a SERMON — drop its checksum and decrement.
+                unset( $checksums[ $legacyId ] );
+                if ( isset( $counts['sermons'] ) ) {
+                    $counts['sermons'] = max( 0, (int) $counts['sermons'] - 1 );
+                }
+                continue;
+            }
+            // Not checksummed: a PODCAST (the manifest records podcasts by count only).
+            if ( isset( $counts['podcasts'] ) ) {
+                $counts['podcasts'] = max( 0, (int) $counts['podcasts'] - 1 );
+            }
+        }
+
+        return new Manifest( $counts, $checksums );
     }
 
     /**
