@@ -194,9 +194,110 @@ final class SermonWriter {
             }
         }
 
+        // Meta application (Task 13) — runs on both the fresh-insert and the
+        // resume path, idempotently. Returns any meta-derived flags (e.g.
+        // legacy_nonnumeric_date) to fold into the canonical flags row.
+        $flags = array_merge( $flags, $this->applyMeta( $newId, $legacyId ) );
+
         $this->writeFlags( $newId, $flags );
 
         return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Apply the legacy sermon's post meta onto the new post, idempotently.
+     *
+     * Discipline (the closed adversarial holes):
+     *  - the SermonMetaMapper drives WHICH keys are renamed / dropped / verbatim
+     *    and which legacy dates are non-numeric (its flags), but the actual WRITE
+     *    VALUES are sourced from the per-key UNSERIALIZED get_post_meta($id,$key,
+     *    false) form — never the no-key raw-serialized values — so an array meta
+     *    value round-trips as an array (core re-serializes) instead of being
+     *    double-serialized;
+     *  - the denormalized wpfc_service_type meta and the sermon_description (now
+     *    post_content) are dropped; unknown keys (e.g. _yoast_wpseo_title,
+     *    post_content_temp) pass through verbatim under the same key, so
+     *    post_content_temp is its own single canonical row;
+     *  - every key is rewritten with delete-then-re-add of the FULL multiset, so a
+     *    resume re-run produces zero duplicate / accumulated rows while preserving
+     *    multi-value ordering and arity exactly;
+     *  - for EVERY non-numeric sermon_date row a sermonator_date_normalized
+     *    companion (DateNormalizer::normalize, UTC-anchored) is written ALONGSIDE
+     *    the untouched verbatim raw; numeric dates get no companion. The companion
+     *    set is also delete-then-re-added (idempotent).
+     *
+     * Legacy meta is read READ-ONLY throughout.
+     *
+     * @return list<string> Meta-derived migration flags (e.g. legacy_nonnumeric_date).
+     */
+    private function applyMeta( int $newId, int $legacyId ): array {
+        // No-key form: drives the mapper's key-mapping / drop / flag decisions.
+        // (We deliberately do NOT use its serialized values for writes.)
+        $rawByKey = get_post_meta( $legacyId );
+        $rawByKey = is_array( $rawByKey ) ? $rawByKey : array();
+
+        $mapped = SermonMetaMapper::map( $rawByKey );
+        $keyMap = MappingContract::metaKeyMap();
+        $dropped = MappingContract::droppedMetaKeys();
+
+        foreach ( array_keys( $rawByKey ) as $legacyKey ) {
+            // sermon_description becomes post_content (handled by the reconciler);
+            // wpfc_service_type denorm copy is authoritative-via-taxonomy. Never
+            // carry either as a meta row.
+            if ( in_array( $legacyKey, $dropped, true ) ) {
+                continue;
+            }
+
+            $newKey = $keyMap[ $legacyKey ] ?? $legacyKey; // known → renamed; unknown → verbatim
+
+            // UNSERIALIZED per-key values — the heart of the serialized-meta hole.
+            $values = get_post_meta( $legacyId, $legacyKey, false );
+            $values = is_array( $values ) ? array_values( $values ) : array();
+
+            // Delete-then-re-add the full multiset: idempotent on resume, preserves
+            // multi-value ordering/arity, replaces single-value rows.
+            delete_post_meta( $newId, $newKey );
+            foreach ( $values as $value ) {
+                add_post_meta( $newId, $newKey, $value );
+            }
+        }
+
+        // Date normalization companions: one per NON-NUMERIC sermon_date row,
+        // written alongside the untouched raw (which the loop above already copied
+        // verbatim under the new date key). Delete-then-re-add for idempotency.
+        $this->applyDateNormalization( $newId, $legacyId );
+
+        return array_values( $mapped['flags'] );
+    }
+
+    /**
+     * Write a sermonator_date_normalized companion for EVERY non-numeric
+     * sermon_date row (raw left untouched), delete-then-re-add for idempotency.
+     * Numeric dates produce no companion row.
+     */
+    private function applyDateNormalization( int $newId, int $legacyId ): void {
+        $rawDates = get_post_meta( $legacyId, LegacyIdentifiers::META_DATE, false );
+        $rawDates = is_array( $rawDates ) ? array_values( $rawDates ) : array();
+
+        delete_post_meta( $newId, Identifiers::META_DATE_NORMALIZED );
+
+        foreach ( $rawDates as $raw ) {
+            $rawString = is_string( $raw ) ? $raw : (string) $raw;
+            if ( $this->isUnixTimestamp( $rawString ) ) {
+                continue; // numeric date — no companion
+            }
+            $normalized = DateNormalizer::normalize( $rawString );
+            if ( null === $normalized ) {
+                continue; // unparseable — raw is the source of truth; mapper still flags it
+            }
+            add_post_meta( $newId, Identifiers::META_DATE_NORMALIZED, $normalized );
+        }
+    }
+
+    /** Whether a legacy date value is a (signed) unix timestamp. */
+    private function isUnixTimestamp( string $value ): bool {
+        $stripped = ltrim( $value, '-' );
+        return '' !== $stripped && ctype_digit( $stripped );
     }
 
     /**
