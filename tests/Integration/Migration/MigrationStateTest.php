@@ -350,6 +350,13 @@ final class MigrationStateTest extends WP_UnitTestCase {
                 Identifiers::OPTION_MIGRATION_STATE
             )
         );
-        $this->assertSame( 'no', $autoload, 'Migration state option must be stored autoload=no.' );
+        // WP 6.6+ stores explicit non-autoload as 'off' (was 'no'); accept either so the
+        // assertion is correct across the supported floor. Both mean "not autoloaded".
+        $this->assertContains(
+            $autoload,
+            array( 'no', 'off' ),
+            'Migration state option must be stored with autoload disabled (no/off).'
+        );
+        $this->assertNotContains( $autoload, array( 'yes', 'on' ), 'Migration state option must NOT be autoloaded.' );
     }
 }

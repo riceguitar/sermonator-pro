@@ -6,7 +6,7 @@ namespace Sermonator\Support;
 
 final class VersionGate {
     public const MIN_PHP = '8.1';
-    public const MIN_WP  = '6.0';
+    public const MIN_WP  = '7.0';
 
     public function __construct(
         private readonly string $phpVersion,
