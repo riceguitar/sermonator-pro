@@ -71,6 +71,37 @@ final class LegacyFixture {
         return $id;
     }
 
+    /**
+     * Create a legacy podcast with an explicit body and a sm_podcast_settings
+     * payload (left exactly as supplied), plus any extra per-key meta.
+     *
+     * @param array<string,mixed>         $settings  The sm_podcast_settings array.
+     * @param array<string, list<string>> $extraMeta Additional meta (key → list of values).
+     */
+    public function createPodcastWithSettings( array $settings, string $title = 'Feed', string $content = '', array $extraMeta = array() ): int {
+        // Seed the body the way real legacy data exists in the DB — with KSES OFF
+        // and slashes applied — so the fixture itself does not strip an iframe /
+        // shortcode before the writer ever reads it.
+        kses_remove_filters();
+        try {
+            $id = (int) wp_insert_post( wp_slash( array(
+                'post_type'    => LegacyIdentifiers::POST_TYPE_PODCAST,
+                'post_title'   => $title,
+                'post_status'  => 'publish',
+                'post_content' => $content,
+            ) ) );
+        } finally {
+            kses_init_filters();
+        }
+        add_post_meta( $id, LegacyIdentifiers::META_PODCAST_SETTINGS, $settings );
+        foreach ( $extraMeta as $key => $values ) {
+            foreach ( (array) $values as $value ) {
+                add_post_meta( $id, $key, $value );
+            }
+        }
+        return $id;
+    }
+
     public function setOption( string $name, mixed $value ): void {
         update_option( $name, $value );
     }

@@ -1,0 +1,298 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sermonator\Tests\Integration\Migration;
+
+use WP_UnitTestCase;
+use Sermonator\Migration\PodcastWriter;
+use Sermonator\Migration\OptionWriter;
+use Sermonator\Migration\TermWriter;
+use Sermonator\Migration\Crosswalk;
+use Sermonator\Migration\LegacyIdentifiers;
+use Sermonator\Schema\Identifiers;
+use Sermonator\Tests\Integration\Support\LegacyFixture;
+
+/**
+ * Task 15: PodcastWriter + OptionWriter (integration).
+ *
+ * PodcastWriter mirrors the SermonWriter disciplines for the wpfc_sm_podcast →
+ * sermonator_podcast post type: back-ref FIRST + MIGRATION_COMPLETE LAST,
+ * KSES-safe wp_slash'd insert, per-key UNSERIALIZED meta (sm_podcast_settings
+ * round-trips as an array, never double-serialized), idempotent re-run, stamped
+ * with LEGACY_POST_ID so allMigratedPostIds()/rollback cover it. Any taxonomy/
+ * term reference inside sm_podcast_settings is remapped via TermCrosswalk (legacy
+ * taxonomy slug → new taxonomy slug; legacy term id → new term id) and renamed
+ * sm_podcast_settings → sermonator_podcast_settings.
+ *
+ * OptionWriter reads every sermonmanager_* option, applies OptionMapper (verbatim
+ * value/type under the sermonator_* prefix), with the add_option-first + backup
+ * discipline (a pre-existing sermonator_* target is backed up to
+ * OPTION_PRE_MIGRATION_BACKUP, never blind-clobbered), and remaps
+ * wpfc_sm_default_podcast → sermonator_default_podcast via the post crosswalk.
+ *
+ * Legacy podcasts and options are read READ-ONLY (byte-equal before/after).
+ */
+final class PodcastOptionWriterTest extends WP_UnitTestCase {
+    private LegacyFixture $fixture;
+
+    public function set_up(): void {
+        parent::set_up();
+        $this->fixture = new LegacyFixture();
+        $this->fixture->registerLegacySchema();
+        ( new \Sermonator\Model\Registrar() )->register();
+    }
+
+    /** Snapshot a legacy post + all its meta for byte-equality assertions. */
+    private function snapshotPost( int $legacyId ): array {
+        return array(
+            'post' => get_post( $legacyId, ARRAY_A ),
+            'meta' => get_post_meta( $legacyId ),
+        );
+    }
+
+    // ------------------------------------------------------------------ Podcast
+
+    public function test_podcast_settings_roundtrip_as_array_under_new_key(): void {
+        $settings = array(
+            'itunes_author'   => 'First Baptist',
+            'itunes_category' => array( 'Religion & Spirituality', 'Christianity' ),
+            'explicit'        => false,
+        );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $this->assertTrue( $result->created );
+        $this->assertSame( Identifiers::POST_TYPE_PODCAST, get_post_type( $result->newId ) );
+
+        // The settings array must arrive under the NEW key as the actual ARRAY
+        // (proving we read the per-key UNSERIALIZED form and let core re-serialize),
+        // never double-serialized into a string.
+        $stored = get_post_meta( $result->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertSame( $settings, $stored, 'sm_podcast_settings must round-trip as an array under the new key' );
+
+        // The legacy key name must NOT appear on the new post.
+        $this->assertSame( '', (string) get_post_meta( $result->newId, LegacyIdentifiers::META_PODCAST_SETTINGS, true ) );
+    }
+
+    public function test_podcast_stamped_with_legacy_id_appears_in_all_migrated(): void {
+        $legacyId = $this->fixture->createPodcast( 'Sunday Service' );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        // Back-ref stamped, so the post is resolvable and rollback-covered.
+        $this->assertSame( $legacyId, (int) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true ) );
+        $this->assertSame( $result->newId, Crosswalk::findNewByLegacyId( $legacyId, Identifiers::POST_TYPE_PODCAST ) );
+        $this->assertContains( $result->newId, Crosswalk::allMigratedPostIds() );
+        // MIGRATION_COMPLETE stamped LAST.
+        $this->assertSame( '1', (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+    }
+
+    public function test_podcast_settings_term_references_remapped_via_crosswalk(): void {
+        // Migrate a legacy series term so the crosswalk can resolve it.
+        $legacySeries = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Advent' );
+        ( new TermWriter() )->migrateAll();
+        $newSeries = Crosswalk::findNewTermByLegacyId( $legacySeries, Identifiers::TAX_SERIES );
+        $this->assertNotNull( $newSeries );
+
+        // A feed filtered by that legacy series term: the legacy taxonomy slug is a
+        // key whose value is the legacy term id.
+        $settings = array(
+            'itunes_author'              => 'Church',
+            LegacyIdentifiers::TAX_SERIES => $legacySeries,
+        );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $stored = get_post_meta( $result->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertIsArray( $stored );
+        // The legacy taxonomy key is renamed to the NEW taxonomy slug, and the
+        // legacy term id is remapped to the NEW term id.
+        $this->assertArrayNotHasKey( LegacyIdentifiers::TAX_SERIES, $stored );
+        $this->assertArrayHasKey( Identifiers::TAX_SERIES, $stored );
+        $this->assertSame( (int) $newSeries, $stored[ Identifiers::TAX_SERIES ] );
+        // Non-term keys pass through verbatim.
+        $this->assertSame( 'Church', $stored['itunes_author'] );
+    }
+
+    public function test_podcast_settings_term_list_references_remapped(): void {
+        $a = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Grace' );
+        $b = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Faith' );
+        ( new TermWriter() )->migrateAll();
+        $newA = Crosswalk::findNewTermByLegacyId( $a, Identifiers::TAX_TOPIC );
+        $newB = Crosswalk::findNewTermByLegacyId( $b, Identifiers::TAX_TOPIC );
+
+        $settings = array(
+            LegacyIdentifiers::TAX_TOPIC => array( $a, $b ),
+        );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $stored = get_post_meta( $result->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertSame( array( (int) $newA, (int) $newB ), $stored[ Identifiers::TAX_TOPIC ] );
+    }
+
+    public function test_podcast_body_kses_safe_iframe_survives(): void {
+        $iframe   = '<iframe src="https://example.com/feed"></iframe>';
+        $legacyId = $this->fixture->createPodcastWithSettings( array( 'itunes_author' => 'C' ), 'Feed', $iframe );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $this->assertSame( $iframe, get_post( $result->newId )->post_content, 'iframe must survive KSES-safe insert verbatim' );
+    }
+
+    public function test_podcast_idempotent_rerun_no_duplicate_post_or_meta(): void {
+        $settings = array( 'itunes_author' => 'Church', 'explicit' => true );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings );
+
+        $writer = new PodcastWriter();
+        $first  = $writer->write( $legacyId );
+        $second = $writer->write( $legacyId );
+
+        // No second insert.
+        $this->assertSame( $first->newId, $second->newId );
+        $this->assertTrue( $first->created );
+        $this->assertFalse( $second->created );
+
+        // Exactly one migrated podcast for this legacy id.
+        $this->assertCount(
+            1,
+            get_posts( array(
+                'post_type'   => Identifiers::POST_TYPE_PODCAST,
+                'meta_key'    => Crosswalk::LEGACY_POST_ID,
+                'meta_value'  => $legacyId,
+                'post_status' => 'any',
+                'fields'      => 'ids',
+                'numberposts' => -1,
+            ) )
+        );
+
+        // Settings meta is a single canonical row after re-run.
+        $this->assertCount( 1, get_post_meta( $first->newId, Identifiers::META_PODCAST_SETTINGS, false ) );
+        $this->assertSame( $settings, get_post_meta( $first->newId, Identifiers::META_PODCAST_SETTINGS, true ) );
+    }
+
+    public function test_partial_podcast_resumes_not_reinserts(): void {
+        $legacyId = $this->fixture->createPodcast( 'Resumable' );
+        $writer   = new PodcastWriter();
+        $first    = $writer->write( $legacyId );
+
+        // Crash-inject a partial: drop COMPLETE so the next write resumes.
+        delete_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE );
+        $second = $writer->write( $legacyId );
+
+        $this->assertSame( $first->newId, $second->newId );
+        $this->assertTrue( $second->resumed );
+        $this->assertSame( '1', (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+    }
+
+    public function test_legacy_podcast_byte_equal_before_and_after(): void {
+        $settings = array(
+            'itunes_author' => 'Church',
+            'nested'        => array( 'k' => array( 1, 2, 3 ) ),
+        );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings, 'Feed', '<iframe src="x"></iframe>' );
+
+        $before = $this->snapshotPost( $legacyId );
+
+        ( new PodcastWriter() )->write( $legacyId );
+        // resume too
+        $newId = Crosswalk::findNewByLegacyId( $legacyId, Identifiers::POST_TYPE_PODCAST );
+        delete_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE );
+        ( new PodcastWriter() )->write( $legacyId );
+
+        $after = $this->snapshotPost( $legacyId );
+        $this->assertSame( $before, $after, 'Legacy podcast post/meta were mutated by the writer.' );
+    }
+
+    // ------------------------------------------------------------------- Options
+
+    public function test_sermonmanager_options_mapped_verbatim_value_and_type(): void {
+        $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
+        $this->fixture->setOption( 'sermonmanager_per_page', 10 ); // int
+        $this->fixture->setOption( 'sermonmanager_template', array( 'a' => 1, 'b' => true ) ); // array
+
+        $result = ( new OptionWriter() )->migrate();
+
+        $this->assertSame( 'mediaelement', get_option( 'sermonator_player' ) );
+        $this->assertSame( 10, get_option( 'sermonator_per_page' ), 'int type preserved verbatim' );
+        $this->assertSame( array( 'a' => 1, 'b' => true ), get_option( 'sermonator_template' ) );
+        $this->assertGreaterThanOrEqual( 3, $result['written'] );
+    }
+
+    public function test_preexisting_target_option_backed_up_not_clobbered(): void {
+        // A church already has a NATIVE sermonator_player value.
+        add_option( 'sermonator_player', 'native-choice' );
+        $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
+
+        $result = ( new OptionWriter() )->migrate();
+
+        // The migrated value wins on the live option...
+        $this->assertSame( 'mediaelement', get_option( 'sermonator_player' ) );
+        // ...but the native value is preserved in the pre-migration backup.
+        $backup = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        $this->assertIsArray( $backup );
+        $this->assertSame( 'native-choice', $backup['sermonator_player'] );
+        $this->assertGreaterThanOrEqual( 1, $result['backed_up'] );
+    }
+
+    public function test_default_podcast_option_remapped_to_new_podcast_id(): void {
+        $legacyPodcast = $this->fixture->createPodcast( 'Main' );
+        $newId         = ( new PodcastWriter() )->write( $legacyPodcast )->newId;
+
+        // Legacy default-podcast option points at the legacy podcast id.
+        $this->fixture->setOption( LegacyIdentifiers::OPTION_DEFAULT_PODCAST, $legacyPodcast );
+
+        ( new OptionWriter() )->migrate();
+
+        $this->assertSame(
+            $newId,
+            (int) get_option( Identifiers::OPTION_DEFAULT_PODCAST ),
+            'default-podcast option must be remapped to the NEW podcast id'
+        );
+    }
+
+    public function test_options_idempotent_rerun_no_double_backup(): void {
+        add_option( 'sermonator_player', 'native-choice' );
+        $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
+
+        $writer = new OptionWriter();
+        $writer->migrate();
+        $second = $writer->migrate();
+
+        // The backup still holds the ORIGINAL native value (the re-run must NOT
+        // back up the value we ourselves wrote).
+        $backup = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        $this->assertSame( 'native-choice', $backup['sermonator_player'] );
+        $this->assertSame( 0, $second['backed_up'], 'a re-run backs up nothing new' );
+        $this->assertSame( 'mediaelement', get_option( 'sermonator_player' ) );
+    }
+
+    public function test_legacy_options_untouched_byte_equal(): void {
+        $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
+        $this->fixture->setOption( 'sermonmanager_template', array( 'a' => 1 ) );
+        $legacyPodcast = $this->fixture->createPodcast( 'Main' );
+        ( new PodcastWriter() )->write( $legacyPodcast );
+        $this->fixture->setOption( LegacyIdentifiers::OPTION_DEFAULT_PODCAST, $legacyPodcast );
+
+        $before = array(
+            'sermonmanager_player'    => get_option( 'sermonmanager_player' ),
+            'sermonmanager_template'  => get_option( 'sermonmanager_template' ),
+            'default_podcast'         => get_option( LegacyIdentifiers::OPTION_DEFAULT_PODCAST ),
+        );
+
+        ( new OptionWriter() )->migrate();
+        ( new OptionWriter() )->migrate();
+
+        $after = array(
+            'sermonmanager_player'    => get_option( 'sermonmanager_player' ),
+            'sermonmanager_template'  => get_option( 'sermonmanager_template' ),
+            'default_podcast'         => get_option( LegacyIdentifiers::OPTION_DEFAULT_PODCAST ),
+        );
+
+        $this->assertSame( $before, $after, 'Legacy options must be byte-equal before/after.' );
+    }
+}
