@@ -33,7 +33,20 @@ final class Plugin {
         ( new \Sermonator\Model\Capabilities() )->grant();
 
         self::registerAdmin();
+        self::registerFrontend();
         self::registerCliCommands();
+    }
+
+    /**
+     * Register the read-only front-end display layer (blocks, block template, classic
+     * fallback, assets). Booted in ALL contexts: block and block-template registration must
+     * be visible to the editor (admin) and REST as well as the front end. The front-end-only
+     * pieces self-scope — single_template and wp_enqueue_scripts only fire on front-end
+     * requests, and the the_content meta hook is guarded by is_singular()/in_the_loop()/
+     * is_main_query(). The layer never writes data.
+     */
+    private static function registerFrontend(): void {
+        ( new \Sermonator\Frontend\FrontendServiceProvider() )->hook();
     }
 
     /**

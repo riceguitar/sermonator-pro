@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/sermon-meta",
+  "title": "Sermon Meta",
+  "category": "widgets",
+  "icon": "list-view",
+  "description": "Scripture, preacher, series, date and taxonomy details for a sermon.",
+  "textdomain": "sermonator",
+  "usesContext": [ "postId" ],
+  "attributes": {
+    "postId": { "type": "number" }
+  },
+  "supports": {
+    "html": false,
+    "align": [ "wide" ]
+  },
+  "style": "sermonator-frontend"
+}
