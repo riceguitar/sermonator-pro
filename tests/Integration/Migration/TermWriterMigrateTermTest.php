@@ -535,6 +535,73 @@ final class TermWriterMigrateTermTest extends WP_UnitTestCase {
         $this->assertCount( 1, get_term_meta( $newId, Crosswalk::LEGACY_TERM_ID, false ) );
     }
 
+    /**
+     * MUST-FIX #4: migrateTerm must copy ALL legacy termmeta onto the new term
+     * (preacher bios/photos, series artwork, _yoast_wpseo_* term SEO, ACF term
+     * fields), byte-exact, with the same unserialize-then-wp_slash / delete-then-
+     * re-add discipline as SermonWriter::applyMeta — EXCLUDING the migration's own
+     * keys (LEGACY_TERM_ID, LEGACY_TERM_TT_ID, LEGACY_SLUG, MIGRATION_FLAGS).
+     * Attachment-id-bearing values are global ids → verbatim.
+     */
+    public function test_legacy_termmeta_is_copied_byte_exact_excluding_migration_keys(): void {
+        $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_PREACHER, 'Pastor Meta' );
+
+        // Arbitrary legacy termmeta the church depends on: a scalar bio, an
+        // attachment-id photo (global id → verbatim), a Yoast SEO key, a SERIALIZED
+        // ARRAY (ACF-style), and a BACKSLASH value. Seeded wp_slash'd so the DB row
+        // holds the EXACT bytes (mirrors how real legacy termmeta lives on disk).
+        $bio          = 'A faithful shepherd since 1998.';
+        $photoId      = '4242';
+        $yoastTitle   = 'Sermons by Pastor Meta';
+        $acfArray     = array( 'years' => 26, 'tags' => array( 'grace', 'mercy' ) );
+        $backslash    = 'C:\\photos\\pastor\\meta.jpg';
+        $serializedIn = serialize( 'inner \\ backslash' );
+
+        add_term_meta( $legacyId, 'preacher_bio', wp_slash( $bio ) );
+        add_term_meta( $legacyId, 'sermon_image_id', wp_slash( $photoId ) );
+        add_term_meta( $legacyId, '_yoast_wpseo_title', wp_slash( $yoastTitle ) );
+        add_term_meta( $legacyId, 'acf_term_fields', wp_slash( $acfArray ) );
+        add_term_meta( $legacyId, 'unc_path', wp_slash( $backslash ) );
+        add_term_meta( $legacyId, 'serialized_inner', wp_slash( $serializedIn ) );
+
+        // Precondition: the legacy rows hold the exact bytes (fixture path OK).
+        $this->assertSame( $bio, get_term_meta( $legacyId, 'preacher_bio', true ) );
+        $this->assertSame( $acfArray, get_term_meta( $legacyId, 'acf_term_fields', true ) );
+        $this->assertSame( $serializedIn, get_term_meta( $legacyId, 'serialized_inner', true ) );
+
+        $legacy = $this->legacyTerm( LegacyIdentifiers::TAX_PREACHER, $legacyId );
+        $legacyMetaBefore = get_term_meta( $legacyId );
+
+        $writer = new TermWriter();
+        $newId  = $writer->migrateTerm( LegacyIdentifiers::TAX_PREACHER, $legacy );
+
+        // Every legacy termmeta key lands BYTE-EXACT on the new term.
+        $this->assertSame( $bio, get_term_meta( $newId, 'preacher_bio', true ) );
+        $this->assertSame( $photoId, get_term_meta( $newId, 'sermon_image_id', true ), 'attachment id is a global id → verbatim' );
+        $this->assertSame( $yoastTitle, get_term_meta( $newId, '_yoast_wpseo_title', true ) );
+        $this->assertSame( $acfArray, get_term_meta( $newId, 'acf_term_fields', true ), 'serialized array must round-trip as an array' );
+        $this->assertSame( $backslash, get_term_meta( $newId, 'unc_path', true ), 'backslash value must not lose a backslash level' );
+        $this->assertSame( $serializedIn, get_term_meta( $newId, 'serialized_inner', true ) );
+        $this->assertSame( 'inner \\ backslash', maybe_unserialize( get_term_meta( $newId, 'serialized_inner', true ) ) );
+
+        // The migration's OWN keys must NOT be duplicated by the termmeta copy:
+        // exactly one back-ref / slug row each, never carried over from legacy.
+        $this->assertCount( 1, get_term_meta( $newId, Crosswalk::LEGACY_TERM_ID, false ) );
+        $this->assertCount( 1, get_term_meta( $newId, Crosswalk::LEGACY_TERM_TT_ID, false ) );
+        $this->assertCount( 1, get_term_meta( $newId, Crosswalk::LEGACY_SLUG, false ) );
+
+        // Legacy termmeta is READ-ONLY — unchanged.
+        $this->assertSame( $legacyMetaBefore, get_term_meta( $legacyId ), 'legacy termmeta must be byte-equal after migration' );
+
+        // Idempotent re-run: no accumulation of termmeta rows, same values.
+        $second = $writer->migrateTerm( LegacyIdentifiers::TAX_PREACHER, $legacy );
+        $this->assertSame( $newId, $second );
+        $this->assertCount( 1, get_term_meta( $newId, 'preacher_bio', false ), 're-run must not duplicate termmeta rows' );
+        $this->assertCount( 1, get_term_meta( $newId, 'acf_term_fields', false ) );
+        $this->assertSame( $acfArray, get_term_meta( $newId, 'acf_term_fields', true ) );
+        $this->assertCount( 1, get_term_meta( $newId, Crosswalk::LEGACY_TERM_ID, false ), 're-run must not duplicate the back-ref' );
+    }
+
     /** @param list<mixed> $flagRows @return list<string> */
     private function flattenFlags( array $flagRows ): array {
         $out = array();

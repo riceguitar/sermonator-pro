@@ -284,6 +284,13 @@ final class TermWriter {
             add_term_meta( $newTermId, Crosswalk::MIGRATION_FLAGS, $flag );
         }
 
+        // MUST-FIX #4: copy ALL legacy termmeta onto the new term (preacher bios/
+        // photos, series artwork, _yoast_wpseo_* term SEO, ACF term fields) — these
+        // are irreplaceable per-term ORIGINAL content, not derived data. Run AFTER the
+        // ownership marker / back-refs / flags are stamped so the exclusion of the
+        // migration's own keys is complete.
+        $this->copyTermMeta( $legacyTermId, $newTermId );
+
         return $newTermId;
     }
 
@@ -599,6 +606,58 @@ final class TermWriter {
             }
         }
 
+        // MUST-FIX #4: an adopted crash orphan must also receive the legacy termmeta
+        // (it was a bare insert whose run died before any meta copy). Idempotent
+        // delete-then-re-add per key, so a re-run never accumulates duplicate rows.
+        $this->copyTermMeta( $legacyTermId, $termId );
+
         return $termId;
+    }
+
+    /**
+     * Copy ALL legacy termmeta onto the new term with the same discipline as
+     * SermonWriter::applyMeta (MUST-FIX #4):
+     *
+     *  - per-key UNSERIALIZED values (get_term_meta(...,false)) so a serialized array
+     *    round-trips as an array (core re-serializes) instead of double-serializing;
+     *  - delete-then-re-add the full multiset per key → idempotent on resume,
+     *    preserving multi-value ordering/arity exactly;
+     *  - wp_slash() each value: get_term_meta(...,false) returns UNSLASHED values and
+     *    add_term_meta() internally wp_unslash()es its input, so a backslash level
+     *    would otherwise be stripped (UNC/file paths, escaped quotes, serialized inner
+     *    strings). wp_slash() recurses into arrays so array meta is byte-exact;
+     *  - the migration's OWN keys (LEGACY_TERM_ID, LEGACY_TERM_TT_ID, LEGACY_SLUG,
+     *    MIGRATION_FLAGS) are EXCLUDED — they were just stamped by the writer and must
+     *    never be duplicated/overwritten from the (markerless) legacy source.
+     *
+     * Attachment-id-bearing termmeta values are GLOBAL ids → copied verbatim.
+     *
+     * Legacy termmeta is read READ-ONLY.
+     */
+    private function copyTermMeta( int $legacyTermId, int $newTermId ): void {
+        $ownKeys = array(
+            Crosswalk::LEGACY_TERM_ID,
+            Crosswalk::LEGACY_TERM_TT_ID,
+            Crosswalk::LEGACY_SLUG,
+            Crosswalk::MIGRATION_FLAGS,
+        );
+
+        $byKey = get_term_meta( $legacyTermId );
+        $byKey = is_array( $byKey ) ? $byKey : array();
+
+        foreach ( array_keys( $byKey ) as $key ) {
+            $key = (string) $key;
+            if ( in_array( $key, $ownKeys, true ) ) {
+                continue; // never carry the migration's own keys across
+            }
+
+            $values = get_term_meta( $legacyTermId, $key, false );
+            $values = is_array( $values ) ? array_values( $values ) : array();
+
+            delete_term_meta( $newTermId, $key );
+            foreach ( $values as $value ) {
+                add_term_meta( $newTermId, $key, wp_slash( $value ) );
+            }
+        }
     }
 }

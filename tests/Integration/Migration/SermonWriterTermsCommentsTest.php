@@ -1337,36 +1337,125 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         );
     }
 
-    // --------- FIX 4: mirrorNativeTaxonomies — count mutation is intentional (doc contract)
+    // --------- MUST-FIX #2: identical-content crash-orphans adopted positionally
 
     /**
-     * FIX 4: mirrorNativeTaxonomies() calls wp_set_object_terms on global term ids,
-     * which invokes wp_update_term_count, mutating wp_term_taxonomy.count BEFORE
-     * Finalize. This is an intentional, reversible derived-value mutation — the
-     * RELATIONSHIP (which IS primary data) must be preserved.
+     * MUST-FIX #2: two BYTE-IDENTICAL legacy comments (same parent=0 / email /
+     * content / date / type / approved / user_id) that were both crash-orphaned on
+     * the new post must NOT be permanently duplicated on resume.
      *
-     * This test documents the contract:
-     *  (a) legacy post term_relationships rows are UNCHANGED (legacy is read-only);
-     *  (b) the new sermon has the category term mirrored (relationship preserved);
-     *  (c) the count column is a derived value — its mutation is intentional and will
-     *      be re-balanced on rollback/finalize. We snapshot and compare to document
-     *      this behaviour explicitly rather than asserting a specific delta.
+     * The two legacy comments share ONE identity signature, and the two orphans
+     * share that SAME signature — so the ambiguity guard fires (N=2 legacy, M=2
+     * orphans). The OLD behaviour `continue`d past ALL of them, leaving the orphans
+     * un-back-reffed AND fresh-inserting two more copies: 2 orphans + 2 fresh = 4
+     * comments where the legacy had 2, forever un-mappable on every resume.
      *
-     * NOTE: WordPress's built-in category count callback only counts 'post' post type,
-     * so the count for a sermonator_sermon may not change numerically in this test —
-     * but the RELATIONSHIP row is what matters (and must be mirrored correctly).
-     * TODO(B2b): consider deferring native-taxonomy assignment to the Finalize step
-     * for strict count-immutability.
+     * The fix: because the orphans are by construction interchangeable copies, adopt
+     * POSITIONALLY — pair K=min(N,M)=2 orphans to the 2 same-signature legacy
+     * comments (stamp a back-ref on each), consuming every orphan. Net: exactly 2
+     * comments, both carrying a LEGACY_COMMENT_ID. Zero duplicates.
      */
-    public function test_mirror_native_taxonomies_legacy_relationships_unchanged(): void {
+    public function test_identical_content_orphans_adopted_positionally_no_duplicates(): void {
+        $legacyId = $this->bareSermon();
+
+        // The partial (not-COMPLETE) new post the orphans live on.
+        $newPostId = (int) wp_insert_post( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_title'  => get_post_field( 'post_title', $legacyId ),
+            'post_status' => 'publish',
+        ) );
+        $this->assertGreaterThan( 0, $newPostId );
+        add_post_meta( $newPostId, Crosswalk::LEGACY_POST_ID, $legacyId, true );
+
+        // Two BYTE-IDENTICAL legacy comments — same parent=0, email, content, date.
+        $sharedEmail   = 'amen-' . wp_generate_uuid4() . '@example.com';
+        $sharedContent = 'Amen!';
+        $sharedDate    = '2021-09-12 09:30:00';
+        $commentArgs   = array(
+            'comment_post_ID'      => $legacyId,
+            'comment_author'       => 'Double Submitter',
+            'comment_author_email' => $sharedEmail,
+            'comment_content'      => $sharedContent,
+            'comment_date_gmt'     => $sharedDate,
+            'comment_date'         => $sharedDate,
+            'comment_parent'       => 0,
+            'comment_approved'     => '1',
+        );
+        $legacyCommentA = (int) wp_insert_comment( $commentArgs );
+        $legacyCommentB = (int) wp_insert_comment( $commentArgs );
+        $this->assertNotSame( $legacyCommentA, $legacyCommentB );
+
+        // Two matching crash-orphans on the new post (same signature, no back-ref).
+        $newArgs               = $commentArgs;
+        $newArgs['comment_post_ID'] = $newPostId;
+        $orphan1 = (int) wp_insert_comment( $newArgs );
+        $orphan2 = (int) wp_insert_comment( $newArgs );
+        $this->assertSame( '', (string) get_comment_meta( $orphan1, Crosswalk::LEGACY_COMMENT_ID, true ) );
+        $this->assertSame( '', (string) get_comment_meta( $orphan2, Crosswalk::LEGACY_COMMENT_ID, true ) );
+
+        // Run write() — resumes on the existing partial post.
+        $result = ( new SermonWriter() )->write( $legacyId );
+        $this->assertSame( $newPostId, $result->newId );
+
+        // EXACTLY 2 comments — every orphan consumed, none duplicated.
+        $after = get_comments( array( 'post_id' => $newPostId, 'status' => 'any', 'number' => 0 ) );
+        $this->assertCount(
+            2,
+            $after,
+            'two identical legacy comments + two matching orphans must yield exactly 2 comments (no duplicates)'
+        );
+
+        // Both carry a LEGACY_COMMENT_ID back-ref (mappable on every future resume).
+        $legacyRefs = array();
+        foreach ( $after as $c ) {
+            $ref = (int) get_comment_meta( $c->comment_ID, Crosswalk::LEGACY_COMMENT_ID, true );
+            $this->assertGreaterThan( 0, $ref, 'every surviving comment must carry a LEGACY_COMMENT_ID' );
+            $legacyRefs[] = $ref;
+        }
+        sort( $legacyRefs );
+        $this->assertSame(
+            array( $legacyCommentA, $legacyCommentB ),
+            $legacyRefs,
+            'the two orphans must be back-reffed to the two legacy comment ids (positional adoption)'
+        );
+
+        // Idempotent: a second resume copies zero further duplicates.
+        delete_post_meta( $newPostId, Crosswalk::MIGRATION_COMPLETE );
+        ( new SermonWriter() )->write( $legacyId );
+        $this->assertCount(
+            2,
+            get_comments( array( 'post_id' => $newPostId, 'status' => 'any', 'number' => 0 ) ),
+            'a second resume must not add further duplicates'
+        );
+    }
+
+    // --------- MUST-FIX #3: mirrorNativeTaxonomies must NOT move shared term counts
+
+    /**
+     * MUST-FIX #3: mirrorNativeTaxonomies() must insert the native term_relationship
+     * row DIRECTLY (no wp_set_object_terms / wp_update_term_count) so the SHARED
+     * wp_term_taxonomy.count — the column the church's own non-migrated posts are
+     * counted against — is NOT mutated before Finalize (Invariant 2: shared rows
+     * are never mutated pre-Finalize).
+     *
+     * Asserts:
+     *  (a) legacy post term_relationships rows are UNCHANGED (legacy is read-only);
+     *  (b) the new sermon's term_relationship row EXISTS (primary data preserved);
+     *  (c) the shared count is UNCHANGED after write() (no pre-Finalize count move);
+     *  (d) the affected term_taxonomy_id is recorded in OPTION_MIGRATION_PROGRESS for
+     *      the deferred B2b Finalize recount.
+     */
+    public function test_mirror_native_taxonomies_does_not_move_shared_count(): void {
         global $wpdb;
+
+        delete_option( Identifiers::OPTION_MIGRATION_PROGRESS );
 
         $legacyId = $this->bareSermon();
 
-        // Register a custom global taxonomy for the test so we can control count behaviour.
-        // Using 'post_tag' (registered for 'post') mirrors the same issue as 'category'.
-        // We use a freshly registered test taxonomy that counts ALL post types so the
-        // count assertion is reliable regardless of the built-in category count callback.
+        // A custom global taxonomy whose count callback counts ALL post types, so a
+        // wp_set_object_terms-driven count move WOULD be observable — proving the
+        // direct-insert path genuinely avoids it (not masked by the category callback
+        // that only counts 'post').
         $testTaxonomy = 'sermonator_test_global_' . substr( wp_generate_uuid4(), 0, 8 );
         register_taxonomy( $testTaxonomy, array( 'wpfc_sermon', Identifiers::POST_TYPE_SERMON ), array(
             'public'       => false,
@@ -1380,7 +1469,8 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         $termId = (int) $termResult['term_id'];
         $ttId   = (int) $termResult['term_taxonomy_id'];
 
-        // Assign to the legacy sermon.
+        // Assign to the legacy sermon (this is the only legitimate count move — the
+        // legacy assignment itself; we snapshot AFTER it so the write() delta is 0).
         wp_set_object_terms( $legacyId, array( $termId ), $testTaxonomy );
 
         // Snapshot: legacy term_relationships BEFORE write.
@@ -1392,7 +1482,7 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
             ARRAY_A
         );
 
-        // Capture count before write.
+        // Capture the SHARED count immediately before write().
         $countBefore = (int) $wpdb->get_var(
             $wpdb->prepare(
                 "SELECT count FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id = %d",
@@ -1420,32 +1510,71 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
             'Legacy post term_relationships must be byte-equal before and after write() — legacy is read-only'
         );
 
-        // (b) New sermon must have the taxonomy term mirrored (primary relationship preserved).
+        // (b) The new sermon's term_relationship row must EXIST (primary data preserved).
+        $relationshipExists = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->term_relationships} WHERE object_id = %d AND term_taxonomy_id = %d",
+                $newId,
+                $ttId
+            )
+        );
+        $this->assertSame(
+            1,
+            $relationshipExists,
+            'the native taxonomy relationship row must be inserted directly on the new sermon'
+        );
+        // And it must be visible through the term API too (cache cleaned).
         $newAssigned = wp_get_object_terms( $newId, $testTaxonomy, array( 'fields' => 'ids' ) );
         $this->assertContains(
             $termId,
             array_map( 'intval', is_array( $newAssigned ) ? $newAssigned : array() ),
-            'New sermon must have the native taxonomy term mirrored from the legacy post'
+            'the mirrored relationship must be readable through the term API'
         );
 
-        // (c) Document count mutation: wp_set_object_terms fires wp_update_term_count.
-        // For a custom taxonomy registered for both post types, the count increments.
-        // This is intentional (derived value), reversible on rollback/finalize.
-        // TODO(B2b): consider deferring native-taxonomy assignment to the Finalize step
-        // for strict count-immutability before Finalize has run.
+        // (c) The SHARED count must be UNCHANGED — no pre-Finalize count move.
         $countAfter = (int) $wpdb->get_var(
             $wpdb->prepare(
                 "SELECT count FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id = %d",
                 $ttId
             )
         );
-        $this->assertGreaterThan(
+        $this->assertSame(
             $countBefore,
             $countAfter,
-            'wp_term_taxonomy.count must increment after mirrorNativeTaxonomies — intentional, reversible derived-value mutation'
+            'mirrorNativeTaxonomies must NOT move the shared wp_term_taxonomy.count before Finalize'
         );
 
-        // Cleanup: unregister the test taxonomy.
+        // (d) The affected tt_id must be recorded for the deferred B2b Finalize recount.
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        $this->assertIsArray( $progress, 'OPTION_MIGRATION_PROGRESS must be an array' );
+        $this->assertArrayHasKey( SermonWriter::PROGRESS_KEY, $progress );
+        $this->assertArrayHasKey( 'native_term_recount_tt_ids', $progress[ SermonWriter::PROGRESS_KEY ] );
+        $this->assertContains(
+            $ttId,
+            array_map( 'intval', $progress[ SermonWriter::PROGRESS_KEY ]['native_term_recount_tt_ids'] ),
+            'the affected term_taxonomy_id must be recorded for the deferred Finalize recount'
+        );
+
+        // Idempotent: a re-run must not create a duplicate relationship row nor move count.
+        delete_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE );
+        $writer->write( $legacyId );
+        $relRowsAfterRerun = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->term_relationships} WHERE object_id = %d AND term_taxonomy_id = %d",
+                $newId,
+                $ttId
+            )
+        );
+        $this->assertSame( 1, $relRowsAfterRerun, 'a re-run must not duplicate the relationship row' );
+        $countAfterRerun = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT count FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id = %d",
+                $ttId
+            )
+        );
+        $this->assertSame( $countBefore, $countAfterRerun, 're-run must not move the shared count either' );
+
+        // Cleanup.
         unregister_taxonomy( $testTaxonomy );
     }
 }

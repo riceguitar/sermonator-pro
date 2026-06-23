@@ -42,6 +42,15 @@ use Sermonator\Schema\Identifiers;
  * shared attachment posts are referenced by id and never mutated.
  */
 final class SermonWriter {
+    /**
+     * Sub-key under Identifiers::OPTION_MIGRATION_PROGRESS where SermonWriter records
+     * deferred-work bookkeeping. Currently holds 'native_term_recount_tt_ids': the
+     * term_taxonomy_ids whose SHARED count was intentionally NOT moved during the
+     * per-record write (MUST-FIX #3) and which the B2b Finalize step must recount
+     * authoritatively via wp_update_term_count_now().
+     */
+    public const PROGRESS_KEY = 'sermons';
+
     private ?DateNormalizer $dates;
 
     public function __construct( ?DateNormalizer $dates = null ) {
@@ -731,20 +740,21 @@ final class SermonWriter {
      * post_tag, which core registers only for `post`) is still discovered and never
      * silently dropped.
      *
+     * MUST-FIX #3 — SHARED COUNT IMMUTABILITY (Invariant 2). wp_set_object_terms()
+     * triggers wp_update_term_count(), which writes wp_term_taxonomy.count on the
+     * SHARED term rows — the rows the church's own non-migrated posts are counted
+     * against — BEFORE the Finalize point of no return. To honour the invariant
+     * "shared rows are never mutated pre-Finalize", we DO NOT call
+     * wp_set_object_terms here. Instead we INSERT the term_relationship row DIRECTLY
+     * via $wpdb (object_id=$newId, term_taxonomy_id=the term's tt_id, term_order),
+     * with INSERT IGNORE-style idempotency (pre-check the existing row), then
+     * clean_object_term_cache($newId, $taxonomy) so the relationship is readable
+     * through the term API. The affected term_taxonomy_ids are recorded into
+     * OPTION_MIGRATION_PROGRESS so the deferred B2b Finalize step recounts them
+     * authoritatively (wp_update_term_count_now) once, at the point of no return.
+     *
      * Mirrors the wpfc_ loop's empty-read NO-OP guard (IMPORTANT #10): on a non-fresh
      * pass a transient empty legacy read does not clobber an existing assignment.
-     *
-     * COUNT MUTATION CONTRACT: wp_set_object_terms() triggers wp_update_term_count(),
-     * which increments wp_term_taxonomy.count for the assigned terms. This happens
-     * BEFORE the Finalize step. The count increment is an INTENTIONAL, REVERSIBLE,
-     * derived-value mutation — the TERM_RELATIONSHIP row (primary data) is what this
-     * step preserves, and the count is a derived aggregate that will re-balance on
-     * rollback (delete removes the relationship + decrements the count) or on Finalize
-     * (final recount). No count immutability guarantee is offered pre-Finalize.
-     *
-     * TODO(B2b): consider deferring native-taxonomy assignment to the Finalize step
-     * for strict count-immutability before Finalize runs. Until then, the count delta
-     * is documented here as intentional so future reviewers are not surprised by it.
      *
      * Legacy term assignments are read READ-ONLY.
      *
@@ -766,6 +776,8 @@ final class SermonWriter {
             )
         );
 
+        $recountTtIds = array();
+
         foreach ( (array) $taxonomies as $taxonomy ) {
             $taxonomy = (string) $taxonomy;
             // The five wpfc_ taxonomies are handled by the crosswalk loop — skip.
@@ -773,29 +785,130 @@ final class SermonWriter {
                 continue;
             }
 
-            $legacyTermIds = wp_get_object_terms( $legacyId, $taxonomy, array( 'fields' => 'ids' ) );
-            if ( is_wp_error( $legacyTermIds ) ) {
-                continue; // unreadable — nothing to mirror.
-            }
-            $legacyTermIds = array_values( array_map( 'intval', (array) $legacyTermIds ) );
+            // Read the legacy assignment as (term_id => tt_id) pairs DIRECTLY so we
+            // have the term_taxonomy_id needed for the direct relationship insert and
+            // for the deferred recount. Read-only on legacy.
+            $legacyTtRows = $wpdb->get_results(
+                $wpdb->prepare(
+                    "SELECT tr.term_taxonomy_id AS tt_id, tr.term_order AS term_order"
+                    . " FROM {$wpdb->term_relationships} tr"
+                    . " INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_taxonomy_id = tr.term_taxonomy_id"
+                    . " WHERE tr.object_id = %d AND tt.taxonomy = %s"
+                    . " ORDER BY tr.term_order ASC, tr.term_taxonomy_id ASC",
+                    $legacyId,
+                    $taxonomy
+                )
+            );
+            $legacyTtRows = is_array( $legacyTtRows ) ? $legacyTtRows : array();
 
             // Empty-read NO-OP on a non-fresh pass (mirrors the wpfc_ loop): never
-            // clobber an existing native assignment with a transient empty read.
-            if ( array() === $legacyTermIds && ! $fresh ) {
+            // clobber / re-touch an existing native assignment with a transient empty
+            // read.
+            if ( array() === $legacyTtRows && ! $fresh ) {
                 $existing = wp_get_object_terms( $newId, $taxonomy, array( 'fields' => 'ids' ) );
                 if ( ! is_wp_error( $existing ) && array() !== array_map( 'intval', (array) $existing ) ) {
                     continue;
                 }
             }
 
-            // Copy the SAME (global) term ids verbatim (idempotent full replace).
-            $result = wp_set_object_terms( $newId, $legacyTermIds, $taxonomy );
-            if ( is_wp_error( $result ) ) {
-                $flags[] = 'native_term_assign_error:' . $taxonomy;
+            $taxonomyTouched = false;
+            foreach ( $legacyTtRows as $row ) {
+                $ttId      = (int) $row->tt_id;
+                $termOrder = (int) $row->term_order;
+
+                // Idempotency: skip if the relationship row already exists (a resume /
+                // re-run must not duplicate it). $wpdb->insert has no INSERT IGNORE, so
+                // we pre-check the (object_id, term_taxonomy_id) pair (the table's PK).
+                $alreadyLinked = (int) $wpdb->get_var(
+                    $wpdb->prepare(
+                        "SELECT COUNT(*) FROM {$wpdb->term_relationships}"
+                        . " WHERE object_id = %d AND term_taxonomy_id = %d",
+                        $newId,
+                        $ttId
+                    )
+                );
+                if ( $alreadyLinked > 0 ) {
+                    // Still record the tt_id for the deferred recount: the relationship
+                    // is present but the shared count has (correctly) not been moved.
+                    $recountTtIds[ $ttId ] = true;
+                    $taxonomyTouched       = true;
+                    continue;
+                }
+
+                // DIRECT insert — no wp_set_object_terms, so wp_update_term_count is
+                // NEVER invoked and the SHARED count is not moved before Finalize.
+                $inserted = $wpdb->insert(
+                    $wpdb->term_relationships,
+                    array(
+                        'object_id'        => $newId,
+                        'term_taxonomy_id' => $ttId,
+                        'term_order'       => $termOrder,
+                    ),
+                    array( '%d', '%d', '%d' )
+                );
+
+                if ( false === $inserted ) {
+                    $flags[] = 'native_term_assign_error:' . $taxonomy;
+                    continue;
+                }
+
+                // The affected tt_id's shared count is now STALE-by-design — record it
+                // for the deferred B2b Finalize recount.
+                $recountTtIds[ $ttId ] = true;
+                $taxonomyTouched       = true;
+            }
+
+            // Refresh the object's term cache for this taxonomy so the directly-inserted
+            // relationship is readable through wp_get_object_terms immediately.
+            if ( $taxonomyTouched ) {
+                clean_object_term_cache( $newId, $taxonomy );
             }
         }
 
+        if ( $recountTtIds !== array() ) {
+            $this->recordNativeRecountTtIds( array_keys( $recountTtIds ) );
+        }
+
         return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Record the term_taxonomy_ids whose SHARED wp_term_taxonomy.count was
+     * intentionally NOT moved by the direct relationship insert (MUST-FIX #3), so the
+     * deferred B2b Finalize step can recount them authoritatively. Persisted under
+     * OPTION_MIGRATION_PROGRESS[PROGRESS_KEY]['native_term_recount_tt_ids'] as a
+     * de-duplicated list. Idempotent: a re-run unions without duplicating.
+     *
+     * @param list<int> $ttIds
+     */
+    private function recordNativeRecountTtIds( array $ttIds ): void {
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        if ( ! is_array( $progress ) ) {
+            $progress = array();
+        }
+        if ( ! isset( $progress[ self::PROGRESS_KEY ] ) || ! is_array( $progress[ self::PROGRESS_KEY ] ) ) {
+            $progress[ self::PROGRESS_KEY ] = array();
+        }
+
+        $existing = array();
+        if ( isset( $progress[ self::PROGRESS_KEY ]['native_term_recount_tt_ids'] )
+            && is_array( $progress[ self::PROGRESS_KEY ]['native_term_recount_tt_ids'] ) ) {
+            $existing = array_map( 'intval', $progress[ self::PROGRESS_KEY ]['native_term_recount_tt_ids'] );
+        }
+
+        $merged = array_values( array_unique( array_merge( $existing, array_map( 'intval', $ttIds ) ) ) );
+        sort( $merged );
+
+        // No-op if nothing changed (avoid a needless option write on every resume).
+        if ( $merged === $existing ) {
+            return;
+        }
+
+        $progress[ self::PROGRESS_KEY ]['native_term_recount_tt_ids'] = $merged;
+
+        if ( ! add_option( Identifiers::OPTION_MIGRATION_PROGRESS, $progress ) ) {
+            update_option( Identifiers::OPTION_MIGRATION_PROGRESS, $progress );
+        }
     }
 
     /**
@@ -1072,9 +1185,16 @@ final class SermonWriter {
      * a content hash) and ADOPT it: stamp the back-ref and add it to the map so the
      * copy loop skips it rather than re-inserting a duplicate.
      *
-     * Identity match is intentionally strict (date_gmt + email + content hash) so a
-     * genuinely distinct comment is never mis-adopted. Each new orphan is consumed
-     * at most once.
+     * Identity match is intentionally strict (date_gmt + email + content hash +
+     * parent + type + approved + user_id) so a genuinely distinct comment is never
+     * mis-adopted. Each new orphan is consumed at most once.
+     *
+     * MUST-FIX #2: when a signature bucket holds N>1 indistinguishable legacy
+     * comments and M>=1 indistinguishable orphans, the orphans are interchangeable
+     * copies, so adoption is POSITIONAL — pair K=min(N,M) bucket orphans to K
+     * same-signature legacy comments (consuming every orphan); the remaining N-M
+     * legacy comments fall through to a fresh insert. Net: exactly N comments, every
+     * orphan back-reffed, zero duplicates on resume.
      *
      * @param array<int,\WP_Comment>|list<\WP_Comment> $legacyComments
      * @param array<int,int>                            $oldToNew legacy id → new id
@@ -1098,20 +1218,6 @@ final class SermonWriter {
             return $oldToNew;
         }
 
-        // Count how many LEGACY comments share each signature (used in ambiguity guard).
-        // If multiple unmapped legacy comments hash to the same signature AND there are
-        // also multiple orphans in that bucket, a bare array_shift would pick the wrong
-        // orphan for one of them — silently mis-threading the reply chain. The guard
-        // below refuses adoption in that case and falls through to a fresh insert.
-        $legacySigCount = array();
-        foreach ( $legacyComments as $legacy ) {
-            if ( isset( $oldToNew[ (int) $legacy->comment_ID ] ) ) {
-                continue; // already mapped — exclude from ambiguity count
-            }
-            $sig = $this->commentIdentitySignature( $legacy );
-            $legacySigCount[ $sig ] = ( $legacySigCount[ $sig ] ?? 0 ) + 1;
-        }
-
         foreach ( $legacyComments as $legacy ) {
             $legacyCommentId = (int) $legacy->comment_ID;
             if ( isset( $oldToNew[ $legacyCommentId ] ) ) {
@@ -1122,17 +1228,23 @@ final class SermonWriter {
                 continue; // no matching orphan to adopt
             }
 
-            // Ambiguity guard: refuse silent adoption when the signature is shared by
-            // multiple unmapped legacy comments OR multiple orphan candidates. A bare
-            // array_shift would pick arbitrarily, potentially cross-adopting and
-            // mis-threading the reply chain. Fall through to a fresh insert instead —
-            // the copy loop will insert a new, correctly-parented comment.
-            if ( count( $orphansBySig[ $sig ] ) > 1 || ( $legacySigCount[ $sig ] ?? 0 ) > 1 ) {
-                continue; // ambiguous — fall through to fresh insert
-            }
-
-            // Adopt the orphan: stamp the back-ref FIRST (idempotency spine) and add
-            // to the map. Consume it so it is not adopted by two legacy comments.
+            // MUST-FIX #2: identical-content positional adoption. When a signature
+            // bucket is shared by N>1 indistinguishable legacy comments AND M>=1
+            // indistinguishable orphans, those orphans are — by the FULL identity
+            // signature (date_gmt + email + content + parent + type + approved +
+            // user_id) — interchangeable copies of one another. The OLD ambiguity
+            // guard `continue`d past ALL of them, leaving every orphan un-back-reffed
+            // AND fresh-inserting a duplicate of each (2 orphans + 2 fresh = 4 where
+            // the legacy had 2), un-mappable forever. Instead, adopt POSITIONALLY:
+            // because the orphans are interchangeable, pairing the i-th legacy comment
+            // in the bucket to ANY remaining bucket orphan is correct — it consumes
+            // every orphan (K=min(N,M) adoptions) and yields exactly N comments. The
+            // signature already encodes comment_parent, so a DIFFERENT-parent reply is
+            // in its OWN bucket and is never cross-adopted here (that distinct-parent
+            // case has a single-orphan/single-legacy bucket).
+            //
+            // The remaining N-M unmatched legacy comments (bucket drained) fall
+            // through below to the copy loop's fresh insert — exactly the right count.
             $adoptedId = (int) array_shift( $orphansBySig[ $sig ] );
             add_comment_meta( $adoptedId, Crosswalk::LEGACY_COMMENT_ID, $legacyCommentId, true );
             $oldToNew[ $legacyCommentId ] = $adoptedId;
@@ -1154,10 +1266,11 @@ final class SermonWriter {
      * signature, causing array_shift() in reconcileOrphanComments to consume the wrong
      * orphan — swapping parent assignments and mis-threading the reply chain. The
      * tightened signature includes comment_parent so each orphan lands in its own
-     * bucket and is adopted by the correct legacy comment. The ambiguity guard in
-     * reconcileOrphanComments additionally refuses adoption when the bucket is shared
-     * by multiple legacy comments or multiple orphan candidates — a final line of
-     * defence against any remaining collision scenario.
+     * bucket and is adopted by the correct legacy comment. When a bucket is STILL
+     * shared (N>1 byte-identical legacy comments + M>1 byte-identical orphans, e.g. a
+     * double-submitted 'Amen!'), the orphans are interchangeable copies and
+     * reconcileOrphanComments adopts them POSITIONALLY (MUST-FIX #2) rather than
+     * leaving them un-back-reffed to be duplicated forever.
      */
     private function commentIdentitySignature( \WP_Comment $comment ): string {
         return implode( "\0", array(
