@@ -99,3 +99,27 @@ PHP fallbacks). Read-only — no data mutation.
 ## Out of scope (later phases)
 Podcast RSS + enclosure backfill + subscribe (Phase 3); schema.org/OG + cross-theme pass
 (Phase 4); search UI; AJAX filtering (filter block links to filtered archives, no JS).
+
+## Phase 2 adversarial-review outcomes (2026-06-23)
+
+Two-lens review (query/correctness + security/WP). Confirmed defects **resolved**:
+- **HIGH** — `SermonQuery` + `ArchiveOrdering` ordered via `meta_key`/`meta_value_num`, an
+  INNER JOIN that silently dropped any sermon without `sermonator_date` (e.g. one created in
+  wp-admin before an editor meta box exists). Now a LEFT-JOIN `meta_query`
+  (`EXISTS` OR `NOT EXISTS`) with `orderby => ['preached'=>$order,'date'=>'DESC']` includes
+  dateless sermons, sorted last. Integration-tested (total exact, order, no dup).
+- **MEDIUM** — unbounded `perPage`/`count` (DoS via `count="999999"`) → clamped to ≤100 in
+  `GridArgs` (`columns` was already clamped). Integration-tested.
+- **MEDIUM** — embedded-grid pagination used `paginate_links()` with no base/format, which
+  cannot resolve for a secondary query on a static Page. Removed pagination from embedded
+  grids (fixed-count lists); paginated browsing is the archive's job via core/the_posts_
+  pagination. Removed the now-dead `Renderer::pagination()`.
+- **Cosmetic** — wired the `taxonomy-filter` `showCount` attribute (was unread).
+
+Verified-correct (no change): Renderer escaping; tax_query AND/OR semantics + slug/id
+heuristic; ArchiveOrdering scope (`is_main_query` + explicit `is_tax(slug)`); `inherit:true`
+honoring the pre_get_posts ordering; no N+1 (caches primed); TaxonomyFilter taxonomy
+allowlist; sermon-card draft/private gate (inherited from Phase 1).
+
+Result: unit 98, integration 363 — green on WP 7.0; archive + preacher taxonomy + grid
+block + shortcode live-verified on TT5 (block) and twentytwentyone (classic).
