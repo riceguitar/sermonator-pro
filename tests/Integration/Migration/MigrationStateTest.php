@@ -1,0 +1,253 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sermonator\Tests\Integration\Migration;
+
+use WP_UnitTestCase;
+use Sermonator\Migration\MigrationState;
+use Sermonator\Migration\Manifest;
+use Sermonator\Schema\Identifiers;
+
+/**
+ * Task 1: MigrationState — durable, option-backed state machine + per-record
+ * progress.
+ *
+ * The lifecycle phase is monotonic: it advances none → detected → migrating →
+ * migrated → verified → finalized and NEVER skips a step nor moves backward,
+ * except the one Rollback-flagged retreat migrated → detected. Per-record
+ * progress distinguishes an in_progress partial from a complete record so a
+ * resumed run redoes partials without duplicating completes. The manifest is
+ * captured at detect time for the Verifier/Finalizer. Everything persists in
+ * Identifiers::OPTION_MIGRATION_STATE (autoload=no) so it survives a process
+ * restart: a fresh MigrationState object reads the same persisted state.
+ */
+final class MigrationStateTest extends WP_UnitTestCase {
+    protected function setUp(): void {
+        parent::setUp();
+        delete_option( Identifiers::OPTION_MIGRATION_STATE );
+    }
+
+    protected function tearDown(): void {
+        delete_option( Identifiers::OPTION_MIGRATION_STATE );
+        parent::tearDown();
+    }
+
+    public function test_phase_defaults_to_none(): void {
+        $state = new MigrationState();
+        $this->assertSame( 'none', $state->phase() );
+    }
+
+    public function test_set_advances_to_detected(): void {
+        $state = new MigrationState();
+        $state->set( 'detected' );
+        $this->assertSame( 'detected', $state->phase() );
+    }
+
+    public function test_illegal_skip_to_finalized_is_rejected(): void {
+        $state = new MigrationState();
+        $state->set( 'detected' );
+
+        // detected → finalized is an illegal multi-step jump; it must be refused
+        // and the phase must remain unchanged.
+        $threw = false;
+        try {
+            $state->set( 'finalized' );
+        } catch ( \Throwable $e ) {
+            $threw = true;
+        }
+        $this->assertTrue( $threw, 'Illegal transition detected→finalized must throw.' );
+        $this->assertSame( 'detected', $state->phase() );
+    }
+
+    public function test_illegal_jump_from_none_to_verified_is_rejected(): void {
+        $state = new MigrationState();
+        $threw = false;
+        try {
+            $state->set( 'verified' );
+        } catch ( \Throwable $e ) {
+            $threw = true;
+        }
+        $this->assertTrue( $threw, 'Illegal transition none→verified must throw.' );
+        $this->assertSame( 'none', $state->phase() );
+    }
+
+    public function test_full_forward_progression_is_allowed(): void {
+        $state = new MigrationState();
+        foreach ( array( 'detected', 'migrating', 'migrated', 'verified', 'finalized' ) as $phase ) {
+            $state->set( $phase );
+            $this->assertSame( $phase, $state->phase() );
+        }
+    }
+
+    public function test_idempotent_set_to_same_phase_is_allowed(): void {
+        $state = new MigrationState();
+        $state->set( 'detected' );
+        // Re-setting the current phase is a no-op, not an illegal transition.
+        $state->set( 'detected' );
+        $this->assertSame( 'detected', $state->phase() );
+    }
+
+    public function test_backward_retreat_is_rejected_without_rollback_flag(): void {
+        $state = new MigrationState();
+        $state->set( 'detected' );
+        $state->set( 'migrating' );
+        $state->set( 'migrated' );
+
+        $threw = false;
+        try {
+            $state->set( 'detected' );
+        } catch ( \Throwable $e ) {
+            $threw = true;
+        }
+        $this->assertTrue( $threw, 'migrated→detected without the rollback flag must throw.' );
+        $this->assertSame( 'migrated', $state->phase() );
+    }
+
+    public function test_rollback_retreat_from_migrated_to_detected_is_allowed(): void {
+        $state = new MigrationState();
+        $state->set( 'detected' );
+        $state->set( 'migrating' );
+        $state->set( 'migrated' );
+
+        // Only the Rollback path may retreat, and only migrated → detected.
+        $state->set( 'detected', true );
+        $this->assertSame( 'detected', $state->phase() );
+    }
+
+    public function test_rollback_flag_does_not_permit_arbitrary_retreat(): void {
+        $state = new MigrationState();
+        $state->set( 'detected' );
+        $state->set( 'migrating' );
+        $state->set( 'migrated' );
+        $state->set( 'verified' );
+
+        // The rollback retreat is ONLY migrated → detected. From verified it is
+        // still illegal even with the rollback flag (Rollback runs from detected
+        // after the state has been brought back; finalized refuses Rollback).
+        $threw = false;
+        try {
+            $state->set( 'detected', true );
+        } catch ( \Throwable $e ) {
+            $threw = true;
+        }
+        $this->assertTrue( $threw, 'rollback flag must not permit verified→detected.' );
+        $this->assertSame( 'verified', $state->phase() );
+    }
+
+    public function test_record_record_in_progress_is_distinct_from_complete(): void {
+        $state = new MigrationState();
+        $state->recordRecord( 123, 'in_progress', null, array() );
+
+        $rec = $state->record( 123 );
+        $this->assertIsArray( $rec );
+        $this->assertSame( 'in_progress', $rec['state'] );
+        $this->assertNull( $rec['newId'] );
+    }
+
+    public function test_record_record_complete_stores_new_id_and_flags(): void {
+        $state = new MigrationState();
+        $state->recordRecord( 456, 'complete', 789, array( 'slug_collision' ) );
+
+        $rec = $state->record( 456 );
+        $this->assertIsArray( $rec );
+        $this->assertSame( 'complete', $rec['state'] );
+        $this->assertSame( 789, $rec['newId'] );
+        $this->assertContains( 'slug_collision', $rec['flags'] );
+    }
+
+    public function test_record_record_overwrites_prior_state_for_same_legacy_id(): void {
+        $state = new MigrationState();
+        $state->recordRecord( 100, 'in_progress', null, array() );
+        $state->recordRecord( 100, 'complete', 200, array() );
+
+        $rec = $state->record( 100 );
+        $this->assertSame( 'complete', $rec['state'] );
+        $this->assertSame( 200, $rec['newId'] );
+    }
+
+    public function test_record_for_unknown_legacy_id_is_null(): void {
+        $state = new MigrationState();
+        $this->assertNull( $state->record( 999999 ) );
+    }
+
+    public function test_record_record_rejects_unknown_state(): void {
+        $state = new MigrationState();
+        $threw = false;
+        try {
+            $state->recordRecord( 1, 'bogus', null, array() );
+        } catch ( \Throwable $e ) {
+            $threw = true;
+        }
+        $this->assertTrue( $threw, 'recordRecord must reject states outside pending|in_progress|complete|failed.' );
+    }
+
+    public function test_mark_phase_complete_round_trips(): void {
+        $state = new MigrationState();
+        $this->assertFalse( $state->phaseComplete( 'terms' ) );
+
+        $state->markPhaseComplete( 'terms' );
+        $this->assertTrue( $state->phaseComplete( 'terms' ) );
+        // A different phase key is independent.
+        $this->assertFalse( $state->phaseComplete( 'sermons' ) );
+    }
+
+    public function test_manifest_round_trips_via_the_option(): void {
+        $state    = new MigrationState();
+        $manifest = new Manifest(
+            array( 'sermons' => 3, 'preacher' => 2 ),
+            array( 11 => 'abc123', 22 => 'def456' )
+        );
+        $state->setManifest( $manifest );
+
+        $got = $state->manifest();
+        $this->assertInstanceOf( Manifest::class, $got );
+        $this->assertSame( 3, $got->count( 'sermons' ) );
+        $this->assertSame( 2, $got->count( 'preacher' ) );
+        $this->assertSame( 'abc123', $got->checksum( 11 ) );
+        $this->assertSame( 'def456', $got->checksum( 22 ) );
+    }
+
+    public function test_manifest_is_null_before_detect(): void {
+        $state = new MigrationState();
+        $this->assertNull( $state->manifest() );
+    }
+
+    public function test_state_is_durable_across_a_fresh_instance(): void {
+        $writer = new MigrationState();
+        $writer->set( 'detected' );
+        $writer->recordRecord( 321, 'in_progress', null, array( 'post_parent_unresolved' ) );
+        $writer->markPhaseComplete( 'terms' );
+        $writer->setManifest( new Manifest( array( 'sermons' => 5 ), array( 7 => 'hash7' ) ) );
+
+        // A brand-new object (simulating a process restart / a separate cron
+        // run) reads exactly the same persisted state from the option.
+        $reader = new MigrationState();
+        $this->assertSame( 'detected', $reader->phase() );
+
+        $rec = $reader->record( 321 );
+        $this->assertSame( 'in_progress', $rec['state'] );
+        $this->assertContains( 'post_parent_unresolved', $rec['flags'] );
+
+        $this->assertTrue( $reader->phaseComplete( 'terms' ) );
+
+        $manifest = $reader->manifest();
+        $this->assertInstanceOf( Manifest::class, $manifest );
+        $this->assertSame( 5, $manifest->count( 'sermons' ) );
+        $this->assertSame( 'hash7', $manifest->checksum( 7 ) );
+    }
+
+    public function test_option_is_not_autoloaded(): void {
+        $state = new MigrationState();
+        $state->set( 'detected' );
+
+        global $wpdb;
+        $autoload = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT autoload FROM {$wpdb->options} WHERE option_name = %s",
+                Identifiers::OPTION_MIGRATION_STATE
+            )
+        );
+        $this->assertSame( 'no', $autoload, 'Migration state option must be stored autoload=no.' );
+    }
+}
