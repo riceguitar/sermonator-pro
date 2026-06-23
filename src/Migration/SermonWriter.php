@@ -113,8 +113,26 @@ final class SermonWriter {
                     $touched = true;
                 }
 
+                // Comment self-heal: if COMPLETE was stamped while a comment_copy_failed:*
+                // flag was open (the flag was somehow injected externally, or the guard
+                // failed to withhold COMPLETE), retry copyComments now. Without this, a
+                // COMPLETE record with an open comment flag is a dead-end — every write()
+                // hits this no-op COMPLETE branch and the irreplaceable parishioner comment
+                // is never recovered (skip-forever). Mirrors the term and post_parent heals:
+                // strip the stale flag, re-run the step, let markCompleteUnlessCommentFailureOpen
+                // decide whether to re-stamp or keep COMPLETE.
+                if ( $this->hasOpenCommentFailureFlag( $flags ) ) {
+                    $flags   = $this->stripCommentFailureFlags( $flags );
+                    $flags   = array_merge( $flags, $this->copyComments( $existing, $legacyId ) );
+                    $touched = true;
+                }
+
                 if ( $touched ) {
                     $this->writeFlags( $existing, $flags );
+                    // Re-evaluate COMPLETE after self-heals: if the comment flag cleared,
+                    // stamp COMPLETE; if a comment copy still fails, withhold it (the record
+                    // will return to the resume leg on the next write — never skip-forever).
+                    $this->markCompleteUnlessCommentFailureOpen( $existing, $flags );
                     return new WriteResult( $existing, false, array_values( array_unique( $flags ) ), false );
                 }
                 return new WriteResult( $existing, false, $persisted, false );
@@ -690,6 +708,18 @@ final class SermonWriter {
      * Mirrors the wpfc_ loop's empty-read NO-OP guard (IMPORTANT #10): on a non-fresh
      * pass a transient empty legacy read does not clobber an existing assignment.
      *
+     * COUNT MUTATION CONTRACT: wp_set_object_terms() triggers wp_update_term_count(),
+     * which increments wp_term_taxonomy.count for the assigned terms. This happens
+     * BEFORE the Finalize step. The count increment is an INTENTIONAL, REVERSIBLE,
+     * derived-value mutation — the TERM_RELATIONSHIP row (primary data) is what this
+     * step preserves, and the count is a derived aggregate that will re-balance on
+     * rollback (delete removes the relationship + decrements the count) or on Finalize
+     * (final recount). No count immutability guarantee is offered pre-Finalize.
+     *
+     * TODO(B2b): consider deferring native-taxonomy assignment to the Finalize step
+     * for strict count-immutability before Finalize runs. Until then, the count delta
+     * is documented here as intentional so future reviewers are not surprised by it.
+     *
      * Legacy term assignments are read READ-ONLY.
      *
      * @param list<string> $flags
@@ -1023,6 +1053,20 @@ final class SermonWriter {
             return $oldToNew;
         }
 
+        // Count how many LEGACY comments share each signature (used in ambiguity guard).
+        // If multiple unmapped legacy comments hash to the same signature AND there are
+        // also multiple orphans in that bucket, a bare array_shift would pick the wrong
+        // orphan for one of them — silently mis-threading the reply chain. The guard
+        // below refuses adoption in that case and falls through to a fresh insert.
+        $legacySigCount = array();
+        foreach ( $legacyComments as $legacy ) {
+            if ( isset( $oldToNew[ (int) $legacy->comment_ID ] ) ) {
+                continue; // already mapped — exclude from ambiguity count
+            }
+            $sig = $this->commentIdentitySignature( $legacy );
+            $legacySigCount[ $sig ] = ( $legacySigCount[ $sig ] ?? 0 ) + 1;
+        }
+
         foreach ( $legacyComments as $legacy ) {
             $legacyCommentId = (int) $legacy->comment_ID;
             if ( isset( $oldToNew[ $legacyCommentId ] ) ) {
@@ -1031,6 +1075,15 @@ final class SermonWriter {
             $sig = $this->commentIdentitySignature( $legacy );
             if ( empty( $orphansBySig[ $sig ] ) ) {
                 continue; // no matching orphan to adopt
+            }
+
+            // Ambiguity guard: refuse silent adoption when the signature is shared by
+            // multiple unmapped legacy comments OR multiple orphan candidates. A bare
+            // array_shift would pick arbitrarily, potentially cross-adopting and
+            // mis-threading the reply chain. Fall through to a fresh insert instead —
+            // the copy loop will insert a new, correctly-parented comment.
+            if ( count( $orphansBySig[ $sig ] ) > 1 || ( $legacySigCount[ $sig ] ?? 0 ) > 1 ) {
+                continue; // ambiguous — fall through to fresh insert
             }
 
             // Adopt the orphan: stamp the back-ref FIRST (idempotency spine) and add
@@ -1047,14 +1100,29 @@ final class SermonWriter {
 
     /**
      * A strict identity signature for matching a legacy comment to an un-back-reffed
-     * copy on the new post: GMT date + author email + a hash of the content. These
-     * are preserved verbatim by the copy, so an adopted orphan is the same comment.
+     * copy on the new post. Includes ALL fields that the copy preserves verbatim:
+     * GMT date + author email + content hash + parent + type + approved + user_id.
+     *
+     * The original 3-field signature (date + email + content) was too weak: two
+     * comments authored by the same person at the same second with the same text but
+     * different parents (e.g. a top-level and a direct reply to it) produced the same
+     * signature, causing array_shift() in reconcileOrphanComments to consume the wrong
+     * orphan — swapping parent assignments and mis-threading the reply chain. The
+     * tightened signature includes comment_parent so each orphan lands in its own
+     * bucket and is adopted by the correct legacy comment. The ambiguity guard in
+     * reconcileOrphanComments additionally refuses adoption when the bucket is shared
+     * by multiple legacy comments or multiple orphan candidates — a final line of
+     * defence against any remaining collision scenario.
      */
     private function commentIdentitySignature( \WP_Comment $comment ): string {
         return implode( "\0", array(
             (string) $comment->comment_date_gmt,
             (string) $comment->comment_author_email,
             md5( (string) $comment->comment_content ),
+            (string) $comment->comment_parent,
+            (string) $comment->comment_type,
+            (string) $comment->comment_approved,
+            (string) $comment->user_id,
         ) );
     }
 

@@ -25,6 +25,14 @@ use Sermonator\Schema\Identifiers;
  *    PODCAST post type, so the new default points at the migrated podcast. An
  *    unresolved id is left out (never a dangling legacy id) — the podcast pass
  *    runs before options, so a resolvable id is normally present;
+ *  - KNOWN id-bearing scalar options (sermonator_default_series,
+ *    sermonator_default_preacher) embed legacy term ids in their VALUE. These are
+ *    translated via TermCrosswalk::newTermId() BEFORE the write so the stored
+ *    value always points at the new term. An unresolvable id is left verbatim AND
+ *    a missing_option_id_crosswalk:<optionName> flag is recorded under
+ *    OPTION_MIGRATION_PROGRESS['options']['option_id_flags'] so a later pass
+ *    (once the term is migrated) can re-run and clear it. Attachment ids embedded
+ *    in options are SHARED globals — they never change — so they are left verbatim;
  *  - legacy options are NEVER mutated.
  *
  * @phpstan-type MigrateResult array{written: int, backed_up: int}
@@ -34,19 +42,46 @@ final class OptionWriter {
     private const PROGRESS_KEY = 'options';
 
     /**
+     * New option names whose VALUES are a single legacy TERM ID.
+     * These are translated via TermCrosswalk::newTermId() before writing.
+     *
+     * Attachment ids in options are SHARED globals (same id in both schemas)
+     * and are intentionally excluded from this list — they never need remapping.
+     *
+     * @var list<string>
+     */
+    private const TERM_ID_OPTIONS = array(
+        'sermonator_default_series',
+        'sermonator_default_preacher',
+    );
+
+    /**
      * @return array{written: int, backed_up: int}
      */
     public function migrate(): array {
         $legacyOptions = $this->readLegacySermonManagerOptions();
         $mapped        = OptionMapper::map( $legacyOptions );
 
-        $backedUp = 0;
-        $written  = 0;
+        $backedUp    = 0;
+        $written     = 0;
+        $idFlags     = array();
+        $crosswalk   = new TermCrosswalk();
+
         foreach ( $mapped as $name => $value ) {
+            // Translate known id-bearing option values before writing.
+            $remapped = $this->remapEmbeddedIds( $name, $value, $crosswalk );
+            $value    = $remapped['value'];
+            $idFlags  = array_merge( $idFlags, $remapped['flags'] );
+
             if ( $this->writeOption( $name, $value ) ) {
                 ++$backedUp;
             }
             ++$written;
+        }
+
+        // Persist any id-crosswalk flags so a later pass can self-heal them.
+        if ( $idFlags !== array() ) {
+            $this->recordOptionFlags( array_values( array_unique( $idFlags ) ) );
         }
 
         // Remap the default-podcast pointer (legacy post id → new post id).
@@ -58,6 +93,52 @@ final class OptionWriter {
             'written'   => $written,
             'backed_up' => $backedUp,
         );
+    }
+
+    /**
+     * For KNOWN id-bearing scalar options, translate the embedded legacy id to the
+     * new id via TermCrosswalk. Returns the (possibly remapped) value and any
+     * missing-crosswalk flags.
+     *
+     * Options whose values embed legacy TERM IDs (sermonator_default_series,
+     * sermonator_default_preacher) are translated via TermCrosswalk::newTermId().
+     * If the crosswalk is unresolvable the value is left VERBATIM and a
+     * missing_option_id_crosswalk:<optionName> flag is returned.
+     *
+     * Attachment ids are SHARED globals (same id in both schemas) — they do not
+     * appear in TERM_ID_OPTIONS and are intentionally left verbatim.
+     *
+     * @return array{value: mixed, flags: list<string>}
+     */
+    private function remapEmbeddedIds( string $optionName, mixed $value, TermCrosswalk $crosswalk ): array {
+        $flags = array();
+
+        if ( in_array( $optionName, self::TERM_ID_OPTIONS, true ) ) {
+            // Value is a legacy term id (stored as an integer or numeric string).
+            $legacyTermId = (int) $value;
+            if ( $legacyTermId > 0 ) {
+                $newTermId = $crosswalk->newTermId( $legacyTermId );
+                if ( null !== $newTermId ) {
+                    $value = $newTermId;
+                } else {
+                    // Crosswalk not yet available — leave verbatim and flag for self-heal.
+                    $flags[] = 'missing_option_id_crosswalk:' . $optionName;
+                }
+            }
+        }
+
+        return array( 'value' => $value, 'flags' => $flags );
+    }
+
+    /**
+     * Record id-crosswalk flags into OPTION_MIGRATION_PROGRESS['options']['option_id_flags'].
+     * These signal that a later migrate() run should re-attempt id translation once
+     * the relevant TermWriter has run.
+     *
+     * @param list<string> $flags
+     */
+    private function recordOptionFlags( array $flags ): void {
+        $this->updateProgress( 'option_id_flags', $flags );
     }
 
     /**

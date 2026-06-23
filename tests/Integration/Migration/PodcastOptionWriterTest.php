@@ -937,4 +937,76 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
 
         $this->assertSame( $before, $after, 'Legacy options must be byte-equal before/after.' );
     }
+
+    // ----------------------------------- FIX 1: embedded term id remap in options
+
+    /**
+     * FIX 1a: sermonmanager_default_series (a legacy term id) must be translated to
+     * the new term id via the TermCrosswalk after TermWriter has run. The migrated
+     * option sermonator_default_series must hold the NEW term id, never the legacy one.
+     */
+    public function test_option_embedded_term_id_remapped_to_new_term_id(): void {
+        // Seed a legacy term and run TermWriter so a crosswalk exists.
+        $legacyTermId = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Sunday AM ' . wp_generate_uuid4() );
+        $this->assertGreaterThan( 0, $legacyTermId );
+
+        // Set the legacy option to the legacy term id (as a string, the way WP stores it).
+        $this->fixture->setOption( 'sermonmanager_default_series', (string) $legacyTermId );
+
+        // Run TermWriter to create the term crosswalk.
+        ( new \Sermonator\Migration\TermWriter() )->migrateAll();
+
+        // Resolve the new term id via Crosswalk so we know what to expect.
+        $newTermId = \Sermonator\Migration\Crosswalk::findNewTermByLegacyId( $legacyTermId, Identifiers::TAX_SERIES );
+        $this->assertNotNull( $newTermId, 'TermWriter must have produced a crosswalk for the legacy term' );
+
+        // Run OptionWriter.
+        ( new OptionWriter() )->migrate();
+
+        // The new option must hold the NEW term id, not the legacy one.
+        $stored = get_option( 'sermonator_default_series' );
+        $this->assertSame(
+            (string) $newTermId,
+            (string) $stored,
+            'sermonator_default_series must hold the NEW term id after remap, not the legacy one'
+        );
+        $this->assertNotSame(
+            (string) $legacyTermId,
+            (string) $stored,
+            'sermonator_default_series must NOT hold the legacy term id after remap'
+        );
+    }
+
+    /**
+     * FIX 1b: When the crosswalk for sermonmanager_default_series cannot be resolved
+     * (TermWriter has NOT run), the value must be left verbatim AND a flag must be
+     * recorded under OPTION_MIGRATION_PROGRESS['options']['option_id_flags'].
+     */
+    public function test_option_embedded_term_id_unresolvable_left_verbatim_and_flagged(): void {
+        // Seed a legacy term id that has NO crosswalk (TermWriter never ran).
+        $legacyTermId = 99991; // A non-existent term id — no crosswalk will exist.
+        $this->fixture->setOption( 'sermonmanager_default_series', (string) $legacyTermId );
+
+        // Run OptionWriter WITHOUT TermWriter.
+        ( new OptionWriter() )->migrate();
+
+        // The value must be left verbatim (legacy term id, no crosswalk available).
+        $stored = get_option( 'sermonator_default_series' );
+        $this->assertSame(
+            (string) $legacyTermId,
+            (string) $stored,
+            'sermonator_default_series must be left verbatim when crosswalk is unresolvable'
+        );
+
+        // A flag must appear in OPTION_MIGRATION_PROGRESS['options']['option_id_flags'].
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        $this->assertIsArray( $progress, 'OPTION_MIGRATION_PROGRESS must be an array' );
+        $this->assertArrayHasKey( 'options', $progress, 'progress must have an "options" sub-key' );
+        $this->assertArrayHasKey( 'option_id_flags', $progress['options'], 'options sub-key must have "option_id_flags"' );
+        $this->assertContains(
+            'missing_option_id_crosswalk:sermonator_default_series',
+            $progress['options']['option_id_flags'],
+            'option_id_flags must contain the missing-crosswalk flag for sermonator_default_series'
+        );
+    }
 }

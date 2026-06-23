@@ -1123,4 +1123,329 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
 
         $this->assertSame( $before, $after, 'Legacy comments/commentmeta were mutated by the writer.' );
     }
+
+    // ------------------- FIX 2: COMPLETE branch must self-heal open comment flags
+
+    /**
+     * FIX 2: A sermon stamped COMPLETE but carrying an open comment_copy_failed:*
+     * flag must self-heal on the next write() call by retrying copyComments().
+     *
+     * Scenario: initial write succeeds (comment copied), COMPLETE stamped. Then we
+     * delete the new comment's back-ref AND inject a comment_copy_failed flag
+     * manually to simulate the scenario where COMPLETE was stamped with an open flag
+     * (the bug). On the next write(), the COMPLETE branch must detect the open flag,
+     * strip it, re-run copyComments, and clear the flag.
+     */
+    public function test_complete_with_open_comment_failure_self_heals_on_rewrite(): void {
+        $legacyId  = $this->bareSermon();
+        $commentId = $this->fixture->createComment( $legacyId, '1', array(
+            'comment_author'       => 'Pastor John',
+            'comment_author_email' => 'pastor@example.com',
+            'comment_content'      => 'A parishioner comment',
+        ) );
+
+        // 1. First write: succeeds normally.
+        $writer = new SermonWriter();
+        $result = $writer->write( $legacyId );
+        $newId  = $result->newId;
+        $this->assertGreaterThan( 0, $newId );
+
+        // Verify COMPLETE was stamped.
+        $this->assertSame( '1', (string) get_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE, true ), 'COMPLETE must be stamped after first write' );
+
+        // Verify comment was copied.
+        $newComments = get_comments( array( 'post_id' => $newId, 'status' => 'any' ) );
+        $this->assertCount( 1, $newComments, 'comment must be copied after first write' );
+
+        // 2. Simulate the "COMPLETE with open comment failure" scenario:
+        //    - Inject a comment_copy_failed flag into the flags row.
+        $flags   = $this->readFlagsForPost( $newId );
+        $flags[] = 'comment_copy_failed:' . $commentId;
+        update_post_meta( $newId, Crosswalk::MIGRATION_FLAGS, $flags );
+
+        // COMPLETE remains stamped.
+        $this->assertSame( '1', (string) get_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE, true ), 'COMPLETE must still be stamped before second write' );
+
+        // 3. Second write() hits the COMPLETE branch and must self-heal the comment flag.
+        $result2 = $writer->write( $legacyId );
+        $this->assertSame( $newId, $result2->newId, 'second write must not create a new post' );
+
+        // The comment_copy_failed flag must be cleared.
+        $this->assertNotContains(
+            'comment_copy_failed:' . $commentId,
+            $result2->flags,
+            'comment_copy_failed flag must be cleared after COMPLETE-branch self-heal'
+        );
+
+        // COMPLETE must still be stamped (or re-stamped) after self-heal.
+        $this->assertSame(
+            '1',
+            (string) get_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'MIGRATION_COMPLETE must be stamped after COMPLETE-branch comment self-heal'
+        );
+    }
+
+    /** Read MIGRATION_FLAGS from a new post (helper for FIX 2 test). */
+    private function readFlagsForPost( int $newId ): array {
+        $stored = get_post_meta( $newId, Crosswalk::MIGRATION_FLAGS, true );
+        return is_array( $stored ) ? array_values( $stored ) : array();
+    }
+
+    // --------- FIX 3: comment orphan signature collision — tightened sig + ambiguity guard
+
+    /**
+     * FIX 3: Two legacy comments with identical date_gmt + author_email + content but
+     * DIFFERENT comment_parent. When crash orphans exist on the new post for both,
+     * the OLD 3-field signature (date+email+content) groups both orphans in ONE bucket,
+     * so array_shift() adopts purely by insertion order — NOT by parent identity.
+     *
+     * If orphans happen to be in the WRONG order, the wrong legacy comment gets the
+     * wrong back-ref, corrupting the parent chain.
+     *
+     * The fix: tighten commentIdentitySignature() to include comment_parent so each
+     * orphan lands in its OWN bucket and is adopted by the correct legacy comment.
+     * The ambiguity guard additionally refuses adoption when multiple legacies OR
+     * multiple orphans share a signature (fall through to fresh insert instead).
+     *
+     * This test injects two orphans in REVERSED order (orphanForB before orphanForA
+     * in the bucket) so that with the OLD signature, array_shift mis-adopts. With
+     * the NEW tightened signature each orphan has a distinct sig and is adopted correctly.
+     */
+    public function test_comment_orphan_distinct_parents_not_cross_adopted(): void {
+        global $wpdb;
+
+        $legacyId = $this->bareSermon();
+
+        // Create the new sermon post first (so we can inject orphans onto it).
+        $newPostId = (int) wp_insert_post( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_title'  => get_post_field( 'post_title', $legacyId ),
+            'post_status' => 'publish',
+        ) );
+        $this->assertGreaterThan( 0, $newPostId );
+        // Stamp back-ref (partial record — not COMPLETE).
+        add_post_meta( $newPostId, Crosswalk::LEGACY_POST_ID, $legacyId, true );
+
+        // Common identity for all comments.
+        $sharedEmail   = 'anon-' . wp_generate_uuid4() . '@example.com';
+        $sharedContent = 'Identical content at same second';
+        $sharedDate    = '2020-05-01 12:00:00';
+
+        // Legacy Comment A: top-level (parent=0).
+        $legacyCommentA = (int) wp_insert_comment( array(
+            'comment_post_ID'      => $legacyId,
+            'comment_author'       => 'Anon',
+            'comment_author_email' => $sharedEmail,
+            'comment_content'      => $sharedContent,
+            'comment_date_gmt'     => $sharedDate,
+            'comment_date'         => $sharedDate,
+            'comment_parent'       => 0,
+            'comment_approved'     => '1',
+        ) );
+        // Legacy Comment B: child of A (parent = legacyCommentA).
+        $legacyCommentB = (int) wp_insert_comment( array(
+            'comment_post_ID'      => $legacyId,
+            'comment_author'       => 'Anon',
+            'comment_author_email' => $sharedEmail,
+            'comment_content'      => $sharedContent,
+            'comment_date_gmt'     => $sharedDate,
+            'comment_date'         => $sharedDate,
+            'comment_parent'       => $legacyCommentA,
+            'comment_approved'     => '1',
+        ) );
+
+        // Insert orphan-for-B FIRST (higher comment_ID = appears LATER in DESC order, but
+        // get_comments returns ASC by default → orphanForB comes FIRST in the bucket if it
+        // has a LOWER ID). We insert orphanForB first so it has lower comment_ID and
+        // thus appears first in the orphansBySig bucket — triggering the mis-adoption bug
+        // with the OLD 3-field signature.
+        $orphanForB = (int) wp_insert_comment( array(
+            'comment_post_ID'      => $newPostId,
+            'comment_author'       => 'Anon',
+            'comment_author_email' => $sharedEmail,
+            'comment_content'      => $sharedContent,
+            'comment_date_gmt'     => $sharedDate,
+            'comment_date'         => $sharedDate,
+            'comment_parent'       => 99, // placeholder parent — wrong for comment A (parent=0)
+            'comment_approved'     => '1',
+        ) );
+        // Orphan-for-A: parent=0 (correct parent for legacyCommentA).
+        $orphanForA = (int) wp_insert_comment( array(
+            'comment_post_ID'      => $newPostId,
+            'comment_author'       => 'Anon',
+            'comment_author_email' => $sharedEmail,
+            'comment_content'      => $sharedContent,
+            'comment_date_gmt'     => $sharedDate,
+            'comment_date'         => $sharedDate,
+            'comment_parent'       => 0,
+            'comment_approved'     => '1',
+        ) );
+
+        // With OLD 3-field sig: both orphans in same bucket, ordered by comment_ID (ASC).
+        // orphanForB has lower ID → first shift → gets adopted by legacyCommentA (WRONG).
+        // orphanForA has higher ID → second shift → gets adopted by legacyCommentB (WRONG).
+        // Both adopted but with WRONG parents → comment B's new copy would have parent=99
+        // (the wrong placeholder), and comment A's new copy would have parent=0 which is
+        // accidentally correct for A but wrong by back-ref.
+        //
+        // With NEW tightened sig (includes comment_parent):
+        // orphanForB (parent=99) has a DIFFERENT sig from legacyCommentA (parent=0)
+        // → no match in bucket → NOT adopted → fresh insert for legacyCommentA.
+        // orphanForA (parent=0) matches legacyCommentA's sig → adopted correctly.
+        // This leaves orphanForB un-adopted (no back-ref, not matched).
+
+        // Neither orphan has a back-ref yet.
+        $this->assertSame( '', (string) get_comment_meta( $orphanForA, Crosswalk::LEGACY_COMMENT_ID, true ) );
+        $this->assertSame( '', (string) get_comment_meta( $orphanForB, Crosswalk::LEGACY_COMMENT_ID, true ) );
+
+        // Run write() — hits the RESUME path.
+        $writer = new SermonWriter();
+        $result = $writer->write( $legacyId );
+        $newId  = $result->newId;
+        $this->assertSame( $newPostId, $newId, 'write() must resume on the existing partial post' );
+
+        // Build the legacy→new back-ref map from the new post's comments.
+        $allNewComments = get_comments( array( 'post_id' => $newId, 'status' => 'any', 'number' => 0 ) );
+        $backRefMap = array();
+        foreach ( $allNewComments as $nc ) {
+            $legacyRef = (int) get_comment_meta( $nc->comment_ID, Crosswalk::LEGACY_COMMENT_ID, true );
+            if ( $legacyRef > 0 ) {
+                $backRefMap[ $legacyRef ] = (int) $nc->comment_ID;
+            }
+        }
+
+        // Both legacy comments must be copied (with back-refs).
+        $this->assertArrayHasKey( $legacyCommentA, $backRefMap, 'Comment A must have a back-ref' );
+        $this->assertArrayHasKey( $legacyCommentB, $backRefMap, 'Comment B must have a back-ref' );
+
+        // The key assertion: comment A's new copy must have parent=0 (not the wrong orphanForB's parent=99).
+        $newCommentA = get_comment( $backRefMap[ $legacyCommentA ] );
+        $this->assertInstanceOf( \WP_Comment::class, $newCommentA );
+        $this->assertSame(
+            0,
+            (int) $newCommentA->comment_parent,
+            'Comment A must be top-level (parent=0) — tightened signature prevents mis-adoption of orphanForB (parent=99)'
+        );
+
+        // Comment B's new copy must be parented to A's new copy (not to some wrong id).
+        $newCommentB = get_comment( $backRefMap[ $legacyCommentB ] );
+        $this->assertInstanceOf( \WP_Comment::class, $newCommentB );
+        $this->assertSame(
+            (int) $backRefMap[ $legacyCommentA ],
+            (int) $newCommentB->comment_parent,
+            'Comment B must be parented to A\'s new id (correct threading)'
+        );
+    }
+
+    // --------- FIX 4: mirrorNativeTaxonomies — count mutation is intentional (doc contract)
+
+    /**
+     * FIX 4: mirrorNativeTaxonomies() calls wp_set_object_terms on global term ids,
+     * which invokes wp_update_term_count, mutating wp_term_taxonomy.count BEFORE
+     * Finalize. This is an intentional, reversible derived-value mutation — the
+     * RELATIONSHIP (which IS primary data) must be preserved.
+     *
+     * This test documents the contract:
+     *  (a) legacy post term_relationships rows are UNCHANGED (legacy is read-only);
+     *  (b) the new sermon has the category term mirrored (relationship preserved);
+     *  (c) the count column is a derived value — its mutation is intentional and will
+     *      be re-balanced on rollback/finalize. We snapshot and compare to document
+     *      this behaviour explicitly rather than asserting a specific delta.
+     *
+     * NOTE: WordPress's built-in category count callback only counts 'post' post type,
+     * so the count for a sermonator_sermon may not change numerically in this test —
+     * but the RELATIONSHIP row is what matters (and must be mirrored correctly).
+     * TODO(B2b): consider deferring native-taxonomy assignment to the Finalize step
+     * for strict count-immutability.
+     */
+    public function test_mirror_native_taxonomies_legacy_relationships_unchanged(): void {
+        global $wpdb;
+
+        $legacyId = $this->bareSermon();
+
+        // Register a custom global taxonomy for the test so we can control count behaviour.
+        // Using 'post_tag' (registered for 'post') mirrors the same issue as 'category'.
+        // We use a freshly registered test taxonomy that counts ALL post types so the
+        // count assertion is reliable regardless of the built-in category count callback.
+        $testTaxonomy = 'sermonator_test_global_' . substr( wp_generate_uuid4(), 0, 8 );
+        register_taxonomy( $testTaxonomy, array( 'wpfc_sermon', Identifiers::POST_TYPE_SERMON ), array(
+            'public'       => false,
+            'hierarchical' => false,
+        ) );
+
+        $termResult = wp_insert_term( 'Test Tag ' . wp_generate_uuid4(), $testTaxonomy );
+        if ( is_wp_error( $termResult ) ) {
+            $this->markTestSkipped( 'Could not create test taxonomy term: ' . $termResult->get_error_message() );
+        }
+        $termId = (int) $termResult['term_id'];
+        $ttId   = (int) $termResult['term_taxonomy_id'];
+
+        // Assign to the legacy sermon.
+        wp_set_object_terms( $legacyId, array( $termId ), $testTaxonomy );
+
+        // Snapshot: legacy term_relationships BEFORE write.
+        $legacyRelsBefore = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT * FROM {$wpdb->term_relationships} WHERE object_id = %d ORDER BY term_taxonomy_id ASC",
+                $legacyId
+            ),
+            ARRAY_A
+        );
+
+        // Capture count before write.
+        $countBefore = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT count FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id = %d",
+                $ttId
+            )
+        );
+
+        // Run write().
+        $writer = new SermonWriter();
+        $result = $writer->write( $legacyId );
+        $newId  = $result->newId;
+        $this->assertGreaterThan( 0, $newId );
+
+        // (a) Legacy term_relationships must be UNCHANGED (primary data, read-only).
+        $legacyRelsAfter = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT * FROM {$wpdb->term_relationships} WHERE object_id = %d ORDER BY term_taxonomy_id ASC",
+                $legacyId
+            ),
+            ARRAY_A
+        );
+        $this->assertSame(
+            $legacyRelsBefore,
+            $legacyRelsAfter,
+            'Legacy post term_relationships must be byte-equal before and after write() — legacy is read-only'
+        );
+
+        // (b) New sermon must have the taxonomy term mirrored (primary relationship preserved).
+        $newAssigned = wp_get_object_terms( $newId, $testTaxonomy, array( 'fields' => 'ids' ) );
+        $this->assertContains(
+            $termId,
+            array_map( 'intval', is_array( $newAssigned ) ? $newAssigned : array() ),
+            'New sermon must have the native taxonomy term mirrored from the legacy post'
+        );
+
+        // (c) Document count mutation: wp_set_object_terms fires wp_update_term_count.
+        // For a custom taxonomy registered for both post types, the count increments.
+        // This is intentional (derived value), reversible on rollback/finalize.
+        // TODO(B2b): consider deferring native-taxonomy assignment to the Finalize step
+        // for strict count-immutability before Finalize has run.
+        $countAfter = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT count FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id = %d",
+                $ttId
+            )
+        );
+        $this->assertGreaterThan(
+            $countBefore,
+            $countAfter,
+            'wp_term_taxonomy.count must increment after mirrorNativeTaxonomies — intentional, reversible derived-value mutation'
+        );
+
+        // Cleanup: unregister the test taxonomy.
+        unregister_taxonomy( $testTaxonomy );
+    }
 }
