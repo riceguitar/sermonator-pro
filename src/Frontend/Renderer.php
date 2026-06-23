@@ -124,6 +124,30 @@ final class Renderer {
             . $this->pagination( $result );
     }
 
+    /**
+     * A list of taxonomy term links (used by the taxonomy-filter block). Pure: takes
+     * already-resolved {name,url} pairs.
+     *
+     * @param list<array{name:string,url:string,count:int}> $terms
+     */
+    public function taxonomyLinks( array $terms, string $label = '' ): string {
+        if ( $terms === array() ) {
+            return '';
+        }
+        $items = '';
+        foreach ( $terms as $t ) {
+            $text = esc_html( $t['name'] );
+            if ( $t['count'] > 0 ) {
+                $text .= ' <span class="sermonator-termlist__count">(' . esc_html( (string) $t['count'] ) . ')</span>';
+            }
+            $items .= $t['url'] !== ''
+                ? '<li><a href="' . esc_url( $t['url'] ) . '">' . $text . '</a></li>'
+                : '<li>' . $text . '</li>';
+        }
+        $heading = $label !== '' ? '<h2 class="sermonator-termlist__label">' . esc_html( $label ) . '</h2>' : '';
+        return '<nav class="sermonator-termlist">' . $heading . '<ul>' . $items . '</ul></nav>';
+    }
+
     public function pagination( QueryResult $result ): string {
         if ( $result->totalPages <= 1 ) {
             return '';

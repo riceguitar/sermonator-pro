@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/sermon-grid",
+  "title": "Sermon Grid",
+  "category": "widgets",
+  "icon": "grid-view",
+  "description": "A grid of sermons, newest preached first, optionally filtered by taxonomy.",
+  "textdomain": "sermonator",
+  "attributes": {
+    "perPage": { "type": "number", "default": 12 },
+    "columns": { "type": "number", "default": 3 },
+    "order": { "type": "string", "default": "DESC" },
+    "preacher": { "type": "string", "default": "" },
+    "series": { "type": "string", "default": "" },
+    "topic": { "type": "string", "default": "" },
+    "book": { "type": "string", "default": "" },
+    "serviceType": { "type": "string", "default": "" }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}

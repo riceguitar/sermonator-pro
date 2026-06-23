@@ -7,11 +7,15 @@ namespace Sermonator\Frontend;
 use Sermonator\Frontend\Blocks\SermonMetaBlock;
 use Sermonator\Frontend\Blocks\AudioPlayerBlock;
 use Sermonator\Frontend\Blocks\VideoBlock;
+use Sermonator\Frontend\Blocks\SermonCardBlock;
+use Sermonator\Frontend\Blocks\SermonGridBlock;
+use Sermonator\Frontend\Blocks\TaxonomyFilterBlock;
 
 /**
- * Wires the read-only front-end display layer: dynamic blocks, the block template (FSE),
- * the classic-theme template fallback, and conditional assets. Instantiated by Plugin::boot
- * on front-end + feed/REST requests (not wp-admin screens, not WP-CLI rendering).
+ * Wires the read-only front-end display layer: dynamic blocks, block templates (FSE), the
+ * classic-theme template fallbacks, the [sermonator_sermons] shortcode, archive ordering,
+ * and conditional assets. Instantiated by Plugin::boot in all contexts (the editor needs
+ * block/template registration); front-end-only hooks self-scope.
  */
 final class FrontendServiceProvider {
     private Assets $assets;
@@ -23,6 +27,8 @@ final class FrontendServiceProvider {
     public function hook(): void {
         add_action( 'init', array( $this, 'onInit' ) );
         ( new ClassicTemplates() )->hook();
+        ( new ArchiveOrdering() )->hook();
+        ( new Shortcode() )->hook();
         $this->assets->hook();
     }
 
@@ -33,6 +39,9 @@ final class FrontendServiceProvider {
         ( new SermonMetaBlock() )->register();
         ( new AudioPlayerBlock() )->register();
         ( new VideoBlock() )->register();
+        ( new SermonCardBlock() )->register();
+        ( new SermonGridBlock() )->register();
+        ( new TaxonomyFilterBlock() )->register();
 
         ( new BlockTemplates() )->register();
     }

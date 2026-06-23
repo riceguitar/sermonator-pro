@@ -8,10 +8,10 @@ use Sermonator\Schema\Identifiers as ID;
 
 /**
  * Registers plugin-provided block templates for block (FSE) themes. A more-specific
- * single-sermonator_sermon template wins over a theme's generic `single` with zero config
+ * single-/archive-/taxonomy- template wins over a theme's generic template with zero config
  * (verified in Phase 0 on TT5). Themes can still override by shipping their own template of
- * the same slug, and users can edit ours in the Site Editor. Single-meta renders purely by
- * the block's PRESENCE in this composition — no request-scoped guard.
+ * the same slug, and users can edit ours in the Site Editor. Single-meta and cards render
+ * purely by block PRESENCE in the composition — no request-scoped guard.
  */
 final class BlockTemplates {
     public function register(): void {
@@ -19,10 +19,22 @@ final class BlockTemplates {
             return;
         }
 
-        $name = 'sermonator//single-' . ID::POST_TYPE_SERMON;
+        $this->registerOne( 'single-' . ID::POST_TYPE_SERMON, __( 'Single Sermon', 'sermonator' ), $this->singleContent() );
+        $this->registerOne( 'archive-' . ID::POST_TYPE_SERMON, __( 'Sermon Archive', 'sermonator' ), $this->archiveContent( __( 'Sermons', 'sermonator' ) ) );
 
-        // Idempotent: register_block_template() emits a _doing_it_wrong on a duplicate, so
-        // guard against a second call within the same request.
+        foreach ( ID::sermonTaxonomies() as $taxonomy ) {
+            $this->registerOne(
+                'taxonomy-' . $taxonomy,
+                __( 'Sermon Taxonomy', 'sermonator' ),
+                $this->archiveContent( '' )
+            );
+        }
+    }
+
+    private function registerOne( string $slug, string $title, string $content ): void {
+        $name = 'sermonator//' . $slug;
+
+        // Idempotent: register_block_template() emits a _doing_it_wrong on a duplicate.
         if ( class_exists( '\WP_Block_Templates_Registry' )
             && \WP_Block_Templates_Registry::get_instance()->is_registered( $name ) ) {
             return;
@@ -31,9 +43,8 @@ final class BlockTemplates {
         register_block_template(
             $name,
             array(
-                'title'       => __( 'Single Sermon', 'sermonator' ),
-                'description' => __( 'Default Sermonator single-sermon layout.', 'sermonator' ),
-                'content'     => $this->singleContent(),
+                'title'   => $title,
+                'content' => $content,
             )
         );
     }
@@ -46,6 +57,32 @@ final class BlockTemplates {
             . '<!-- wp:sermonator/audio-player /-->'
             . '<!-- wp:sermonator/video /-->'
             . '<!-- wp:post-content /-->'
+            . '</main><!-- /wp:group -->'
+            . '<!-- wp:template-part {"slug":"footer","tagName":"footer"} /-->';
+    }
+
+    /**
+     * Archive/taxonomy layout: a query loop that INHERITS the main query (which
+     * ArchiveOrdering has sorted by preached date), rendering one sermon-card per result,
+     * plus query pagination. The archive title comes from the queried object.
+     */
+    private function archiveContent( string $title ): string {
+        $heading = $title !== ''
+            ? '<!-- wp:heading {"level":1} --><h1 class="wp-block-heading">' . esc_html( $title ) . '</h1><!-- /wp:heading -->'
+            : '<!-- wp:query-title {"type":"archive","level":1} /-->';
+
+        return '<!-- wp:template-part {"slug":"header","tagName":"header"} /-->'
+            . '<!-- wp:group {"tagName":"main","layout":{"type":"constrained"}} --><main class="wp-block-group">'
+            . $heading
+            . '<!-- wp:query {"queryId":0,"query":{"inherit":true},"className":"sermonator-grid","layout":{"type":"default"}} -->'
+            . '<div class="wp-block-query sermonator-grid">'
+            . '<!-- wp:post-template -->'
+            . '<!-- wp:sermonator/sermon-card /-->'
+            . '<!-- /wp:post-template -->'
+            . '<!-- wp:query-pagination --><!-- wp:query-pagination-previous /--><!-- wp:query-pagination-numbers /--><!-- wp:query-pagination-next /--><!-- /wp:query-pagination -->'
+            . '<!-- wp:query-no-results --><!-- wp:paragraph --><p>' . esc_html__( 'No sermons found.', 'sermonator' ) . '</p><!-- /wp:paragraph --><!-- /wp:query-no-results -->'
+            . '</div>'
+            . '<!-- /wp:query -->'
             . '</main><!-- /wp:group -->'
             . '<!-- wp:template-part {"slug":"footer","tagName":"footer"} /-->';
     }
