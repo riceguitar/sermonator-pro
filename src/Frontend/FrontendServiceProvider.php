@@ -10,6 +10,7 @@ use Sermonator\Frontend\Blocks\VideoBlock;
 use Sermonator\Frontend\Blocks\SermonCardBlock;
 use Sermonator\Frontend\Blocks\SermonGridBlock;
 use Sermonator\Frontend\Blocks\TaxonomyFilterBlock;
+use Sermonator\Frontend\Feed\PodcastFeed;
 
 /**
  * Wires the read-only front-end display layer: dynamic blocks, block templates (FSE), the
@@ -29,6 +30,7 @@ final class FrontendServiceProvider {
         ( new ClassicTemplates() )->hook();
         ( new ArchiveOrdering() )->hook();
         ( new Shortcode() )->hook();
+        ( new PodcastFeed() )->hook();
         $this->assets->hook();
     }
 
