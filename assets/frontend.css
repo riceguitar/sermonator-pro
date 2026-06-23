@@ -150,3 +150,25 @@
 .sermonator-termlist__count {
 	opacity: 0.6;
 }
+
+/* Podcast subscribe */
+.sermonator-subscribe {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem;
+	margin: 0 0 1.5rem;
+}
+
+.sermonator-subscribe__label {
+	font-weight: 600;
+}
+
+.sermonator-subscribe__link {
+	display: inline-block;
+	padding: 0.35rem 0.75rem;
+	border: 1px solid currentColor;
+	border-radius: 0.25rem;
+	text-decoration: none;
+	font-size: 0.9rem;
+}
