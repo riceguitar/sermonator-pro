@@ -269,6 +269,93 @@ final class OrchestratorTest extends WP_UnitTestCase {
         $other->releaseLock();
     }
 
+    public function test_expired_lock_reclaim_is_a_single_winner_cas(): void {
+        // B2b review (state-concurrency-0): the expired-lock reclaim must be a
+        // compare-and-swap, NOT an unconditional overwrite — otherwise two concurrent
+        // reclaimers of a crashed holder's lock both "win" and insert concurrently.
+        global $wpdb;
+        $this->seedDataset();
+
+        // Plant an EXPIRED lock (ancient timestamp) as if a prior holder crashed.
+        $stale = '100|sermonator_lock_crashed';
+        add_option( Orchestrator::OPTION_LOCK, $stale, '', 'no' );
+
+        // A reclaims via CAS (UPDATE ... WHERE option_value = stale → exactly 1 row).
+        $a = new Orchestrator();
+        $this->assertTrue( $a->acquireLock(), 'An expired lock must be reclaimable.' );
+
+        // The stored value has changed, so a CONCURRENT reclaimer still holding the
+        // stale value loses the CAS (0 rows affected) — proving the single-winner CAS.
+        $reclaimedByStale = (int) $wpdb->query(
+            $wpdb->prepare(
+                "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+                '200|sermonator_lock_loser',
+                Orchestrator::OPTION_LOCK,
+                $stale
+            )
+        );
+        $this->assertSame( 0, $reclaimedByStale,
+            'A second reclaimer holding the stale value must lose the CAS (0 rows) — single winner.' );
+
+        // A fresh acquire by another instance sees A's now-live lock and refuses.
+        $b = new Orchestrator();
+        $this->assertFalse( $b->acquireLock(), 'A concurrent acquire after a fresh reclaim must refuse.' );
+
+        $a->releaseLock();
+    }
+
+    public function test_release_is_ownership_checked_and_does_not_delete_a_successors_lock(): void {
+        // B2b review (state-concurrency-1): releaseLock must be OWNERSHIP-CHECKED — a
+        // slow/overrun holder whose lock was reclaimed by a successor must NOT delete
+        // the successor's live lock (which would re-open the concurrency window).
+        global $wpdb;
+        $this->seedDataset();
+
+        $a = new Orchestrator();
+        $this->assertTrue( $a->acquireLock() );
+
+        // Simulate A overrunning past the TTL: back-date the stored lock timestamp so a
+        // successor sees it as expired. (A's in-memory token is unchanged — A still
+        // believes it owns the lock.)
+        $wpdb->query(
+            $wpdb->prepare(
+                "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s",
+                '100|sermonator_lock_overrun',
+                Orchestrator::OPTION_LOCK
+            )
+        );
+        wp_cache_delete( Orchestrator::OPTION_LOCK, 'options' );
+
+        // Successor B reclaims the (now-expired) lock.
+        $b = new Orchestrator();
+        $this->assertTrue( $b->acquireLock(), 'B must reclaim the expired (overrun) lock.' );
+        $bRaw = $wpdb->get_var(
+            $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", Orchestrator::OPTION_LOCK )
+        );
+
+        // A finishes and releases. Its ownership-checked release must NOT delete B's
+        // lock (A's token no longer matches the stored value).
+        $a->releaseLock();
+        $afterRelease = $wpdb->get_var(
+            $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", Orchestrator::OPTION_LOCK )
+        );
+        $this->assertSame( $bRaw, $afterRelease,
+            "A's release must NOT tear down B's freshly-reclaimed lock." );
+
+        // A third runner must still see B's live lock and refuse — window NOT re-opened.
+        $c = new Orchestrator();
+        $this->assertFalse( $c->acquireLock(), 'A third runner must not enter while B holds the lock.' );
+
+        // B's ownership-checked release removes its OWN lock cleanly.
+        $b->releaseLock();
+        $this->assertNull(
+            $wpdb->get_var(
+                $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", Orchestrator::OPTION_LOCK )
+            ),
+            "B's ownership-checked release removes its own lock."
+        );
+    }
+
     public function test_crash_mid_batch_then_resume_creates_no_duplicate_sermons(): void {
         $data   = $this->seedDataset();
         $before = $this->legacySnapshot();

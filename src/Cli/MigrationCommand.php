@@ -117,12 +117,19 @@ final class MigrationCommand {
         // Loop run() to completion. The Orchestrator returns a terminal phase
         // ('migrated' once every phase reports complete) and advances each chunk under
         // its own lock + gates. We stop on a terminal phase, on a hard non-advancing
-        // FLAG (a held lock or an undetected state — the only genuinely stuck signals,
-        // because the done/remaining counts legitimately stay flat across the
-        // non-record phases like terms/artwork/options), or at a bounded guard so a
-        // bug can never spin forever.
-        $guard    = 0;
-        $maxLoops = 100000;
+        // FLAG (a held lock or an undetected state), on a GENUINELY-STUCK phase (a
+        // blocking failure flag that persists with no forward progress — e.g. an
+        // unresolvable missing_term_crosswalk that would otherwise re-run the full term
+        // phase up to the iteration cap), or at a bounded guard so a bug can never spin
+        // forever. We must NOT treat a single flat iteration as stuck: the non-record
+        // phases (terms/artwork/options) legitimately keep done/remaining flat while
+        // advancing their phaseComplete markers, so we require a blocking flag AND an
+        // IDENTICAL progress signature repeating before stopping.
+        $guard         = 0;
+        $maxLoops      = 100000;
+        $stallSig      = null;
+        $stallCount    = 0;
+        $stallNeeded   = 3; // consecutive identical blocked iterations before we stop
 
         do {
             $progress = $this->orchestrator->run( $batchSize );
@@ -140,8 +147,8 @@ final class MigrationCommand {
                 break;
             }
 
-            // The only non-advancing terminal signals: the lock is held by another run,
-            // or detect() has not run. Stop rather than spin.
+            // Hard non-advancing terminal signals: the lock is held by another run, or
+            // detect() has not run. Stop immediately rather than spin.
             $stuck = array_intersect( array( 'locked', 'not_detected' ), $progress['flags'] );
             if ( $stuck !== array() ) {
                 $this->warning( sprintf(
@@ -151,6 +158,30 @@ final class MigrationCommand {
                 ) );
                 break;
             }
+
+            // Genuinely-stuck phase: a BLOCKING failure flag is open AND the run has
+            // stopped advancing (identical phase/done/remaining/flags signature). Re-running
+            // would only hammer the DB without ever closing the gap (a missing crosswalk,
+            // an unreadable taxonomy, a failed term migration), so stop and surface it.
+            $blocking  = $this->blockingFlags( $progress['flags'] );
+            $signature = $phase . '|' . $progress['done'] . '|' . $progress['remaining']
+                . '|' . implode( ',', $progress['flags'] );
+            if ( $blocking !== array() && $signature === $stallSig ) {
+                $stallCount++;
+                if ( $stallCount >= $stallNeeded ) {
+                    $this->warning( sprintf(
+                        'Migration is stuck (phase=%s) on unresolved issues after %d non-advancing iterations; stopping. Resolve and re-run. Flags: %s',
+                        $phase,
+                        $stallCount,
+                        implode( ',', $blocking )
+                    ) );
+                    break;
+                }
+            } else {
+                $stallCount = 0;
+            }
+            $stallSig = $signature;
+
             $guard++;
         } while ( $guard < $maxLoops );
 
@@ -325,6 +356,14 @@ final class MigrationCommand {
         $this->log( 'Finalize is IRREVERSIBLE — it deletes legacy data per verified counterpart.' );
         $this->log( sprintf( 'Current state: %s', $this->state->phase() ) );
 
+        // Print the EXACT blast radius FIRST (mirroring rollback) so the operator sees
+        // precisely which legacy posts/options the irreversible step would delete before
+        // confirming. The Finalizer still re-enforces every gate regardless of --yes.
+        $pending = $this->finalizer->pendingDeletions();
+        $this->log( 'Finalize would delete (per verified counterpart):' );
+        $this->log( '  legacy posts:   ' . $this->idList( $pending['posts'] ) );
+        $this->log( '  legacy options: ' . ( $pending['options'] !== array() ? implode( ', ', $pending['options'] ) : '(none)' ) );
+
         if ( ! $this->confirmed( $assoc_args ) ) {
             $this->warning( 'Finalize aborted: pass --yes to confirm. Nothing was deleted.' );
             return;
@@ -378,6 +417,40 @@ final class MigrationCommand {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Filter a flag set down to the BLOCKING failure flags — the ones that genuinely
+     * prevent a phase from completing and that re-running cannot self-heal (a missing
+     * crosswalk, an unreadable/failed legacy taxonomy read, a meta-key collision, an
+     * unresolved post parent, a missing option/podcast crosswalk). Advisory flags
+     * (legacy_nonnumeric_date, post_content_preserved, slug_collision, artwork_*) and
+     * the lock/not_detected signals (handled separately) are NOT blocking.
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function blockingFlags( array $flags ): array {
+        $prefixes = array(
+            'missing_term_crosswalk',
+            'missing_podcast_term_crosswalk',
+            'missing_option_id_crosswalk',
+            'legacy_taxonomy_unreadable',
+            'legacy_terms_failed',
+            'meta_key_collision',
+            'post_parent_unresolved',
+        );
+        $blocking = array();
+        foreach ( $flags as $flag ) {
+            $flag = (string) $flag;
+            foreach ( $prefixes as $prefix ) {
+                if ( $flag === $prefix || str_starts_with( $flag, $prefix . ':' ) ) {
+                    $blocking[] = $flag;
+                    break;
+                }
+            }
+        }
+        return array_values( array_unique( $blocking ) );
     }
 
     /**

@@ -54,35 +54,22 @@ use Sermonator\Schema\Identifiers;
  *
  * After success, state → 'finalized'; Rollback then refuses outright.
  *
- * CRASH/RESUME (the destructive step is non-atomic). A single run() deletes legacy
- * posts one counterpart at a time; an abort between counterparts would otherwise wedge
- * the migration: the deleted legacy id has no resolvable counterpart on a fresh rescan
- * (its back-ref was already stripped), so the rescan would report it missing → !complete
- * → Finalize would REFUSE forever, with no Rollback recovery for a force-deleted legacy
- * post. To prevent that, each counterpart is recorded in
- * OPTION_MIGRATION_PROGRESS[PROGRESS_KEY]['finalized_legacy_ids'] BEFORE its legacy
- * delete, and:
- *   - the GATE-2 fresh rescan runs against an EFFECTIVE manifest with those finalized
- *     ids subtracted (checksums removed + sermons/podcasts counts decremented), so an
- *     already-finalized id is expected-absent rather than "missing" — the rescan stays
- *     a pure clean-oracle over the REMAINING work;
- *   - the per-counterpart op is fully idempotent (delete is guarded by get_post(); the
- *     meta/comment strips are no-ops when the rows are already gone), so the loop is
- *     re-run for EVERY manifest id on resume — a mark-before-delete abort still gets its
- *     legacy delete completed (no leak), and a completed delete is never repeated.
- * The state advances to 'finalized' only after the whole loop, so a mid-loop abort
- * leaves the phase at 'verified' and GATE 1 still admits the resume.
+ * CRASH/RESUME (the destructive step is non-atomic). The three gates are enforced ONCE,
+ * on the first run, against the fully-intact (pre-destruction) database. The instant
+ * they pass, the destructive step is COMMITTED: we advance the phase to 'finalized'
+ * BEFORE deleting anything, then run an idempotent destructive drain (delete legacy
+ * posts per verified counterpart, delete legacy options, recount native tt_ids). A crash
+ * anywhere in the (non-atomic) drain leaves the phase at 'finalized'; the next run()
+ * re-enters the drain DIRECTLY and completes it — it does NOT re-run the gates, because
+ * GATE 2's fresh rescan is a PRE-destruction oracle that would falsely refuse over the
+ * half-deleted DB (a deleted-and-stripped counterpart reads as "missing"). The drain is
+ * fully idempotent: deletes are guarded by get_post()/findNewByLegacyId(), and posts are
+ * enumerated from the IMMUTABLE manifest (sermons AND podcasts are checksummed there), so
+ * a counterpart deleted-but-not-yet-stripped is still re-enumerated and its dangling
+ * back-ref stripped (no leak). Advancing the phase first also means Rollback (which
+ * refuses from 'finalized') can never interleave with the in-progress destruction.
  */
 final class Finalizer {
-    /**
-     * Sub-key under OPTION_MIGRATION_PROGRESS where the destructive step records its
-     * own resume bookkeeping. Holds 'finalized_legacy_ids': the list of legacy POST
-     * ids whose destructive finalize was ENTERED (marked BEFORE the legacy delete).
-     * On resume these ids are treated as expected-absent by the fresh drift rescan so
-     * a mid-loop abort does not wedge the migration into a "missing forever" refusal.
-     */
-    public const PROGRESS_KEY = 'finalize';
-
     private MigrationState $state;
     private Verifier $verifier;
 
@@ -103,7 +90,65 @@ final class Finalizer {
     }
 
     /**
-     * The sole destructive step. Hard-gated; idempotent on the refusal paths.
+     * Enumerate the blast radius a successful run() would delete, WITHOUT acting — so a
+     * CLI/admin surface can print the exact id set before the operator confirms the
+     * irreversible step (mirroring Rollback::pendingDeletions). Read-only.
+     *
+     * 'posts' are the legacy ids that resolve to a clean, deletable counterpart: every
+     * manifest-checksummed sermon id + every live legacy podcast id whose counterpart
+     * exists and carries no unresolved divergence flag (the exact records run() would
+     * force-delete). 'options' are the pure-legacy option names run() would delete that
+     * are currently present. This is a PREVIEW: run() still re-enforces all three gates,
+     * so a preview at a not-yet-verified phase shows what WOULD be deleted once verified.
+     *
+     * @return array{posts:list<int>, options:list<string>}
+     */
+    public function pendingDeletions(): array {
+        LegacySchemaRegistrar::ensureRegistered();
+
+        $posts    = array();
+        $manifest = $this->state->manifest();
+        if ( $manifest !== null ) {
+            foreach ( $manifest->checksummedLegacyIds() as $legacyId ) {
+                if ( $this->isDeletableCounterpart( (int) $legacyId, Identifiers::POST_TYPE_SERMON ) ) {
+                    $posts[] = (int) $legacyId;
+                }
+            }
+        }
+        foreach ( $this->legacyPostIds( LegacyIdentifiers::POST_TYPE_PODCAST ) as $legacyId ) {
+            if ( $this->isDeletableCounterpart( $legacyId, Identifiers::POST_TYPE_PODCAST ) ) {
+                $posts[] = $legacyId;
+            }
+        }
+        $posts = array_values( array_unique( $posts ) );
+        sort( $posts );
+
+        $options = array();
+        foreach ( $this->legacyOptionsToDelete() as $name ) {
+            if ( get_option( $name, '__sermonator_absent__' ) !== '__sermonator_absent__' ) {
+                $options[] = $name;
+            }
+        }
+
+        return array( 'posts' => $posts, 'options' => array_values( array_unique( $options ) ) );
+    }
+
+    /**
+     * Whether a legacy id has a clean, deletable migrated counterpart — it resolves via
+     * the crosswalk AND carries no unresolved divergence flag (the same two conditions
+     * finalizeCounterpart requires before it would force-delete the legacy source).
+     */
+    private function isDeletableCounterpart( int $legacyId, string $newType ): bool {
+        $newId = Crosswalk::findNewByLegacyId( $legacyId, $newType );
+        if ( $newId === null ) {
+            return false;
+        }
+        return ! $this->hasUnresolvedDivergence( $newId );
+    }
+
+    /**
+     * The sole destructive step. Hard-gated on the first run; idempotent on the refusal
+     * paths AND on a committed-but-incomplete resume.
      *
      * @param bool $confirmed Explicit operator confirmation (CLI: behind --yes).
      * @return array{deleted:array{posts:list<int>, options:list<string>}, stripped:int, refused:?string}
@@ -117,13 +162,32 @@ final class Finalizer {
             'options' => array(),
         );
 
+        $phase = $this->state->phase();
+
+        // RESUME of a committed-but-incomplete finalize. Once the three gates passed on
+        // the first run we advanced the phase to 'finalized' BEFORE any deletion (the
+        // destructive step is committed at that point). A crash mid-destruction therefore
+        // leaves the phase at 'finalized'; re-entering here runs the IDEMPOTENT drain
+        // directly. We must NOT re-run the gates: GATE 2's fresh rescan is a
+        // PRE-destruction oracle and would falsely refuse over the half-deleted DB (a
+        // legacy post already deleted with its back-ref already stripped reads as
+        // "missing"). A redundant re-run on a fully-completed finalize is a harmless
+        // no-op drain. This is what closes the wedge where a half-deleted DB could fail
+        // GATE 2 forever (B2b review finalize-correctness-0 / data-loss-0).
+        if ( $phase === 'finalized' ) {
+            return $this->drainDestructive( $deleted );
+        }
+
+        // ---- FIRST run: enforce all three gates on the fully-intact (pre-destruction)
+        //      database, cheapest first. ----
+
         // GATE 1: state must be 'verified'.
-        if ( $this->state->phase() !== 'verified' ) {
+        if ( $phase !== 'verified' ) {
             return $this->refuse(
                 $deleted,
                 sprintf(
                     'Finalize refused: migration phase is "%s", not "verified" (run verify first).',
-                    $this->state->phase()
+                    $phase
                 )
             );
         }
@@ -136,11 +200,12 @@ final class Finalizer {
             );
         }
 
-        // GATE 2: a FRESH drift rescan must STILL be clean. The Verifier is read-only
-        // and, run from the 'verified' phase, does not advance state (it only ever
-        // advances migrated → verified) — so a re-run here is a pure oracle. Any drift,
-        // re-opened failure flag, or newly-inserted live legacy id makes this report
-        // incomplete and aborts the destructive step.
+        // GATE 2: a FRESH drift rescan must STILL be clean over the INTACT DB. Run from
+        // the 'verified' phase the Verifier is a pure read-only oracle (it only ever
+        // advances migrated → verified, so it does not move the phase here). Any drift, a
+        // re-opened failure flag, or a newly-inserted live legacy id makes this report
+        // incomplete and aborts the destructive step — leaving the phase at 'verified'
+        // for a corrected retry (nothing has been deleted yet).
         $manifest = $this->state->manifest();
         if ( $manifest === null ) {
             return $this->refuse(
@@ -148,27 +213,7 @@ final class Finalizer {
                 'Finalize refused: no detect-time manifest is stored (cannot prove fixity).'
             );
         }
-
-        // RESUME DRAIN: a prior run may have aborted mid-loop, leaving counterparts that
-        // were MARKED finalized but whose legacy delete + back-ref strip did not finish.
-        // Complete those idempotently FIRST so the live DB matches the reduced manifest
-        // before the gate — a drained id's legacy post is gone and its back-ref stripped,
-        // so the rescan's expected/live/surplus cross-checks are all consistent. (On a
-        // first, never-aborted run the finalized set is empty and this is a no-op.)
-        $stripped = 0;
-        foreach ( $this->finalizedLegacyIds() as $legacyId ) {
-            $newType   = $manifest->checksum( $legacyId ) !== null
-                ? Identifiers::POST_TYPE_SERMON
-                : Identifiers::POST_TYPE_PODCAST;
-            $stripped += $this->finalizeCounterpart( $legacyId, $newType, $deleted );
-        }
-
-        // Subtract the finalized (now-drained) counterparts from the manifest so the
-        // fresh rescan does not report a deliberately-deleted legacy id as missing and
-        // wedge the resume. Over REMAINING work it stays a strict clean-oracle.
-        $rescanManifest = $this->manifestExcludingFinalized( $manifest );
-
-        $report = $this->verifier->verify( $rescanManifest );
+        $report = $this->verifier->verify( $manifest );
         if ( ! $report->complete ) {
             return $this->refuse(
                 $deleted,
@@ -181,28 +226,46 @@ final class Finalizer {
             );
         }
 
-        // --- All gates passed. Begin the irreversible destructive step. ------------
+        // COMMIT POINT. All gates passed → the destructive step is committed. Advance the
+        // phase to 'finalized' BEFORE touching any data, so a crash anywhere in the
+        // (non-atomic) destruction re-enters the idempotent drain on the next run()
+        // WITHOUT re-gating. Rollback also refuses from 'finalized', so no rollback can
+        // interleave with the in-progress destruction.
+        $this->state->set( 'finalized' );
 
-        // (1) Per verified POST counterpart: delete the legacy post + strip allowlist
-        // back-refs from the migrated counterpart. Driven from the manifest's
-        // enumerated legacy id set (sermons) plus the live legacy podcast set (the
-        // manifest records podcasts by count only). Because the fresh rescan was clean,
-        // every enumerated legacy id resolves to EXACTLY ONE clean counterpart — so we
-        // never delete a legacy id that lacks a verified counterpart.
-        $sermonLegacyIds  = $manifest->checksummedLegacyIds();
-        $podcastLegacyIds = $this->legacyPostIds( LegacyIdentifiers::POST_TYPE_PODCAST );
+        return $this->drainDestructive( $deleted );
+    }
 
-        foreach ( $sermonLegacyIds as $legacyId ) {
-            $stripped += $this->finalizeCounterpart( (int) $legacyId, Identifiers::POST_TYPE_SERMON, $deleted );
+    /**
+     * The idempotent destructive drain — the actual deletion of legacy data, run ONLY
+     * after the phase is 'finalized' (committed). Safe to re-run after a crash: every
+     * step is a no-op once already applied.
+     *
+     *  (1) Per verified POST counterpart, enumerated from the IMMUTABLE manifest (both
+     *      sermons AND podcasts are checksummed there) — NOT the live DB — so a
+     *      counterpart deleted-but-not-yet-stripped by a prior aborted drain is still
+     *      re-enumerated and its dangling back-ref stripped (no leak). finalizeCounterpart
+     *      is idempotent (get_post() / findNewByLegacyId() guards skip already-done work)
+     *      and never deletes a legacy id lacking a clean counterpart.
+     *  (2) Delete the migrated legacy OPTIONS (skip already-absent — idempotent).
+     *  (3) Recount the deferred native shared tt_ids exactly once (idempotent recompute).
+     *
+     * @param array{posts:list<int>, options:list<string>} $deleted
+     * @return array{deleted:array{posts:list<int>, options:list<string>}, stripped:int, refused:null}
+     */
+    private function drainDestructive( array $deleted ): array {
+        $manifest = $this->state->manifest();
+        $stripped = 0;
+
+        if ( $manifest !== null ) {
+            foreach ( $manifest->checksummedLegacyIds() as $legacyId ) {
+                $stripped += $this->finalizeCounterpart( (int) $legacyId, Identifiers::POST_TYPE_SERMON, $deleted );
+            }
+            foreach ( $manifest->checksummedPodcastLegacyIds() as $legacyId ) {
+                $stripped += $this->finalizeCounterpart( (int) $legacyId, Identifiers::POST_TYPE_PODCAST, $deleted );
+            }
         }
-        foreach ( $podcastLegacyIds as $legacyId ) {
-            $stripped += $this->finalizeCounterpart( (int) $legacyId, Identifiers::POST_TYPE_PODCAST, $deleted );
-        }
 
-        // (2) Delete the migrated legacy OPTIONS. Their sermonator_* targets were
-        // verified present, so the legacy originals can go. This is the live
-        // sermonmanager_* set + the legacy artwork options + the legacy default-podcast
-        // pointer. (The migration NEVER wrote these — they are pure legacy.)
         foreach ( $this->legacyOptionsToDelete() as $optionName ) {
             if ( get_option( $optionName, '__sermonator_absent__' ) !== '__sermonator_absent__' ) {
                 delete_option( $optionName );
@@ -210,12 +273,9 @@ final class Finalizer {
             }
         }
 
-        // (3) Recount the deferred native shared tt_ids exactly once so the church's
-        // shared counts settle to their TRUE live value at the point of no return.
+        // Recount the deferred native shared tt_ids exactly once so the church's shared
+        // counts settle to their TRUE live value at the point of no return.
         $this->recountNativeTtIds();
-
-        // Done — the point of no return.
-        $this->state->set( 'finalized' );
 
         return array(
             'deleted'  => array(
@@ -252,12 +312,10 @@ final class Finalizer {
             return 0;
         }
 
-        // Resume bookkeeping: record this counterpart as entered BEFORE the irreversible
-        // delete, so a mid-loop abort leaves it expected-absent on the next GATE-2
-        // rescan (no "missing forever" wedge). The whole op below is idempotent, so a
-        // re-run after an abort completes any delete that did not finish (no leak) and
-        // never double-deletes one that did.
-        $this->markCounterpartFinalized( $legacyId );
+        // The whole op below is idempotent (the get_post()/findNewByLegacyId() guards),
+        // so a re-run after a crashed drain completes any delete/strip that did not
+        // finish (no leak) and never double-deletes one that did. The 'finalized' phase
+        // gate in run() is the resume signal — no per-id bookkeeping is needed.
 
         // Delete the verified legacy source (force — past trash). Idempotent: the
         // get_post() guard skips a re-run whose legacy post is already gone.
@@ -342,87 +400,6 @@ final class Finalizer {
             }
         }
         return false;
-    }
-
-    /**
-     * Record a legacy POST id as entered into the destructive finalize, persisted in
-     * OPTION_MIGRATION_PROGRESS[PROGRESS_KEY]['finalized_legacy_ids'] BEFORE the legacy
-     * delete fires. On a mid-loop abort this is what lets the GATE-2 rescan treat the id
-     * as expected-absent on resume (rather than reporting it missing forever).
-     */
-    private function markCounterpartFinalized( int $legacyId ): void {
-        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
-        if ( ! is_array( $progress ) ) {
-            $progress = array();
-        }
-        if ( ! isset( $progress[ self::PROGRESS_KEY ] ) || ! is_array( $progress[ self::PROGRESS_KEY ] ) ) {
-            $progress[ self::PROGRESS_KEY ] = array();
-        }
-
-        $ids = $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids'] ?? array();
-        $ids = is_array( $ids ) ? array_map( 'intval', $ids ) : array();
-        if ( ! in_array( $legacyId, $ids, true ) ) {
-            $ids[] = $legacyId;
-        }
-
-        $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids'] = array_values( array_unique( $ids ) );
-        update_option( Identifiers::OPTION_MIGRATION_PROGRESS, $progress );
-    }
-
-    /**
-     * The legacy POST ids already entered into the destructive finalize on a prior
-     * (possibly aborted) run.
-     *
-     * @return list<int>
-     */
-    private function finalizedLegacyIds(): array {
-        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
-        if ( ! is_array( $progress )
-            || ! isset( $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids'] )
-            || ! is_array( $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids'] ) ) {
-            return array();
-        }
-
-        return array_values( array_unique( array_map(
-            'intval',
-            $progress[ self::PROGRESS_KEY ]['finalized_legacy_ids']
-        ) ) );
-    }
-
-    /**
-     * Build a derived manifest with the already-finalized legacy ids subtracted, so the
-     * GATE-2 fresh rescan does not flag a deliberately-deleted legacy id as missing on a
-     * resumed run. Removes each finalized id's checksum and decrements the matching
-     * sermons/podcasts count (podcasts are count-only in the manifest, so their count
-     * guard would otherwise fire on a shrunk live set). On a first, never-aborted run
-     * the finalized set is empty and this returns an equivalent manifest unchanged.
-     */
-    private function manifestExcludingFinalized( Manifest $manifest ): Manifest {
-        $finalized = $this->finalizedLegacyIds();
-        if ( $finalized === array() ) {
-            return $manifest;
-        }
-
-        $data      = $manifest->toArray();
-        $counts    = $data['counts'];
-        $checksums = $data['checksums'];
-
-        foreach ( $finalized as $legacyId ) {
-            if ( isset( $checksums[ $legacyId ] ) ) {
-                // A checksummed id is a SERMON — drop its checksum and decrement.
-                unset( $checksums[ $legacyId ] );
-                if ( isset( $counts['sermons'] ) ) {
-                    $counts['sermons'] = max( 0, (int) $counts['sermons'] - 1 );
-                }
-                continue;
-            }
-            // Not checksummed: a PODCAST (the manifest records podcasts by count only).
-            if ( isset( $counts['podcasts'] ) ) {
-                $counts['podcasts'] = max( 0, (int) $counts['podcasts'] - 1 );
-            }
-        }
-
-        return new Manifest( $counts, $checksums );
     }
 
     /**

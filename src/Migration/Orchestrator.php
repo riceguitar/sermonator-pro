@@ -48,6 +48,13 @@ final class Orchestrator {
     /** Lock TTL in seconds: a crashed run's lock self-expires so it cannot wedge. */
     private const LOCK_TTL = 900;
 
+    /**
+     * This caller's per-acquire ownership token, set when WE win the lock and used to
+     * make releaseLock() ownership-checked (so a slow holder that has already been
+     * reclaimed away never deletes its successor's live lock). Null when we hold no lock.
+     */
+    private ?string $lockToken = null;
+
     /** Phase-keys recorded on MigrationState for the precondition gates. */
     private const PHASE_TERMS    = 'terms';
     private const PHASE_ARTWORK  = 'artwork';
@@ -84,18 +91,37 @@ final class Orchestrator {
     /**
      * Run the read-only Detector, persist the manifest (the legacy-shape backup
      * oracle the Verifier/Finalizer compare against), and advance the phase to
-     * 'detected'. Idempotent: re-detecting refreshes the manifest and re-sets the
-     * same phase (a no-op transition).
+     * 'detected'. Idempotent while still at none/detected: re-detecting refreshes the
+     * manifest and re-sets the same phase (a no-op transition).
+     *
+     * ONCE MIGRATION HAS BEGUN (phase advanced past 'detected') re-detect is a SAFE
+     * NO-OP that returns the EXISTING detect-time manifest WITHOUT re-baselining it.
+     * Re-pinning the manifest checksums to current (possibly post-edit) legacy values
+     * would silently defeat the source-fixity drift oracle and let a drifted legacy
+     * record verify clean and be finalized — irreversible loss of the church's true
+     * source. The stored manifest is the immutable fixity oracle; a deliberate
+     * re-detect requires first retreating to 'detected' via Rollback.
      */
     public function detect(): Manifest {
         // Legacy reads must work with the legacy plugin DEACTIVATED.
         LegacySchemaRegistrar::ensureRegistered();
 
+        $phase = $this->state->phase();
+        if ( ! in_array( $phase, array( 'none', 'detected' ), true ) ) {
+            $existing = $this->state->manifest();
+            if ( $existing !== null ) {
+                // Do NOT re-baseline — return the immutable detect-time manifest.
+                return $existing;
+            }
+            // Defensive only: an advanced phase with no stored manifest cannot poison
+            // an oracle that does not exist, so fall through to a fresh detect.
+        }
+
         $manifest = $this->detector->detect();
         $this->state->setManifest( $manifest );
 
         // none → detected. Re-detect from 'detected' is an idempotent no-op.
-        if ( $this->state->phase() === 'none' ) {
+        if ( $phase === 'none' ) {
             $this->state->set( 'detected' );
         }
 
@@ -507,40 +533,108 @@ final class Orchestrator {
 
     /**
      * Acquire the single advisory lock. Returns true if this caller now holds it,
-     * false if another live (non-expired) holder has it. Implemented as an
-     * add_option race-winner with a TTL: only one concurrent add_option for a new
-     * option name succeeds (it is an atomic INSERT), so two racing processes get a
-     * deterministic single winner. An expired lock (older than LOCK_TTL — a crashed
-     * holder) is reclaimable.
+     * false if another live (non-expired) holder has it.
+     *
+     * The lock VALUE is "<timestamp>|<per-acquire-token>": the timestamp drives TTL
+     * expiry, the token makes ownership provable. Acquisition is atomic on BOTH paths:
+     *  - FRESH: add_option is an atomic INSERT, so exactly one of N racing callers
+     *    wins a brand-new lock.
+     *  - EXPIRED RECLAIM (a crashed/overrun holder, older than LOCK_TTL): a
+     *    COMPARE-AND-SWAP — a conditional UPDATE that only matches the exact stale
+     *    value — so exactly ONE concurrent reclaimer wins (affected-rows === 1) and
+     *    every other reclaimer's WHERE no longer matches and loses. A plain
+     *    update_option would let two reclaimers both "win" and insert concurrently;
+     *    the CAS closes that race.
+     * Direct $wpdb reads/writes (uncached) are used for the held value, the CAS, and
+     * the ownership-checked release so a concurrent holder in another process is
+     * always observed; the option cache is busted after each direct write.
      */
     public function acquireLock(): bool {
-        $now = time();
+        global $wpdb;
+
+        $now   = time();
+        $value = $now . '|' . $this->newLockToken();
 
         // Fast path: a fresh, atomic INSERT. add_option returns false if the row
         // already exists, so exactly one of N racing callers wins a brand-new lock.
-        if ( add_option( self::OPTION_LOCK, $now, '', 'no' ) ) {
+        if ( add_option( self::OPTION_LOCK, $value, '', 'no' ) ) {
+            $this->lockToken = $value;
             return true;
         }
 
-        // The lock row exists. Reclaim it ONLY if the prior holder's lock has
-        // expired (a crashed run). Use the DB value, not a cache, so a concurrent
-        // holder in another process is observed.
-        $held = (int) get_option( self::OPTION_LOCK, 0 );
-        if ( $held > 0 && ( $now - $held ) < self::LOCK_TTL ) {
+        // The lock row exists. Read the CURRENT raw value DIRECTLY (uncached) so a
+        // concurrent holder in another process is observed, and decide expiry.
+        $heldRaw = $this->readLockRaw();
+        $heldTs  = $this->lockTimestamp( $heldRaw );
+        if ( $heldRaw !== null && $heldTs > 0 && ( $now - $heldTs ) < self::LOCK_TTL ) {
             return false; // A live holder owns it.
         }
 
-        // Expired (or corrupt) — reclaim by overwriting the timestamp.
-        update_option( self::OPTION_LOCK, $now, 'no' );
-        return true;
+        // Expired (or corrupt). Reclaim via COMPARE-AND-SWAP: only the single racer
+        // whose UPDATE still matches the stale value wins.
+        $reclaimed = (int) $wpdb->query(
+            $wpdb->prepare(
+                "UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+                $value,
+                self::OPTION_LOCK,
+                (string) $heldRaw
+            )
+        );
+        wp_cache_delete( self::OPTION_LOCK, 'options' );
+
+        if ( $reclaimed === 1 ) {
+            $this->lockToken = $value;
+            return true;
+        }
+        return false; // Lost the reclaim race to a concurrent reclaimer.
     }
 
     /**
-     * Release the advisory lock (delete the sentinel row). Safe to call when not
-     * held.
+     * Release the advisory lock — OWNERSHIP-CHECKED. Deletes the sentinel ONLY if it
+     * still carries OUR token, so a slow/overrun holder whose lock was already
+     * reclaimed by a successor no-ops here instead of tearing down the successor's
+     * live lock (which would re-open the concurrency window). Safe to call when not
+     * held (no token → no-op).
      */
     public function releaseLock(): void {
-        delete_option( self::OPTION_LOCK );
+        global $wpdb;
+
+        if ( $this->lockToken === null ) {
+            return; // We never acquired it — never delete another run's lock.
+        }
+
+        $wpdb->query(
+            $wpdb->prepare(
+                "DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value = %s",
+                self::OPTION_LOCK,
+                $this->lockToken
+            )
+        );
+        wp_cache_delete( self::OPTION_LOCK, 'options' );
+        $this->lockToken = null;
+    }
+
+    /** Read the raw lock option value DIRECTLY from the DB (uncached), or null. */
+    private function readLockRaw(): ?string {
+        global $wpdb;
+        $val = $wpdb->get_var(
+            $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", self::OPTION_LOCK )
+        );
+        return $val === null ? null : (string) $val;
+    }
+
+    /** The leading "<timestamp>" component of a "<timestamp>|<token>" lock value. */
+    private function lockTimestamp( ?string $raw ): int {
+        if ( $raw === null || $raw === '' ) {
+            return 0;
+        }
+        $parts = explode( '|', $raw, 2 );
+        return (int) $parts[0];
+    }
+
+    /** A per-process, per-acquire ownership token (more_entropy so two near-simultaneous acquires differ). */
+    private function newLockToken(): string {
+        return uniqid( 'sermonator_lock_', true );
     }
 
     // ---------------------------------------------------------------------------

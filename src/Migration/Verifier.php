@@ -120,19 +120,23 @@ final class Verifier {
             'sermons',
             $m->checksummedLegacyIds(),
             $m->count( 'sermons' ),
-            $m,
+            static fn( int $id ): ?string => $m->checksum( $id ),
             $drift,
             $missing,
             $openFlags,
             $counts
         );
+        // Podcasts are now ALSO manifest-driven + per-id checksummed (symmetric with
+        // sermons): enumerate the detect-time podcast set and fold a content drift into
+        // drift[], so a podcast edited between detect and finalize is caught before the
+        // destructive step deletes the only copy of that edit.
         $this->verifyPostType(
             LegacyIdentifiers::POST_TYPE_PODCAST,
             Identifiers::POST_TYPE_PODCAST,
             'podcasts',
-            $this->legacyPostIds( LegacyIdentifiers::POST_TYPE_PODCAST ),
+            $m->checksummedPodcastLegacyIds(),
             $m->count( 'podcasts' ),
-            $m,
+            static fn( int $id ): ?string => $m->podcastChecksum( $id ),
             $drift,
             $missing,
             $openFlags,
@@ -188,12 +192,13 @@ final class Verifier {
      *    manifest's recorded count → surplus sentinel. This defeats an offsetting
      *    "skip one + duplicate another" that balances a bare count.
      *
-     * @param list<int>          $expectedLegacyIds The manifest's legacy ids for this type.
-     * @param int                $manifestCount     The manifest's recorded count for this type.
-     * @param array<string,int>  $counts
-     * @param list<int>          $drift
-     * @param list<int>          $missing
-     * @param list<string>       $openFlags
+     * @param list<int>             $expectedLegacyIds The manifest's legacy ids for this type.
+     * @param int                   $manifestCount     The manifest's recorded count for this type.
+     * @param callable(int):?string $checksumOf        Resolver for the detect-time checksum of a legacy id (sermon or podcast map).
+     * @param array<string,int>     $counts
+     * @param list<int>             $drift
+     * @param list<int>             $missing
+     * @param list<string>          $openFlags
      */
     private function verifyPostType(
         string $legacyType,
@@ -201,7 +206,7 @@ final class Verifier {
         string $countKey,
         array $expectedLegacyIds,
         int $manifestCount,
-        Manifest $m,
+        callable $checksumOf,
         array &$drift,
         array &$missing,
         array &$openFlags,
@@ -214,7 +219,7 @@ final class Verifier {
 
         foreach ( array_keys( $expectedSet ) as $legacyId ) {
             // (1) Source-fixity drift — only for ids the manifest checksummed.
-            $expected = $m->checksum( $legacyId );
+            $expected = $checksumOf( $legacyId );
             if ( $expected !== null && LegacyChecksum::forPost( $legacyId ) !== $expected ) {
                 $drift[] = $legacyId;
             }

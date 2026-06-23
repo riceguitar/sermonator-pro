@@ -56,11 +56,16 @@ final class MigrationState {
      *  - the same phase (idempotent no-op);
      *  - migrated → detected ONLY when $rollback === true (the Rollback retreat);
      *  - migrating → detected ONLY when $rollback === true (the Rollback retreat
-     *    after a real mid-batch crash that left the phase at 'migrating').
+     *    after a real mid-batch crash that left the phase at 'migrating');
+     *  - verified → detected ONLY when $rollback === true (the Rollback retreat from
+     *    the normal pre-finalize review state — legacy is still byte-intact at
+     *    'verified', so a review-then-reject rollback is fully reversible and must
+     *    return the lifecycle to 'detected' for a corrected re-migration).
      *
      * Any other transition (a multi-step skip such as detected → finalized, an
      * unflagged backward move, or a flagged retreat from anything other than
-     * migrating/migrated) throws and leaves the persisted phase unchanged.
+     * migrating/migrated/verified — notably the irreversible finalized) throws and
+     * leaves the persisted phase unchanged.
      *
      * @throws \InvalidArgumentException on an unknown or illegal transition.
      */
@@ -79,20 +84,23 @@ final class MigrationState {
         }
 
         if ( $rollback ) {
-            // The ONLY sanctioned retreats, both to 'detected' so a corrected
+            // The ONLY sanctioned retreats, all to 'detected' so a corrected
             // migration can re-run:
             //  - migrated → detected:  a completed-but-unverified migration;
             //  - migrating → detected: a migration that crashed mid-batch (the phase
             //    never reached 'migrated'). Rollback still cleans up the partial
-            //    records + un-stamped orphans and must return the lifecycle here.
-            // Never from verified (would silently undo verification) nor from
-            // finalized (irreversible).
-            if ( in_array( $current, array( 'migrated', 'migrating' ), true ) && $phase === 'detected' ) {
+            //    records + un-stamped orphans and must return the lifecycle here;
+            //  - verified → detected:  a review-then-reject before the point of no
+            //    return. Legacy is still byte-intact at 'verified' (Finalize has not
+            //    run), so this is fully reversible and Rollback must NOT leave the
+            //    phase stuck at 'verified' over now-deleted migrated data.
+            // Never from finalized (irreversible — Finalize already deleted legacy).
+            if ( in_array( $current, array( 'migrated', 'migrating', 'verified' ), true ) && $phase === 'detected' ) {
                 $this->persistPhase( $data, $phase );
                 return;
             }
             throw new \InvalidArgumentException(
-                sprintf( 'Illegal rollback transition "%s" → "%s" (only migrating/migrated → detected is allowed).', $current, $phase )
+                sprintf( 'Illegal rollback transition "%s" → "%s" (only migrating/migrated/verified → detected is allowed).', $current, $phase )
             );
         }
 
@@ -168,9 +176,29 @@ final class MigrationState {
 
     /**
      * Capture the detect-time manifest (the legacy-shape oracle).
+     *
+     * WRITE-ONCE w.r.t. lifecycle. The manifest is the IMMUTABLE detect-time fixity
+     * snapshot the drift oracle compares the live legacy source against. It may be
+     * (re)captured only while the migration has not yet begun (phase ∈ {none,
+     * detected}); once work has started, overwriting it would re-pin checksums to
+     * current (possibly post-edit) values, silently destroying the drift oracle and
+     * letting a drifted legacy record verify clean and be finalized (irreversible
+     * loss of the church's true source). So we refuse the overwrite in any later
+     * phase. (A deliberate re-detect requires first retreating to 'detected' via
+     * Rollback.)
+     *
+     * @throws \InvalidArgumentException when the migration has advanced past 'detected'.
      */
     public function setManifest( Manifest $m ): void {
-        $data             = $this->load();
+        $data = $this->load();
+        if ( ! in_array( $data['phase'], array( 'none', 'detected' ), true ) ) {
+            throw new \InvalidArgumentException(
+                sprintf(
+                    'Refusing to overwrite the detect-time manifest in phase "%s" — it is the immutable fixity oracle (re-detect only after a rollback to "detected").',
+                    $data['phase']
+                )
+            );
+        }
         $data['manifest'] = $m->toArray();
         $this->save( $data );
     }
@@ -222,7 +250,7 @@ final class MigrationState {
      *   phase: string,
      *   records: array<string,array{state:string,newId:int|null,flags:list<string>}>,
      *   phaseComplete: array<string,bool>,
-     *   manifest?: array{counts: array<string,int>, checksums: array<int,string>}
+     *   manifest?: array{counts: array<string,int>, checksums: array<int,string>, podcastChecksums?: array<int,string>}
      * }
      */
     private function load(): array {

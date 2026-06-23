@@ -253,6 +253,79 @@ final class CliTest extends WP_UnitTestCase {
         }
     }
 
+    /**
+     * finalize PRINTS the exact blast radius (legacy post ids + option names) BEFORE
+     * the confirm gate — mirroring rollback (B2b review cli-wiring-0: the most dangerous
+     * command must not show less than the reversible one).
+     */
+    public function test_finalize_prints_blast_radius_before_confirm(): void {
+        $seed = $this->seedDataset();
+
+        $cmd = new MigrationCommand();
+        $cmd->detect( array(), array() );
+        $cmd->migrate( array(), array( 'batch-size' => 50 ) );
+        $cmd->verify( array(), array() );
+        $this->assertSame( 'verified', ( new MigrationState() )->phase() );
+
+        $expected = ( new Finalizer() )->pendingDeletions();
+        $this->assertNotEmpty( $expected['posts'], 'Setup must have verified counterparts to finalize.' );
+
+        \Sermonator\Tests\Integration\Support\WpCliShim::reset();
+        $cmd->finalize( array(), array() ); // no --yes — must print the blast radius, delete nothing
+
+        $log = \Sermonator\Tests\Integration\Support\WpCliShim::output();
+        foreach ( $expected['posts'] as $pid ) {
+            $this->assertStringContainsString( (string) $pid, $log,
+                'Finalize must print each pending legacy post id BEFORE the confirm gate.' );
+        }
+        $this->assertStringContainsString( 'sermonmanager_general', $log,
+            'Finalize must print the legacy option names it would delete.' );
+
+        // The preview path deleted nothing.
+        $this->assertSame( 'verified', ( new MigrationState() )->phase() );
+        foreach ( $seed['sermons'] as $sid ) {
+            $this->assertInstanceOf( \WP_Post::class, get_post( $sid ) );
+        }
+    }
+
+    /**
+     * migrate STOPS on a genuinely-stuck blocking phase (a persistent failure flag with
+     * no forward progress) instead of spinning to the iteration cap (B2b review
+     * cli-wiring-2). A forced legacy-taxonomy read failure keeps the terms phase
+     * permanently incomplete; the loop must surface a stuck warning and stop quickly.
+     */
+    public function test_migrate_stops_on_a_genuinely_stuck_blocking_phase(): void {
+        $this->seedDataset();
+
+        $cmd = new MigrationCommand();
+        $cmd->detect( array(), array() );
+
+        // Force a PERSISTENT blocking failure: make get_terms return a WP_Error for a
+        // sermon-referenced legacy taxonomy, so the terms gate can never close and run()
+        // keeps returning the same blocking flag at a flat progress signature.
+        $boom = static function ( $terms, $taxonomies ) {
+            if ( in_array( LegacyIdentifiers::TAX_PREACHER, (array) $taxonomies, true ) ) {
+                return new \WP_Error( 'forced', 'forced taxonomy read failure' );
+            }
+            return $terms;
+        };
+        add_filter( 'get_terms', $boom, 10, 2 );
+        try {
+            \Sermonator\Tests\Integration\Support\WpCliShim::reset();
+            $cmd->migrate( array(), array( 'batch-size' => 50 ) );
+        } finally {
+            remove_filter( 'get_terms', $boom, 10 );
+        }
+
+        // The loop STOPPED (did not reach migrated, did not spin to the cap) and surfaced
+        // a stuck warning naming the unresolved blocking issue.
+        $this->assertNotSame( 'migrated', ( new MigrationState() )->phase(),
+            'A genuinely-stuck blocking phase must not reach migrated.' );
+        $log = \Sermonator\Tests\Integration\Support\WpCliShim::output();
+        $this->assertStringContainsString( 'stuck', $log,
+            'migrate must surface a stuck warning and stop, not loop to the iteration cap.' );
+    }
+
     // -------------------------------------------------------------------------
     // Advisory-lock contention — destructive commands acquire the SAME single lock
     // (design-notes item 20: "destructive commands ... same advisory lock") so they

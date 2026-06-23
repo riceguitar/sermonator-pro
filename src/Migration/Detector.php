@@ -32,8 +32,9 @@ final class Detector {
         // return empty over rows that still exist. No-op when the plugin is active.
         LegacySchemaRegistrar::ensureRegistered();
 
-        $counts    = array();
-        $checksums = array();
+        $counts           = array();
+        $checksums        = array();
+        $podcastChecksums = array();
 
         // Sermons + per-sermon checksum.
         $ids = get_posts( array(
@@ -53,13 +54,20 @@ final class Detector {
             $counts[ 'terms_' . $taxonomy ] = is_array( $terms ) ? count( $terms ) : 0;
         }
 
-        // Podcasts.
-        $counts['podcasts'] = count( get_posts( array(
+        // Podcasts + per-podcast checksum (a podcast carries full post_content/meta
+        // copied forward, so it needs the SAME source-fixity oracle as a sermon — a
+        // post-detect edit must be caught before Finalize force-deletes the legacy
+        // podcast, the only place that edit exists).
+        $podcastIds = get_posts( array(
             'post_type'      => LegacyIdentifiers::POST_TYPE_PODCAST,
             'post_status'    => 'any',
             'posts_per_page' => -1,
             'fields'         => 'ids',
-        ) ) );
+        ) );
+        $counts['podcasts'] = count( $podcastIds );
+        foreach ( $podcastIds as $id ) {
+            $podcastChecksums[ (int) $id ] = LegacyChecksum::forPost( (int) $id );
+        }
 
         // Settings options present (sermonmanager_*).
         $counts['options'] = $this->countLegacyOptions();
@@ -68,7 +76,7 @@ final class Detector {
         $artwork = get_option( LegacyIdentifiers::OPTION_TERM_IMAGES, array() );
         $counts['artwork'] = is_array( $artwork ) ? count( $artwork ) : 0;
 
-        return new Manifest( $counts, $checksums );
+        return new Manifest( $counts, $checksums, $podcastChecksums );
     }
 
     private function sermonChecksum( int $id ): string {

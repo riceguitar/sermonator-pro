@@ -14,8 +14,9 @@ use Sermonator\Schema\Identifiers;
  * swept partial-orphan sermonator posts + comments enumerated via LEGACY_COMMENT_ID
  * + migration-made terms — and restores any native options the migration overwrote
  * from OPTION_PRE_MIGRATION_BACKUP. Legacy wpfc_ / sermonmanager_ data is left
- * byte-for-byte unchanged. After a run the state retreats to detected (from either
- * migrating — a mid-batch crash — or migrated) and ZERO records carry any back-ref.
+ * byte-for-byte unchanged. After a run the state retreats to detected (from any
+ * reversible pre-finalize phase — migrating after a mid-batch crash, migrated, or
+ * verified after a review-then-reject) and ZERO records carry any back-ref.
  *
  * THE HARD CONSTRAINT (B2a fix-10 — shared-taxonomy counts).
  * SermonWriter::mirrorNativeTaxonomies inserts NATIVE (category/post_tag/custom)
@@ -175,15 +176,22 @@ final class Rollback {
         delete_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
 
         // Retreat the lifecycle phase to detected (the only sanctioned backward move)
-        // so a corrected re-migration can proceed. This must fire from BOTH:
-        //  - 'migrated'  — a complete-but-unverified migration, and
+        // so a corrected re-migration can proceed. This must fire from ALL three
+        // reversible pre-finalize phases:
+        //  - 'migrated'  — a complete-but-unverified migration;
         //  - 'migrating' — a migration that crashed mid-batch (the contract's
         //    unconditional postcondition is "After run, state → detected"; leaving it
         //    stuck at 'migrating' after deleting posts + sweeping orphans would
-        //    violate that). A no-op when the phase is already at/below detected (e.g.
-        //    an idempotent second run, or a finalized refusal handled above).
+        //    violate that);
+        //  - 'verified'  — a review-then-reject before the point of no return. Legacy
+        //    is still byte-intact (Finalize has not run), so rollback is correctly
+        //    allowed here and MUST retreat the phase too — otherwise the lifecycle
+        //    would be wedged at 'verified' over now-deleted migrated data, with no
+        //    forward path (Orchestrator::run no-ops at 'verified') and no re-migrate.
+        // A no-op when the phase is already at/below detected (an idempotent second
+        // run) or 'finalized' (refused above — irreversible).
         $phase = $this->state->phase();
-        if ( $phase === 'migrated' || $phase === 'migrating' ) {
+        if ( in_array( $phase, array( 'migrated', 'migrating', 'verified' ), true ) ) {
             $this->state->set( 'detected', true );
         }
         // Reset per-record progress so a re-migration starts clean (no stale

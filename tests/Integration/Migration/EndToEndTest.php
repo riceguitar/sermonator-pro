@@ -844,4 +844,138 @@ final class EndToEndTest extends WP_UnitTestCase {
         $this->assertEquals( $before, $this->legacySnapshot(),
             'Legacy data must be byte-equal after a crash + resume.' );
     }
+
+    // -------------------------------------------------------------------------
+    // 7) Drift oracle covers PODCASTS too (B2b review legacy-immutability-0)
+    // -------------------------------------------------------------------------
+
+    public function test_drift_oracle_catches_post_detect_legacy_podcast_edit(): void {
+        // A podcast carries full post_content copied forward, so a post-detect edit to
+        // the legacy podcast must be caught as drift — otherwise Finalize would
+        // force-delete the only copy of that edit. Podcasts are now checksummed at
+        // detect (symmetric with sermons), so this edit lands in drift[].
+        $data = $this->seedRichDataset();
+
+        $orch     = new Orchestrator();
+        $manifest = $orch->detect();
+
+        // Edit the legacy podcast body AFTER detect but before finalize.
+        wp_update_post( array(
+            'ID'           => $data['podcast'],
+            'post_content' => '<p>Feed body EDITED after detect.</p>',
+        ) );
+
+        $guard = 0;
+        do {
+            $progress = $orch->run( 50 );
+            $guard++;
+        } while ( $progress['phase'] !== 'migrated' && $guard < 200 );
+        $this->assertSame( 'migrated', ( new MigrationState() )->phase() );
+
+        $report = ( new Verifier() )->verify( $manifest );
+        $this->assertNotEmpty( $report->drift, 'A post-detect legacy PODCAST edit must surface as drift.' );
+        $this->assertContains( $data['podcast'], $report->drift,
+            'The drifted legacy podcast id must be flagged.' );
+        $this->assertFalse( $report->complete, 'Podcast drift must withhold completeness.' );
+        $this->assertNotSame( 'verified', ( new MigrationState() )->phase(),
+            'State must NOT advance to verified while podcast drift is open.' );
+
+        // And Finalize must refuse (GATE-2 fresh rescan also sees the podcast drift),
+        // so the edited legacy podcast is NOT force-deleted.
+        $result = ( new Finalizer() )->run( true );
+        $this->assertIsString( $result['refused'], 'Finalize must refuse while podcast drift is open.' );
+        $this->assertNotNull( get_post( $data['podcast'] ), 'The edited legacy podcast must NOT be deleted.' );
+    }
+
+    // -------------------------------------------------------------------------
+    // 8) Re-detect after migration does NOT re-baseline the fixity oracle
+    //    (B2b review verifier-soundness-0)
+    // -------------------------------------------------------------------------
+
+    public function test_redetect_after_migrate_does_not_poison_the_drift_oracle(): void {
+        // Re-running detect() after migration must NOT overwrite the detect-time
+        // manifest — otherwise it would re-pin checksums to post-edit values, silently
+        // defeating the drift oracle and letting a drifted legacy record verify clean
+        // and be finalized (irreversible loss of the church's true source).
+        $data = $this->seedRichDataset();
+
+        $orch     = new Orchestrator();
+        $manifest = $orch->detect();
+
+        // Edit a legacy sermon AFTER detect (drift the source from the manifest).
+        update_post_meta( $data['sermons'][0], LegacyIdentifiers::META_BIBLE_PASSAGE, 'Romans 8:28 (edited after detect)' );
+
+        $guard = 0;
+        do {
+            $progress = $orch->run( 50 );
+            $guard++;
+        } while ( $progress['phase'] !== 'migrated' && $guard < 200 );
+        $this->assertSame( 'migrated', ( new MigrationState() )->phase() );
+
+        // The attack: re-run detect() at the 'migrated' phase. It must be a SAFE no-op
+        // that returns the immutable detect-time manifest unchanged — never re-baseline.
+        $reManifest = $orch->detect();
+        $this->assertSame(
+            $manifest->checksum( $data['sermons'][0] ),
+            $reManifest->checksum( $data['sermons'][0] ),
+            'Re-detect must NOT re-pin the checksum to the post-edit value.'
+        );
+
+        // Verify against the (still-immutable) stored manifest → drift STILL caught.
+        $report = ( new Verifier() )->verify( ( new MigrationState() )->manifest() );
+        $this->assertContains( $data['sermons'][0], $report->drift,
+            'Drift must still be caught after a post-migration re-detect.' );
+        $this->assertFalse( $report->complete, 'A re-detect must not be able to manufacture a false GREEN.' );
+        $this->assertNotSame( 'verified', ( new MigrationState() )->phase() );
+
+        // Finalize must refuse — the drifted legacy sermon is NOT deleted.
+        $result = ( new Finalizer() )->run( true );
+        $this->assertIsString( $result['refused'] );
+        $this->assertNotNull( get_post( $data['sermons'][0] ),
+            'The drifted legacy sermon must NOT be force-deleted.' );
+    }
+
+    // -------------------------------------------------------------------------
+    // 9) Rollback from the 'verified' phase retreats to detected (B2b review
+    //    rollback-correctness-0) — no wedge, re-migrate works, legacy intact
+    // -------------------------------------------------------------------------
+
+    public function test_rollback_from_verified_phase_retreats_and_re_migrates(): void {
+        $data   = $this->seedRichDataset();
+        $before = $this->legacySnapshot();
+
+        $this->migrateToCompletion();
+
+        // Reach the normal pre-finalize review state.
+        $report = ( new Verifier() )->verify( ( new MigrationState() )->manifest() );
+        $this->assertTrue( $report->complete );
+        $this->assertSame( 'verified', ( new MigrationState() )->phase() );
+
+        // A legitimate review-then-reject: rollback BEFORE finalizing. It must NOT refuse
+        // (legacy is byte-intact at 'verified') and MUST retreat the phase to 'detected'.
+        $result = ( new Rollback() )->run();
+        $this->assertSame( array(), $result['warnings'], 'Rollback from verified must not refuse or warn.' );
+        $this->assertSame( 'detected', ( new MigrationState() )->phase(),
+            'Rollback from verified must retreat the lifecycle to detected (no wedge).' );
+
+        // Zero migrated data + legacy byte-equal (pristine), exactly like other rollbacks.
+        $this->assertSame( 0, $this->countBackRef( Crosswalk::LEGACY_POST_ID ) );
+        $this->assertSame( array(), Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON ) );
+        $this->assertEquals( $before, $this->legacySnapshot(),
+            'Legacy data must be byte-equal (pristine) after a rollback from verified.' );
+
+        // And a fresh full migrate after the verified-phase rollback succeeds again.
+        $orch = new Orchestrator();
+        $orch->detect();
+        $guard = 0;
+        do {
+            $progress = $orch->run( 50 );
+            $guard++;
+        } while ( $progress['phase'] !== 'migrated' && $guard < 200 );
+        $this->assertSame( 'migrated', ( new MigrationState() )->phase(),
+            'A re-migrate after a verified-phase rollback must reach migrated again.' );
+        $this->assertNotNull(
+            Crosswalk::findNewByLegacyId( $data['sermons'][0], Identifiers::POST_TYPE_SERMON ),
+            'The re-migrate must produce a fresh counterpart.' );
+    }
 }

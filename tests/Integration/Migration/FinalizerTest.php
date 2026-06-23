@@ -481,11 +481,11 @@ final class FinalizerTest extends WP_UnitTestCase {
         }
         $this->assertTrue( $thrown, 'The injected mid-finalize abort must have fired.' );
 
-        // Partial state: phase has NOT advanced to 'finalized' yet (that is the last
-        // step, after the whole loop). It must NOT have retreated either — it is still
-        // 'verified', so GATE 1 still passes on the resume.
-        $this->assertSame( 'verified', ( new MigrationState() )->phase(),
-            'Phase must still be verified after a mid-loop abort (finalized is set last).' );
+        // Committed state: the gates passed, so the phase advanced to 'finalized' BEFORE
+        // the destructive drain (the commit point). A crash mid-drain therefore leaves
+        // the phase at 'finalized'; the resume re-enters the idempotent drain directly.
+        $this->assertSame( 'finalized', ( new MigrationState() )->phase(),
+            'Phase must be finalized after the commit point, even on a mid-drain abort.' );
 
         // Resume: a fresh run() must COMPLETE — not refuse forever — even though the
         // first legacy id was already marked finalized (and its back-ref counterpart
@@ -520,6 +520,79 @@ final class FinalizerTest extends WP_UnitTestCase {
             'A resumed finalize must reach the finalized terminal phase.' );
     }
 
+    public function test_finalize_resumes_after_abort_mid_OPTION_delete_loop(): void {
+        // B2b review (critical finalize-correctness-0 / data-loss-0): the option-delete
+        // loop + native recount run AFTER the legacy posts are deleted but BEFORE
+        // state→finalized. An abort there must NOT wedge the migration into a permanent
+        // "options shortfall" refusal, and the deferred native recount must still settle.
+        $data = $this->seedDataset();
+        $this->migrateAndVerify();
+
+        $nativeCountBefore = $this->sharedCategoryCountFresh( $data['nativeCatTtId'] );
+        $migratedSermons   = Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON );
+        $this->assertNotEmpty( $migratedSermons );
+
+        // Inject a REAL abort during the OPTION-delete loop: throw when the first legacy
+        // option is being deleted. The `delete_option` action fires inside delete_option
+        // BEFORE the row is removed, so the throw lands after step-1 (posts) is fully done
+        // and the option was MARKED finalized (mark precedes delete) but not yet removed.
+        $thrown = false;
+        $boom   = static function ( $optionName ) {
+            if ( $optionName === 'sermonmanager_general' ) {
+                throw new \RuntimeException( 'injected abort mid finalize OPTION loop @ ' . $optionName );
+            }
+        };
+        add_action( 'delete_option', $boom, 10, 1 );
+        try {
+            ( new Finalizer() )->run( true );
+        } catch ( \RuntimeException $e ) {
+            $thrown = true;
+        } finally {
+            remove_action( 'delete_option', $boom, 10 );
+        }
+        $this->assertTrue( $thrown, 'The injected mid-option-loop abort must have fired.' );
+
+        // Committed: phase advanced to 'finalized' at the commit point (before the
+        // drain), so a crash in the option loop leaves it 'finalized' and the resume
+        // re-enters the idempotent drain directly (no GATE-2 re-run on a half-deleted DB).
+        $this->assertSame( 'finalized', ( new MigrationState() )->phase(),
+            'Phase must be finalized after the commit point, even on a mid-option-loop abort.' );
+
+        // The anti-wedge guarantee: a resumed finalize must COMPLETE, not refuse forever
+        // — even though some legacy options were already deleted and the option-count
+        // guard would otherwise see a shortfall against the un-reduced manifest.
+        $result = ( new Finalizer() )->run( true );
+        $this->assertNull( $result['refused'],
+            'A resumed finalize must complete, not refuse forever, after a partial OPTION-loop abort.' );
+
+        // All verified legacy posts + the migrated legacy option are gone.
+        foreach ( $data['sermons'] as $legacyId ) {
+            $this->assertNull( get_post( $legacyId ), "Legacy sermon {$legacyId} must be deleted after resume." );
+        }
+        $this->assertFalse( get_option( 'sermonmanager_general', false ),
+            'The migrated legacy option must be deleted after the resumed finalize.' );
+
+        // The deferred native shared count must STILL have been recounted (step 3 runs on
+        // the resumed completion, not skipped because the rescan wedged).
+        $stored = $this->sharedCategoryCountFresh( $data['nativeCatTtId'] );
+        wp_update_term_count_now( array( $data['nativeCatTtId'] ), 'category' );
+        $authoritative = $this->sharedCategoryCountFresh( $data['nativeCatTtId'] );
+        $this->assertSame( $authoritative, $stored,
+            'Native shared count must be settled to its authoritative value on the resumed finalize (recount not skipped).' );
+        $this->assertSame( $nativeCountBefore, $authoritative,
+            'The shared native count must equal its true pre-finalize value (legacy post deletion does not change a category count over a non-countable post type).' );
+
+        $this->assertSame( 'finalized', ( new MigrationState() )->phase(),
+            'A resumed finalize must reach the finalized terminal phase.' );
+    }
+
+    private function sharedCategoryCountFresh( int $ttId ): int {
+        global $wpdb;
+        return (int) $wpdb->get_var(
+            $wpdb->prepare( "SELECT count FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id = %d", $ttId )
+        );
+    }
+
     public function test_finalize_is_idempotent_on_resume_no_double_delete(): void {
         $data = $this->seedDataset();
         $this->migrateAndVerify();
@@ -530,11 +603,13 @@ final class FinalizerTest extends WP_UnitTestCase {
         $deletedPosts = $first['deleted']['posts'];
         $this->assertNotEmpty( $deletedPosts );
 
-        // A second run on the finalized phase must REFUSE (GATE 1), deleting nothing
-        // more — the terminal phase is the natural idempotency stop.
+        // A second run on the finalized phase re-enters the IDEMPOTENT drain (not a
+        // refusal): everything is already deleted, so it is a harmless no-op that
+        // deletes nothing more and leaves the terminal phase intact.
         $second = ( new Finalizer() )->run( true );
-        $this->assertIsString( $second['refused'], 'A second finalize on the finalized phase must refuse.' );
-        $this->assertSame( array(), $second['deleted']['posts'] );
+        $this->assertNull( $second['refused'], 'A second finalize on the finalized phase is an idempotent no-op drain.' );
+        $this->assertSame( array(), $second['deleted']['posts'], 'Nothing more is deleted on the idempotent re-run.' );
+        $this->assertSame( array(), $second['deleted']['options'] );
         $this->assertSame( 0, $second['stripped'] );
         $this->assertSame( 'finalized', ( new MigrationState() )->phase() );
     }
