@@ -39,16 +39,43 @@ final class SermonWriter {
 
     public function write( int $legacyId ): WriteResult {
         // --- Idempotency gate (status-agnostic, authoritative via back-ref) ---
+        //
+        // Three observably-distinct outcomes (see WriteResult):
+        //   1. no back-ref            -> insert a fresh post (created=true)
+        //   2. back-ref + COMPLETE    -> skip (created=false, resumed=false): a
+        //                                 no-op here; self-healing steps in later
+        //                                 tasks may still re-run, but never a
+        //                                 second insert.
+        //   3. back-ref but NOT done  -> resume (created=false, resumed=true):
+        //                                 re-enter the post-insert / self-healing
+        //                                 block on the EXISTING post id; never a
+        //                                 second insert.
         $existing = Crosswalk::findNewByLegacyId( $legacyId, Identifiers::POST_TYPE_SERMON );
         if ( null !== $existing ) {
             if ( $this->isComplete( $existing ) ) {
-                // Completed already — skip insert; self-healing steps (Task 14)
-                // may still re-run, but no second post is created.
-                return new WriteResult( $existing, false, $this->readFlags( $existing ) );
+                // COMPLETE — skip; do NOT touch the post (already self-healed).
+                return new WriteResult( $existing, false, $this->readFlags( $existing ), false );
             }
 
-            // Stamped but PARTIAL — resume on the existing post (do not insert).
-            return new WriteResult( $existing, false, $this->readFlags( $existing ) );
+            // Stamped but PARTIAL — RESUME on the existing post (never insert).
+            // Re-enter the same back-ref-first / self-healing block we run after a
+            // fresh insert, idempotently re-driving it on $existing. Tasks 13/14
+            // extend this resume path (meta/terms/comments) without retrofitting
+            // the gate: they hook the post-insert block, which the resume branch
+            // already routes through.
+            $legacyForResume = get_post( $legacyId );
+            if ( ! $legacyForResume instanceof \WP_Post ) {
+                // Legacy source vanished after a partial stamp — surface, do not crash.
+                return new WriteResult( $existing, false, $this->readFlags( $existing ), false );
+            }
+
+            // Seed from the persisted flags so replace-semantics on writeFlags()
+            // never drops a prior flag (e.g. post_parent_unresolved) that this
+            // resume pass does not re-derive.
+            $reconciledForResume = $this->reconcileBody( $legacyId, $legacyForResume );
+            $flags               = $this->applyPostInsertSpine( $existing, $legacyId, $legacyForResume, $reconciledForResume, $this->readFlags( $existing ) );
+
+            return new WriteResult( $existing, false, $flags, true );
         }
 
         // --- Insert a fresh post ---
@@ -61,13 +88,7 @@ final class SermonWriter {
         $flags = array();
 
         // Body reconciliation from (post_content, sermon_description, post_content_temp).
-        $description     = $this->readSingleMeta( $legacyId, LegacyIdentifiers::META_DESCRIPTION );
-        $postContentTemp = $this->readSingleMeta( $legacyId, LegacyIdentifiers::META_POST_CONTENT_TEMP );
-        $reconciled      = PostContentReconciler::reconcile(
-            (string) $legacy->post_content,
-            $description,
-            $postContentTemp
-        );
+        $reconciled = $this->reconcileBody( $legacyId, $legacy );
 
         // post_parent translation: a non-zero legacy parent is translated through
         // the crosswalk; an untranslatable parent collapses to 0 + a flag (never a
@@ -105,12 +126,60 @@ final class SermonWriter {
             return new WriteResult( 0, false, array( 'insert_failed:' . $legacyId ) );
         }
 
-        // --- Crash-safety spine: back-ref FIRST, immediately after insert. ---
+        // --- Crash-safety spine: back-ref FIRST, then idempotent self-healing. ---
+        $flags = $this->applyPostInsertSpine( $newId, $legacyId, $legacy, $reconciled, $flags );
+
+        // NOTE: MIGRATION_COMPLETE is intentionally NOT written here (Task 14).
+
+        return new WriteResult( $newId, true, $flags );
+    }
+
+    /**
+     * Reconcile the body from (post_content, sermon_description, post_content_temp),
+     * reading the two companion meta rows READ-ONLY.
+     *
+     * @return array{content: string, backup: ?string, flag: bool}
+     */
+    private function reconcileBody( int $legacyId, \WP_Post $legacy ): array {
+        $description     = $this->readSingleMeta( $legacyId, LegacyIdentifiers::META_DESCRIPTION );
+        $postContentTemp = $this->readSingleMeta( $legacyId, LegacyIdentifiers::META_POST_CONTENT_TEMP );
+
+        return PostContentReconciler::reconcile(
+            (string) $legacy->post_content,
+            $description,
+            $postContentTemp
+        );
+    }
+
+    /**
+     * The crash-safety spine + idempotent self-healing, applied to a new post id
+     * whether it was just inserted OR is being resumed (re-entered on a stamped-
+     * but-partial post). Every write here is single-row / unique, so re-driving it
+     * on an existing post produces zero duplicate meta rows.
+     *
+     *  - back-ref FIRST (markLegacy uses unique=true: a no-op if already stamped);
+     *  - preserve the reconciler's backup body into LEGACY_POST_CONTENT (unique);
+     *  - record LEGACY_SLUG + a slug_changed flag on drift (unique);
+     *  - persist the canonical MIGRATION_FLAGS row (replace semantics).
+     *
+     * Tasks 13/14 extend THIS block (meta/terms/comments) so both the fresh-insert
+     * and the resume path drive the same steps forward.
+     *
+     * @param array{content: string, backup: ?string, flag: bool} $reconciled
+     * @param list<string>                                         $flags
+     * @return list<string>
+     */
+    private function applyPostInsertSpine( int $newId, int $legacyId, \WP_Post $legacy, array $reconciled, array $flags = array() ): array {
+        // Back-ref FIRST, immediately after insert (unique → idempotent on resume).
         Crosswalk::markLegacy( $newId, $legacyId );
 
-        // Preserve any substantive old body the reconciler routed to backup.
+        // Preserve any substantive old body the reconciler routed to backup. The
+        // unique=true guard means a resume re-entry never adds a duplicate row;
+        // re-derive the flag from the persisted row so a resume reports it too.
         if ( null !== $reconciled['backup'] ) {
             add_post_meta( $newId, Crosswalk::LEGACY_POST_CONTENT, $reconciled['backup'], true );
+        }
+        if ( '' !== (string) get_post_meta( $newId, Crosswalk::LEGACY_POST_CONTENT, true ) ) {
             $flags[] = 'post_content_preserved';
         }
 
@@ -127,9 +196,7 @@ final class SermonWriter {
 
         $this->writeFlags( $newId, $flags );
 
-        // NOTE: MIGRATION_COMPLETE is intentionally NOT written here (Task 14).
-
-        return new WriteResult( $newId, true, $flags );
+        return array_values( array_unique( $flags ) );
     }
 
     /**

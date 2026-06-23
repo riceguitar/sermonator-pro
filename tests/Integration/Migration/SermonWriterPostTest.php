@@ -133,6 +133,133 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertContains( 'post_content_preserved', $result->flags );
     }
 
+    public function test_iframe_in_description_survives_kses_into_reconciled_post_content(): void {
+        // The structural HTML lives in the sermon_description meta itself, so the
+        // reconciler routes it to post_content (NOT the backup). If KSES were left
+        // ON around wp_insert_post, WordPress would strip the <iframe> from
+        // post_content. This proves kses_remove_filters()/kses_init_filters()
+        // around the insert is genuinely load-bearing for the reconciled body.
+        $desc = '<p>Watch the stream:</p><iframe src="https://player.example/embed/99" allowfullscreen></iframe>[audio src="https://x/b.mp3"]';
+
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'Iframe In Description',
+            'post_status'  => 'publish',
+            'post_content' => '',
+        ) );
+        // Slash the seed so the iframe lands in the meta verbatim (add_post_meta
+        // unslashes), mirroring how real legacy data is stored.
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, wp_slash( $desc ) );
+        $this->assertSame(
+            $desc,
+            get_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, true ),
+            'fixture seed sanity: iframe present in legacy description verbatim'
+        );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        // The reconciled body (from the description) must keep the iframe and the
+        // shortcode verbatim in the ACTUAL post_content column — only possible if
+        // KSES was disabled around wp_insert_post.
+        $new = get_post( $result->newId );
+        $this->assertSame( $desc, $new->post_content );
+        $this->assertStringContainsString( '<iframe', $new->post_content );
+        $this->assertStringContainsString( 'allowfullscreen', $new->post_content );
+        $this->assertStringContainsString( '[audio', $new->post_content );
+
+        // The description (now post_content) was NOT routed to the backup.
+        $this->assertSame( '', (string) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_CONTENT, true ) );
+    }
+
+    public function test_complete_record_is_skipped_not_resumed(): void {
+        // A back-ref + MIGRATION_COMPLETE record is a no-op skip: created=false
+        // AND resumed=false. This is the COMPLETE leg of the idempotency gate,
+        // observably distinct from the partial (resume) leg below.
+        $legacyId = $this->fixture->createSermon();
+
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+        $this->assertTrue( $first->created );
+        $this->assertFalse( $first->resumed );
+
+        // Simulate Task 14 stamping COMPLETE at the true end of write().
+        update_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, '1' );
+
+        $second = $writer->write( $legacyId );
+        $this->assertFalse( $second->created );
+        $this->assertFalse( $second->resumed, 'A completed record must be skipped, not resumed.' );
+        $this->assertSame( $first->newId, $second->newId );
+    }
+
+    public function test_partial_record_is_resumed_not_skipped(): void {
+        // A back-ref present but MIGRATION_COMPLETE absent is the PARTIAL leg:
+        // created=false AND resumed=true. The resume re-enters the post-insert
+        // self-healing block on the SAME post (no duplicate, no second insert).
+        $legacyId = $this->fixture->createSermon();
+
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+        $this->assertTrue( $first->created );
+
+        $this->assertSame(
+            '',
+            (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'precondition: post is stamped but partial'
+        );
+
+        $second = $writer->write( $legacyId );
+        $this->assertFalse( $second->created );
+        $this->assertTrue( $second->resumed, 'A stamped-but-partial record must be resumed.' );
+        $this->assertSame( $first->newId, $second->newId );
+
+        // Resume re-drives the spine idempotently — exactly one back-ref row, one post.
+        $backRefs = get_post_meta( $first->newId, Crosswalk::LEGACY_POST_ID, false );
+        $this->assertCount( 1, $backRefs );
+
+        $all = get_posts( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+        ) );
+        $this->assertCount( 1, $all );
+    }
+
+    public function test_resume_does_not_duplicate_backup_or_drop_flags(): void {
+        // A partial record that carries a preserved backup body + an unresolved
+        // post_parent flag must, on resume: keep exactly one LEGACY_POST_CONTENT
+        // row and retain the post_parent_unresolved flag (replace semantics must
+        // not drop a flag the resume pass does not re-derive).
+        $orphanParent = $this->fixture->createSermon();
+
+        $legacyId = $this->insertLegacyRaw( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'Resume Spine',
+            'post_status'  => 'publish',
+            'post_parent'  => $orphanParent,
+            'post_content' => '<iframe src="https://x/embed"></iframe>[audio src="https://x/a.mp3"]',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '' );
+
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+        $this->assertContains( 'post_content_preserved', $first->flags );
+        $this->assertContains( 'post_parent_unresolved:' . $orphanParent, $first->flags );
+
+        $second = $writer->write( $legacyId );
+        $this->assertTrue( $second->resumed );
+
+        // Exactly one backup row after resume (unique guard held).
+        $backups = get_post_meta( $first->newId, Crosswalk::LEGACY_POST_CONTENT, false );
+        $this->assertCount( 1, $backups );
+
+        // Both flags survive the resume's replace-semantics writeFlags().
+        $this->assertContains( 'post_content_preserved', $second->flags );
+        $this->assertContains( 'post_parent_unresolved:' . $orphanParent, $second->flags );
+        $persisted = get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertContains( 'post_parent_unresolved:' . $orphanParent, (array) $persisted );
+    }
+
     public function test_body_with_quotes_backslashes_unicode_not_corrupted(): void {
         $desc = 'He said "grace" \\ mercy — ✝ café façade';
 
