@@ -63,11 +63,12 @@ Frontend\Shortcode                — [sermonator_sermons] → Renderer (Element
 Frontend\Assets                   — conditional minimal CSS + tiny vanilla player JS.
 ```
 
-**Invariant — exactly one mechanism renders a single per request.** The block template
-(block theme) **or** the PHP template (classic) owns the single layout. The `the_content`
-enrichment is a **guarded** fallback that no-ops when a Sermonator template/block has
-already emitted the meta for the current post (render-once guard keyed by post ID). See
-§6 for the guard contract — it is load-bearing and de-risked in Phase 0.
+**Invariant — exactly one mechanism renders a single, by template presence (no request
+state).** The block template (block theme) **or** the PHP template (classic) owns the
+single layout and is the *only* emitter of the meta. Auto-injection into `the_content` is
+an explicit opt-in, **default OFF**, so the default configuration has a single emitter and
+needs no guard. This replaces the original request-scoped render-once guard (rejected — see
+§6) and is cache/SEO-plugin safe by construction.
 
 ## 4. Components & data flow
 
@@ -110,18 +111,21 @@ theme with non-standard part slugs renders headless otherwise; fallback is to om
 part wrapping and rely on the theme's template canvas).
 
 **Classic templates** in `templates/classic/` render identical output via `Renderer`,
-theme-overridable, plus the guarded `the_content` enrichment.
+theme-overridable.
 
-**Render-once guard contract:**
-- A per-request set of post IDs `meta_emitted` (in `Renderer` or a small `RenderGuard`).
-- Any mechanism that emits the sermon meta block for post N calls `RenderGuard::mark(N)`.
-- The `the_content` filter emits meta only if `! RenderGuard::has(N)` **and** the current
-  query is the main single-sermon query (`is_singular(POST_TYPE_SERMON) && in_the_loop()
-  && is_main_query()`).
-- Result: block template / PHP template that includes the meta block ⇒ guard set ⇒
-  `the_content` no-ops. Theme/Site-Editor template that has NO Sermonator meta ⇒ guard
-  unset ⇒ `the_content` injects (graceful enrichment). Customizers who *want* to suppress
-  the auto-append get a filter `sermonator_frontend_auto_append_meta` (default true).
+**Single-meta is template presence, NOT a request-scoped guard** (revised — time-travel
+regret #3). The earlier "render-once guard + default-on `the_content` auto-append" design
+is **rejected**: request-scoped mutable state leaks under full-page caches, SEO/AMP plugins
+that re-enter `the_content` outside the main loop, and similar — producing intermittent
+doubled-or-missing meta, the worst bug class. Instead:
+- The sermon meta is rendered **only** because the `sermon-meta` block is *present* in the
+  resolved template (block theme) or because the classic PHP template *calls* `Renderer`.
+  Presence/absence is a static property of the template, not of request state → idempotent
+  by construction, cache-safe.
+- Auto-injection into `the_content` is an **explicit opt-in, default OFF**
+  (`sermonator_frontend_auto_append_meta`, default `false`) for users on a theme whose
+  template we cannot influence and who accept the trade-off. When off (the default), there
+  is exactly one emitter and no guard is needed.
 
 ## 7. Podcast RSS feed (first-class workstream, not a footnote)
 
@@ -132,10 +136,24 @@ Apple validation is unforgiving; this is treated as a correctness-critical compo
   the podcast's `sermonator_podcast_settings`. `itunes:category` mapped through a **fixed
   Apple-taxonomy allowlist** (free text rejected → nearest valid + admin notice).
 - **Items:** one per **published** sermon with audio, ordered by preached date desc.
-  - `enclosure` `length` resolved by `EnclosureResolver`: prefer `_sermonator_audio_size`;
-    if missing/zero, attempt a cached HEAD `Content-Length`; if still unknown, **omit the
-    item** per Apple's "length required" rule and **count it** for the admin surface
-    (a complete-but-shorter feed beats an Apple-rejected one).
+  - `enclosure` `length`: **read the persisted `_sermonator_audio_size` meta — no network
+    I/O at render time** (time-travel regret #2). Legacy/external audio frequently lacks a
+    stored size, so `EnclosureResolver` runs as a **one-time backfill** (WP-CLI command +
+    chunked cron, idempotent): for each audio URL with no/zero size, a cached HEAD resolves
+    `Content-Length` and **persists** it into `_sermonator_audio_size`. Feed render then
+    only reads local meta. If a size is still unknown at render, **omit the item** per
+    Apple's "length required" rule and **count it** for the admin surface (a
+    complete-but-shorter feed beats an Apple-rejected one). The backfill's natural long-term
+    home is the migration's "complete the data" pass; v1 ships it as a standalone front-end
+    command so the feed never makes per-request network calls.
+  - **Data-preservation guardrails on the backfill (rollback-story outcome):** (1) writes
+    **only** the native `_sermonator_audio_size` on `sermonator_sermon` posts — never the
+    legacy `_wpfc_sermon_size` or any legacy row, so byte-immutability until Finalize is
+    untouched; (2) fills only missing/zero values, never overwrites an existing size; (3)
+    records every touched `post_id` in a transactional option
+    `sermonator_enclosure_backfill_log` so the write is **exactly reversible** (rollback =
+    `delete_post_meta` for logged IDs, restoring the pre-backfill missing state); (4)
+    idempotent + chunked with a cursor so re-runs/crashes are safe.
   - `enclosure` `type` from extension/HEAD MIME (default `audio/mpeg`).
   - `guid isPermaLink="false"` = stable string from post ID (never changes across
     re-titling/slug edits).
@@ -180,18 +198,21 @@ embed → nothing. Theme template override always wins. **All output escaped at 
    parts correctly.
 2. Prove the same data renders on **one classic theme** (e.g. Twenty Twenty-One) via the
    `single_template` filter.
-3. Prove the **render-once guard** prevents double-meta across (a) block template +
-   `the_content`, and (b) a customized template with the meta block removed.
+3. Confirm **single-meta-by-presence** is idempotent: the meta renders exactly once when
+   the `sermon-meta` block is in the template, and zero times when it is removed (no
+   request-scoped guard, no `the_content` auto-append in the default config).
 4. **Decision gate:** if block-template precedence or part resolution is fragile, fall back
    to `template_include` for singles too (Approach-A mechanism) — **same Renderer**, lower
    risk. Record the outcome in the plan before building the fleet.
 
-**Phase 1 — Core read model + Renderer + single view** (TemplateData, Renderer, RenderGuard,
+**Phase 1 — Core read model + Renderer + single view** (TemplateData, Renderer,
 sermon-meta + audio-player + video blocks, single template both theme types).
 
 **Phase 2 — Archives + taxonomy + grid + shortcode + taxonomy-filter** (lists, pagination).
 
-**Phase 3 — Podcast feed + EnclosureResolver + subscribe block** (Apple validation).
+**Phase 3 — Podcast feed + EnclosureResolver backfill (WP-CLI) + subscribe block** (Apple
+validation). The size backfill command may ship as soon as Phase 1's TemplateData exists,
+so feeds read persisted sizes from day one.
 
 **Phase 4 — SEO (JSON-LD + OG)** + assets polish + cross-theme pass.
 
@@ -201,7 +222,7 @@ Each phase ends green (unit + integration) and is verified live on the Local TT5
 
 - **Unit (Brain Monkey):** `Renderer` builders (escaping + omission rules), `TemplateData`
   mapping, `JsonLd`/`OpenGraph` builders, RSS item/channel builders, `EnclosureResolver`
-  (size present / missing / HEAD / unresolved), `RenderGuard`.
+  (size present / missing / HEAD / unresolved + persistence).
 - **Composition-drift control:** one **golden-HTML** test asserting block-render,
   classic-PHP, and shortcode produce matching meta markup for the same fixture sermon.
 - **Integration (wp-env):** `register_block_template` resolution beats generic theme
@@ -221,3 +242,32 @@ Each phase ends green (unit + integration) and is verified live on the Local TT5
   by EnclosureResolver + omit-and-surface, never silent. (tenth-man #3)
 - **Preset-variable theming is unreliable** — hardcoded fallbacks are the baseline.
   (tenth-man #4)
+
+### Known long-horizon risks (time-travel-critic, deferred not addressed)
+
+- **Classic PHP fallback may be low-ROI** (regret #1) — most adopters on the WP-7.0 floor
+  run block themes; the parallel classic template tree could carry build/review cost for
+  <5% of installs and rot first. *Mitigation in scope:* keep the classic path minimal (no
+  bespoke layouts — same `Renderer`, plain wrappers); if Phase 0/early adoption shows no
+  classic users, we can demote it to a `the_content` + shortcode degradation in v1.1
+  without touching the block path.
+- **Block count may exceed demand** (regret #4) — `taxonomy-filter`, `podcast-subscribe`,
+  and `video` (vs core/embed) risk near-zero placement while costing deprecation churn.
+  *Mitigation:* if scope pressure appears, ship the three load-bearing blocks first
+  (`sermon-meta`, `audio-player`, `sermon-grid`) and gate the other three on demand.
+- **`Renderer`-owned composition can calcify** (regret #5) — locking meta order in PHP
+  pushes customizers to CSS hacks / template forks. *Mitigation:* composition lives in the
+  (editable) block template; `Renderer` owns only atomic, non-rearrangeable pieces (player
+  widget, enclosure markup), keeping per-field order user-editable in the Site Editor.
+
+### Rollback (rollback-story gate — verdict: solid)
+
+- **Size backfill (only DB write):** exactly reversible via the touched-IDs log
+  (`delete_post_meta` for logged IDs). Writes only native `_sermonator_audio_size` on
+  native posts, only when missing/zero → **zero legacy-data exposure, zero native-data
+  loss**. Residue: harmless outbound HEAD requests. RTO hours; worst case is a feed item
+  omitted, never site breakage.
+- **WP 7.0 floor lock-in:** reversible by a point release lowering the floor to 6.7 (the
+  real block-template floor); blocked < 7.0 users keep their prior version — the new version
+  simply won't activate (never half-installs). No data impact. User accepted this trade-off
+  unconditionally in the ADR.
