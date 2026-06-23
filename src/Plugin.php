@@ -32,7 +32,25 @@ final class Plugin {
         ( new \Sermonator\Model\Registrar() )->hook();
         ( new \Sermonator\Model\Capabilities() )->grant();
 
+        self::registerAdmin();
         self::registerCliCommands();
+    }
+
+    /**
+     * Register the guided migration wizard (Plan C): the admin page, the thin AJAX
+     * controller, and the legacy-data notice. Admin-context only — is_admin() is true
+     * for both regular admin screens and admin-ajax.php (where the wp_ajax_* handlers
+     * fire), so all three register correctly while never touching front-end requests.
+     * The wizard is pure UI over the gated lifecycle services; it adds no migration
+     * logic and cannot bypass any data-safety gate.
+     */
+    private static function registerAdmin(): void {
+        if ( ! is_admin() ) {
+            return;
+        }
+        ( new \Sermonator\Admin\MigrationController() )->hook();
+        ( new \Sermonator\Admin\MigrationWizard() )->hook();
+        ( new \Sermonator\Admin\LegacyDataNotice() )->hook();
     }
 
     /**

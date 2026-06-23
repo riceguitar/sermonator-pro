@@ -1,0 +1,74 @@
+/* Sermonator migration wizard — minimal admin styling. */
+
+.sermonator-migrate-nav {
+	display: flex;
+	gap: 0;
+	margin: 1em 0 1.5em;
+	padding: 0;
+	list-style: none;
+	counter-reset: sermonator-step;
+}
+
+.sermonator-migrate-nav li {
+	counter-increment: sermonator-step;
+	padding: 6px 18px;
+	background: #f0f0f1;
+	color: #50575e;
+	border-radius: 2px;
+	margin-right: 6px;
+	font-weight: 600;
+}
+
+.sermonator-migrate-nav li::before {
+	content: counter(sermonator-step) ". ";
+}
+
+.sermonator-migrate-nav li.current {
+	background: #2271b1;
+	color: #fff;
+}
+
+.sermonator-migrate-step {
+	max-width: 760px;
+	background: #fff;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	padding: 16px 20px;
+}
+
+.sermonator-migrate-counts {
+	max-width: 420px;
+	margin: 1em 0;
+}
+
+.sermonator-migrate-progress {
+	margin: 1em 0;
+}
+
+.sermonator-migrate-progress progress {
+	width: 320px;
+	height: 18px;
+	vertical-align: middle;
+	margin-right: 10px;
+}
+
+.sermonator-confirm {
+	display: block;
+	margin: 1em 0;
+}
+
+.sermonator-migrate-log {
+	margin-top: 1em;
+	min-height: 1.4em;
+	color: #50575e;
+}
+
+.sermonator-migrate-log.is-error {
+	color: #d63638;
+	font-weight: 600;
+}
+
+.sermonator-verified-ok {
+	color: #00794f;
+	font-weight: 600;
+}
