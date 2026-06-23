@@ -148,6 +148,51 @@ final class TermWriterMigrateAllTest extends WP_UnitTestCase {
         }
     }
 
+    public function test_migrateall_adopts_crash_orphan_no_duplicate_no_reconciliation_error(): void {
+        // A crash orphan (legacy slug, NO back-ref) sits in the target taxonomy
+        // when migrateAll resumes. It must be ADOPTED — not duplicated, and not
+        // tripping the uniqueness guard, which now counts back-ref-less same-slug
+        // terms when asserting a single mapping.
+        $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Sanctification' );
+        $legacy   = get_term( $legacyId, LegacyIdentifiers::TAX_TOPIC );
+
+        $orphanId = $this->fixture->injectCrashOrphanTerm(
+            Identifiers::TAX_TOPIC,
+            'Sanctification',
+            $legacy->slug
+        );
+
+        $countBefore = $this->legacyTermCount( Identifiers::TAX_TOPIC );
+
+        $result = ( new TermWriter() )->migrateAll();
+
+        // Adopted: returned mapping is the orphan, no duplicate target term.
+        $this->assertSame( $orphanId, Crosswalk::findNewTermByLegacyId( $legacyId, Identifiers::TAX_TOPIC ) );
+        $this->assertSame( $countBefore, $this->legacyTermCount( Identifiers::TAX_TOPIC ), 'migrateAll duplicated a crash orphan.' );
+        $this->assertCount( 1, get_term_meta( $orphanId, Crosswalk::LEGACY_TERM_ID, false ) );
+        $this->assertNotContains( 'slug_collision', $result['flags'] );
+    }
+
+    public function test_migrateall_uniqueness_guard_counts_backref_less_same_slug_duplicate(): void {
+        // The corrupt state: the legacy term is ALREADY crosswalked (a back-ref'd
+        // target term exists) AND a second back-ref-less same-slug term lingers
+        // from a crash. The guard must count BOTH and raise rather than silently
+        // leave a divergent mapping for downstream writers.
+        $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Atonement' );
+        $legacy   = get_term( $legacyId, LegacyIdentifiers::TAX_TOPIC );
+
+        // Already-migrated, properly back-ref'd target term.
+        $migrated = wp_insert_term( 'Atonement', Identifiers::TAX_TOPIC, array( 'slug' => $legacy->slug . '-migrated' ) );
+        add_term_meta( (int) $migrated['term_id'], Crosswalk::LEGACY_TERM_ID, $legacyId, true );
+        add_term_meta( (int) $migrated['term_id'], Crosswalk::LEGACY_TERM_TT_ID, (int) $legacy->term_taxonomy_id, true );
+
+        // A back-ref-less crash orphan carrying the ORIGINAL legacy slug.
+        $this->fixture->injectCrashOrphanTerm( Identifiers::TAX_TOPIC, 'Atonement', $legacy->slug );
+
+        $this->expectException( \RuntimeException::class );
+        ( new TermWriter() )->migrateAll();
+    }
+
     public function test_injected_duplicate_backref_raises_uniqueness_error(): void {
         $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Grace' );
 

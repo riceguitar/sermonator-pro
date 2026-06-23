@@ -75,6 +75,58 @@ final class LegacyFixture {
         return (int) $result['term_id'];
     }
 
+    /**
+     * Create a legacy term whose stored name/description hold the EXACT bytes
+     * supplied — including literal backslashes and escaped quotes — mirroring how
+     * real legacy data lives in the wp_terms/wp_term_taxonomy rows.
+     *
+     * wp_insert_term()/wp_update_term() internally wp_unslash() their inputs, so
+     * we wp_slash() first; the value read back via get_term() is then
+     * byte-identical to $name/$description.
+     */
+    public function createTermRaw( string $taxonomy, string $name, string $description = '', ?string $slug = null ): int {
+        $args = array( 'description' => wp_slash( $description ) );
+        if ( $slug !== null ) {
+            $args['slug'] = $slug;
+        }
+
+        $result = wp_insert_term( wp_slash( $name ), $taxonomy, $args );
+        if ( is_wp_error( $result ) ) {
+            throw new \RuntimeException( 'createTermRaw failed: ' . $result->get_error_message() );
+        }
+        return (int) $result['term_id'];
+    }
+
+    /**
+     * Simulate the crash window between TermWriter stamping its LEGACY_SLUG
+     * ownership marker and Crosswalk::markLegacyTerm() writing the back-ref: a
+     * NEW term lands in the target taxonomy carrying the legacy slug AND the
+     * LEGACY_SLUG ownership stamp but NO LEGACY_TERM_ID back-ref. This is the
+     * writer's own crash orphan — distinct from a church's native term (which
+     * never carries LEGACY_SLUG) — and a resumed run must ADOPT it, not treat it
+     * as a native collision.
+     *
+     * @return int The orphan term id (the back-ref-less crash artifact).
+     */
+    public function injectCrashOrphanTerm( string $targetTaxonomy, string $name, string $slug, string $description = '' ): int {
+        $result = wp_insert_term(
+            wp_slash( $name ),
+            $targetTaxonomy,
+            array( 'slug' => $slug, 'description' => wp_slash( $description ) )
+        );
+        if ( is_wp_error( $result ) ) {
+            throw new \RuntimeException( 'injectCrashOrphanTerm failed: ' . $result->get_error_message() );
+        }
+        $termId = (int) $result['term_id'];
+
+        // The writer stamps LEGACY_SLUG (the original legacy slug) BEFORE the
+        // back-ref, so a crash between the two leaves exactly this marker and no
+        // back-ref. Reproduce that faithfully.
+        add_term_meta( $termId, \Sermonator\Migration\Crosswalk::LEGACY_SLUG, $slug, true );
+
+        return $termId;
+    }
+
     public function createPodcast( string $title = 'Default' ): int {
         $id = (int) wp_insert_post( array(
             'post_type'   => LegacyIdentifiers::POST_TYPE_PODCAST,
