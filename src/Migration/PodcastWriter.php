@@ -107,6 +107,12 @@ final class PodcastWriter {
         $orphanId = $this->findBackRefLessPostByLegacyIdentity( $legacy );
         if ( null !== $orphanId ) {
             Crosswalk::markLegacy( $orphanId, $legacyId );
+            // FIX 4 (B2a fix10): purge stale meta from the adopted crash-orphan before
+            // re-entering the spine. Without this, keys written by an older migration
+            // attempt that are absent from the current legacy source are left on the
+            // migrated podcast record indefinitely. Mirrors SermonWriter's equivalent
+            // call in its orphan-adoption branch.
+            $this->purgeOrphanMeta( $orphanId, $legacyId );
             $flags = $this->applyPostInsertSpine( $orphanId, $legacyId, $this->readFlags( $orphanId ) );
             $this->markCompleteUnlessTermCrosswalkOpen( $orphanId, $flags );
 
@@ -226,6 +232,17 @@ final class PodcastWriter {
 
         $values = get_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, false );
         $values = is_array( $values ) ? array_values( $values ) : array();
+
+        // FIX 1 (B2a fix10): an empty/absent legacy sm_podcast_settings read must be a
+        // complete NO-OP. The pre-fix code called delete_post_meta unconditionally BEFORE
+        // checking whether $values is empty, then the re-add loop never fired — silently
+        // wiping the migrated sermonator_podcast_settings row (iTunes category, author,
+        // term filters). Asymmetric with applyMeta, which only deletes per target key when
+        // the legacy source key is actually present. Guard: skip BOTH the delete and the
+        // re-add when $values === [] so existing settings survive the self-heal intact.
+        if ( $values === array() ) {
+            return array_values( array_unique( $flags ) );
+        }
 
         delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
 
@@ -426,10 +443,25 @@ final class PodcastWriter {
     }
 
     /**
-     * Stamp the legacy post_modified / post_modified_gmt onto the new post.
-     * wp_insert_post forces these columns to post_date on INSERT, so we write them
-     * directly via $wpdb and refresh the post cache. Idempotent (no-op when both
-     * columns already match), mirroring SermonWriter.
+     * Force-preserve ALL legacy date/status columns that wp_insert_post may silently
+     * rewrite, via direct $wpdb->update (which bypasses WP's re-stamp logic).
+     *
+     * Columns restored:
+     *  - post_modified / post_modified_gmt — wp_insert_post forces these to post_date.
+     *  - post_date / post_date_gmt       — WP recomputes post_date_gmt from the site
+     *                                       timezone when the postarr value differs from
+     *                                       get_gmt_from_date(post_date). Preserving
+     *                                       them verbatim retains the legacy church's
+     *                                       original TZ-aware timestamps.
+     *  - post_status                      — A 'future' post whose post_date is already
+     *                                       in the past is silently flipped to 'publish'
+     *                                       by wp_insert_post (via wp_check_post_lock).
+     *                                       Force-restoring 'future' matches the legacy
+     *                                       state exactly.
+     *
+     * Idempotent: reads current columns first and skips the $wpdb->update when all six
+     * columns already match (resume path, COMPLETE-branch self-heal). Mirrors
+     * SermonWriter::preserveModifiedTimestamps.
      */
     private function preserveModifiedTimestamps( int $newId, \WP_Post $legacy ): void {
         $current = get_post( $newId );
@@ -437,8 +469,11 @@ final class PodcastWriter {
             return;
         }
         if ( $current->post_modified === $legacy->post_modified
-            && $current->post_modified_gmt === $legacy->post_modified_gmt ) {
-            return;
+            && $current->post_modified_gmt === $legacy->post_modified_gmt
+            && $current->post_date === $legacy->post_date
+            && $current->post_date_gmt === $legacy->post_date_gmt
+            && $current->post_status === $legacy->post_status ) {
+            return; // already preserved — idempotent no-op.
         }
 
         global $wpdb;
@@ -447,6 +482,9 @@ final class PodcastWriter {
             array(
                 'post_modified'     => $legacy->post_modified,
                 'post_modified_gmt' => $legacy->post_modified_gmt,
+                'post_date'         => $legacy->post_date,
+                'post_date_gmt'     => $legacy->post_date_gmt,
+                'post_status'       => $legacy->post_status,
             ),
             array( 'ID' => $newId )
         );
@@ -476,6 +514,69 @@ final class PodcastWriter {
         }
 
         return (int) $newId;
+    }
+
+    /**
+     * Remove stale meta keys from a crash-orphan podcast post before re-entering
+     * the spine. Mirrors SermonWriter::purgeOrphanMeta().
+     *
+     * The orphan was created by an OLDER writer that did not write LEGACY_POST_ID
+     * atomically in meta_input. By the time we re-adopt it the orphan may carry any
+     * number of keys from a partial previous migration attempt — most of which are
+     * about to be rewritten by applyMeta(). The stale keys are anything on the orphan
+     * that is NEITHER:
+     *   (a) a Crosswalk own-key (LEGACY_POST_ID, LEGACY_SLUG, MIGRATION_COMPLETE,
+     *       MIGRATION_FLAGS, LEGACY_POST_CONTENT), nor
+     *   (b) a target key that applyMeta() will re-write from the legacy source.
+     *
+     * Without this purge, a key present on the orphan from an old convention but
+     * absent from the legacy source is silently left behind and corrupts the migrated
+     * podcast record.
+     *
+     * @param int $orphanId  The adopted crash-orphan post ID.
+     * @param int $legacyId  The legacy podcast post ID (source of truth).
+     */
+    private function purgeOrphanMeta( int $orphanId, int $legacyId ): void {
+        // Keys the migration framework owns — never delete these.
+        $ownKeys = array(
+            Crosswalk::LEGACY_POST_ID,
+            Crosswalk::LEGACY_SLUG,
+            Crosswalk::MIGRATION_COMPLETE,
+            Crosswalk::MIGRATION_FLAGS,
+            Crosswalk::LEGACY_POST_CONTENT,
+        );
+
+        // Build the set of TARGET keys that applyMeta() will write from this legacy
+        // source. PodcastWriter renames sm_podcast_settings → sermonator_podcast_settings;
+        // all other keys pass through verbatim. Also include the direct settings key
+        // written by applyScopedSettingsRemap (same target key, handled above).
+        $rawByKey = get_post_meta( $legacyId );
+        $rawByKey = is_array( $rawByKey ) ? $rawByKey : array();
+
+        $legacyTargetKeys = array();
+        foreach ( array_keys( $rawByKey ) as $legacyKey ) {
+            $isSettings         = ( LegacyIdentifiers::META_PODCAST_SETTINGS === (string) $legacyKey );
+            $legacyTargetKeys[] = $isSettings ? Identifiers::META_PODCAST_SETTINGS : (string) $legacyKey;
+        }
+        $legacyTargetKeys = array_values( array_unique( $legacyTargetKeys ) );
+
+        // Snapshot the orphan's current meta keys.
+        $orphanMeta = get_post_meta( $orphanId );
+        $orphanMeta = is_array( $orphanMeta ) ? $orphanMeta : array();
+
+        foreach ( array_keys( $orphanMeta ) as $key ) {
+            $key = (string) $key;
+            // Keep migration's own keys.
+            if ( in_array( $key, $ownKeys, true ) ) {
+                continue;
+            }
+            // Keep keys that applyMeta() will (re-)write from the legacy source.
+            if ( in_array( $key, $legacyTargetKeys, true ) ) {
+                continue;
+            }
+            // Stale key: remove it (all rows for this key).
+            delete_post_meta( $orphanId, $key );
+        }
     }
 
     /** Whether a meta key is one of OUR back-ref / state rows (never copied from legacy). */
