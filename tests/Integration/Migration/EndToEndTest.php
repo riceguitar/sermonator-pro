@@ -286,6 +286,36 @@ final class EndToEndTest extends WP_UnitTestCase {
             ARRAY_A
         );
 
+        // NATIVE shared taxonomies (category/post_tag) the migration must NOT mutate
+        // until Finalize: the church's own data. Capture (a) the count column for every
+        // native term — SermonWriter mirrors a native relationship onto the NEW sermon
+        // via a direct $wpdb insert WITHOUT bumping this shared count (deferred to
+        // native_term_recount_tt_ids), so it must read byte-equal through migrate; and
+        // (b) the legacy posts' OWN native membership rows, scoped to legacy post types
+        // so the migrated mirror rows (on sermonator_* posts) are excluded — proving the
+        // legacy post→category relationship is untouched up to the point of deletion.
+        $nativeTaxonomies   = array( 'category', 'post_tag' );
+        $nativePlaceholders = implode( ',', array_fill( 0, count( $nativeTaxonomies ), '%s' ) );
+        $nativeTermTax = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT tt.term_taxonomy_id, tt.taxonomy, tt.count FROM {$wpdb->term_taxonomy} tt"
+                . " WHERE tt.taxonomy IN ( {$nativePlaceholders} ) ORDER BY tt.term_taxonomy_id ASC",
+                ...$nativeTaxonomies
+            ),
+            ARRAY_A
+        );
+        $nativeRelationships = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT tr.object_id, tr.term_taxonomy_id, tr.term_order FROM {$wpdb->term_relationships} tr"
+                . " INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_taxonomy_id = tr.term_taxonomy_id"
+                . " INNER JOIN {$wpdb->posts} p ON p.ID = tr.object_id"
+                . " WHERE tt.taxonomy IN ( {$nativePlaceholders} ) AND p.post_type IN ( {$placeholders} )"
+                . " ORDER BY tr.object_id ASC, tr.term_taxonomy_id ASC",
+                ...array_merge( $nativeTaxonomies, $legacyPostTypes )
+            ),
+            ARRAY_A
+        );
+
         $comments     = array();
         $commentMeta  = array();
         if ( $postIds !== array() ) {
@@ -316,13 +346,15 @@ final class EndToEndTest extends WP_UnitTestCase {
         );
 
         return array(
-            'posts'         => $posts,
-            'postMeta'      => $postMeta,
-            'termTax'       => $termTax,
-            'relationships' => $relationships,
-            'comments'      => $comments,
-            'commentMeta'   => $commentMeta,
-            'attachments'   => $attachments,
+            'posts'               => $posts,
+            'postMeta'            => $postMeta,
+            'termTax'             => $termTax,
+            'relationships'       => $relationships,
+            'nativeTermTax'       => $nativeTermTax,
+            'nativeRelationships' => $nativeRelationships,
+            'comments'            => $comments,
+            'commentMeta'         => $commentMeta,
+            'attachments'         => $attachments,
             'options'       => array(
                 'default_podcast' => get_option( LegacyIdentifiers::OPTION_DEFAULT_PODCAST ),
                 'general'         => get_option( 'sermonmanager_general' ),
@@ -368,6 +400,14 @@ final class EndToEndTest extends WP_UnitTestCase {
             'status'  => 'any',
             'count'   => true,
         ) );
+    }
+
+    /** The stored shared count for a native (category/post_tag) term taxonomy row. */
+    private function sharedCategoryCount( int $ttId ): int {
+        global $wpdb;
+        return (int) $wpdb->get_var(
+            $wpdb->prepare( "SELECT count FROM {$wpdb->term_taxonomy} WHERE term_taxonomy_id = %d", $ttId )
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -568,6 +608,11 @@ final class EndToEndTest extends WP_UnitTestCase {
     public function test_rollback_returns_to_pristine_start(): void {
         $data   = $this->seedRichDataset();
         $before = $this->legacySnapshot();
+        // The B2a HARD CONSTRAINT, exercised full-cycle: the church's SHARED native
+        // category count must be restored to its TRUE pre-migration value — rollback
+        // strips the mirrored native relationships directly via $wpdb and recounts once,
+        // NEVER decrementing the shared count below its true value.
+        $nativeCountBefore = $this->sharedCategoryCount( $data['nativeCatTtId'] );
 
         $this->migrateToCompletion();
 
@@ -598,7 +643,15 @@ final class EndToEndTest extends WP_UnitTestCase {
         // State retreated → detected.
         $this->assertSame( 'detected', ( new MigrationState() )->phase() );
 
-        // INVARIANT: legacy byte-equal — pristine start.
+        // HARD CONSTRAINT: the shared native category count is back to its TRUE value
+        // (never decremented below it by the rollback of the mirrored relationships).
+        $this->assertSame( $nativeCountBefore, $this->sharedCategoryCount( $data['nativeCatTtId'] ),
+            'Shared native category count must be restored to its TRUE pre-migration value after rollback.' );
+
+        // INVARIANT: legacy byte-equal — pristine start. The snapshot now ALSO covers
+        // the native (category/post_tag) count column and the legacy posts' own native
+        // membership rows, so this byte-equal proves the church's shared-taxonomy data
+        // is untouched through the whole migrate→rollback cycle.
         $this->assertEquals( $before, $this->legacySnapshot(),
             'Legacy data must be byte-equal (pristine) after rollback.' );
 
@@ -661,6 +714,17 @@ final class EndToEndTest extends WP_UnitTestCase {
         $this->assertSame( $preservedBefore,
             (string) get_post_meta( $newTempSermon, Crosswalk::LEGACY_POST_CONTENT, true ),
             '_sermonator_legacy_post_content must survive finalize byte-equal.' );
+
+        // HARD CONSTRAINT at the point of no return: the deferred native shared count
+        // is recounted EXACTLY ONCE at finalize, settling to its true authoritative
+        // value (what a fresh canonical WP recount yields — never left stale, never
+        // double-bumped). The legacy post that carried the membership is now deleted,
+        // so the authoritative value reflects that.
+        $storedNativeCount = $this->sharedCategoryCount( $data['nativeCatTtId'] );
+        wp_update_term_count_now( array( $data['nativeCatTtId'] ), 'category' );
+        $authoritativeNativeCount = $this->sharedCategoryCount( $data['nativeCatTtId'] );
+        $this->assertSame( $authoritativeNativeCount, $storedNativeCount,
+            'Native shared count must be recounted to its true authoritative value at finalize (never left stale).' );
 
         // State → finalized; Rollback now refuses.
         $this->assertSame( 'finalized', ( new MigrationState() )->phase() );
