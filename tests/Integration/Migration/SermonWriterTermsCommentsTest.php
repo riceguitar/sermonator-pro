@@ -339,6 +339,74 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         $this->assertContains( 'comment_copy_failed:' . $legacyCommentId, $result->flags );
         $persisted = (array) get_post_meta( $result->newId, Crosswalk::MIGRATION_FLAGS, true );
         $this->assertContains( 'comment_copy_failed:' . $legacyCommentId, $persisted );
+
+        // CRITICAL: the record must NOT be stamped COMPLETE while the comment copy
+        // is still outstanding — otherwise the gate would route every re-run to the
+        // COMPLETE branch (term-only self-heal) and the irreplaceable comment would
+        // be skipped forever. It stays in the resume leg.
+        $this->assertSame(
+            '',
+            (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'a post with an open comment_copy_failed flag must NOT be marked complete'
+        );
+    }
+
+    public function test_failed_comment_recovers_on_a_later_write_not_skipped_forever(): void {
+        // The "never skip-forever" invariant for irreplaceable parishioner-authored
+        // data: a comment whose copy failed on the first write is RECOVERED on a
+        // subsequent write (the record stayed in the resume leg), the
+        // comment_copy_failed flag clears, and only then is MIGRATION_COMPLETE
+        // stamped.
+        $legacyId        = $this->bareSermon();
+        $legacyCommentId = (int) wp_insert_comment( array(
+            'comment_post_ID'      => $legacyId,
+            'comment_author'       => 'Trent',
+            'comment_author_email' => 'trent@example.com',
+            'comment_content'      => 'Recoverable comment',
+            'comment_approved'     => '1',
+        ) );
+
+        global $wpdb;
+        $commentsTable = $wpdb->comments;
+        $break = static function ( $query ) use ( $commentsTable ) {
+            if ( false !== stripos( $query, 'INSERT INTO `' . $commentsTable . '`' )
+                || false !== stripos( $query, 'INSERT INTO ' . $commentsTable ) ) {
+                return 'INSERT INTO ' . $commentsTable . ' (this_column_does_not_exist) VALUES (1)';
+            }
+            return $query;
+        };
+
+        $writer = new SermonWriter();
+
+        // First write: the comment copy fails.
+        add_filter( 'query', $break );
+        $suppress = $wpdb->suppress_errors( true );
+        $first    = $writer->write( $legacyId );
+        remove_filter( 'query', $break );
+        $wpdb->suppress_errors( $suppress );
+
+        $this->assertContains( 'comment_copy_failed:' . $legacyCommentId, $first->flags );
+        $this->assertCount( 0, get_comments( array( 'post_id' => $first->newId ) ) );
+        // Not complete — still resumable.
+        $this->assertSame( '', (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+
+        // Second write: NO break this time → the comment finally copies (resume).
+        $second = $writer->write( $legacyId );
+
+        // Recovered: the comment exists on the new post, exactly once.
+        $copied = get_comments( array( 'post_id' => $first->newId ) );
+        $this->assertCount( 1, $copied, 'the previously-failed comment must be recovered, not skipped forever' );
+        $this->assertSame( 'Recoverable comment', $copied[0]->comment_content );
+        $this->assertSame( $legacyCommentId, (int) get_comment_meta( $copied[0]->comment_ID, Crosswalk::LEGACY_COMMENT_ID, true ) );
+
+        // The failure flag is cleared (returned and persisted).
+        $this->assertNotContains( 'comment_copy_failed:' . $legacyCommentId, $second->flags );
+        $persisted = (array) get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertNotContains( 'comment_copy_failed:' . $legacyCommentId, $persisted );
+
+        // Now that the irreplaceable data is recovered, MIGRATION_COMPLETE stamps.
+        $this->assertSame( '1', (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+        $this->assertSame( $first->newId, $second->newId );
     }
 
     public function test_admin_added_native_term_survives_second_write_of_completed_post(): void {
@@ -385,6 +453,60 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         sort( $after );
         $this->assertSame( $before, $after, 'admin-curated term was clobbered by an idempotent re-run' );
         $this->assertContains( (int) $adminTermId, $after, 'admin-added native term must survive a second write' );
+    }
+
+    public function test_open_flag_in_one_taxonomy_does_not_clobber_admin_term_in_another(): void {
+        // The multi-taxonomy edge: a COMPLETE record carries an OPEN
+        // missing_term_crosswalk flag in taxonomy A (series). A church admin has
+        // manually added a native term in a DIFFERENT taxonomy B (topic), which has
+        // NO open flag. When A's term resolves and the COMPLETE-branch repair runs,
+        // it must REPLACE ONLY taxonomy A — taxonomy B's admin-curated term must
+        // survive untouched (no full-set REPLACE across every taxonomy).
+        $seriesLegacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Pentecost' );
+        $legacyId       = $this->bareSermon();
+        wp_set_object_terms( $legacyId, array( $seriesLegacyId ), LegacyIdentifiers::TAX_SERIES );
+
+        // First write while the SERIES term has no crosswalk → OPEN flag in tax A.
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+        $this->assertContains( 'missing_term_crosswalk:' . $seriesLegacyId, $first->flags );
+        // Completed even with the open term flag (term flags do not withhold COMPLETE).
+        $this->assertSame( '1', (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+
+        // Admin adds a native term in taxonomy B (TOPIC) on the migrated post.
+        $adminTopicId = $this->factory->term->create( array(
+            'taxonomy' => Identifiers::TAX_TOPIC,
+            'name'     => 'Admin Curated Topic B',
+        ) );
+        wp_set_object_terms( $first->newId, array( (int) $adminTopicId ), Identifiers::TAX_TOPIC );
+
+        $topicBefore = array_map( 'intval', wp_get_object_terms( $first->newId, Identifiers::TAX_TOPIC, array( 'fields' => 'ids' ) ) );
+        $this->assertSame( array( (int) $adminTopicId ), $topicBefore, 'precondition: admin topic present in tax B' );
+
+        // Resolve the SERIES term so tax A's flag can self-heal on the next write.
+        ( new TermWriter() )->migrateAll();
+        $newSeriesId = (int) Crosswalk::findNewTermByLegacyId( $seriesLegacyId, Identifiers::TAX_SERIES );
+
+        // Second write: COMPLETE-branch repair runs (open flag in tax A only).
+        $second = $writer->write( $legacyId );
+        $this->assertFalse( $second->created );
+        $this->assertFalse( $second->resumed );
+
+        // Tax A healed: the now-resolved series term is assigned, flag cleared.
+        $this->assertSame(
+            array( $newSeriesId ),
+            array_map( 'intval', wp_get_object_terms( $first->newId, Identifiers::TAX_SERIES, array( 'fields' => 'ids' ) ) ),
+            'taxonomy A (series) must be healed to the resolved term'
+        );
+        $this->assertNotContains( 'missing_term_crosswalk:' . $seriesLegacyId, $second->flags );
+
+        // Tax B UNTOUCHED: the admin-curated topic term survives the repair.
+        $topicAfter = array_map( 'intval', wp_get_object_terms( $first->newId, Identifiers::TAX_TOPIC, array( 'fields' => 'ids' ) ) );
+        $this->assertSame(
+            array( (int) $adminTopicId ),
+            $topicAfter,
+            'admin-curated term in an unflagged taxonomy must survive the scoped term repair'
+        );
     }
 
     public function test_resolving_the_only_flag_clears_the_persisted_flags_row(): void {

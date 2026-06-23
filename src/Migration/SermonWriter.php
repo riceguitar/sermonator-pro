@@ -14,10 +14,14 @@ use Sermonator\Schema\Identifiers;
  *  - the idempotency gate (resolve via Crosswalk::findNewByLegacyId, status-
  *    agnostic) distinguishes a COMPLETE record (skip the post/body/meta/comments
  *    steps, and re-run term repair ONLY when an OPEN term flag is present so a
- *    now-resolvable term self-heals — but a completed record with no open term
- *    flag is left untouched, never a full wp_set_object_terms REPLACE that would
- *    clobber admin-curated terms) from a stamped-but-PARTIAL record (resume —
- *    re-enter on the existing post, never insert a second one);
+ *    now-resolvable term self-heals — and then scoped to ONLY the taxonomies with
+ *    an open flag, so a taxonomy a church admin curated is never full-REPLACE
+ *    clobbered) from a stamped-but-PARTIAL record (resume — re-enter on the
+ *    existing post, never insert a second one). MIGRATION_COMPLETE is WITHHELD
+ *    while a comment_copy_failed:* flag is open, so an irreplaceable parishioner
+ *    comment that failed to copy keeps the record in the resume leg (copyComments
+ *    re-attempts on the next write) instead of being stamped-complete-and-skipped-
+ *    forever;
  *  - the post is inserted preserving the legacy post columns, with the body
  *    reconciled from (post_content, sermon_description, post_content_temp);
  *  - the insert is wp_slash'd and run with KSES DISABLED so iframes/shortcodes
@@ -72,12 +76,16 @@ final class SermonWriter {
             if ( $this->isComplete( $existing ) ) {
                 // COMPLETE — a no-op skip for the post/body/meta/comments steps.
                 // Term repair (self-heal) runs ONLY when there is actually an OPEN
-                // term flag to clear (missing_term_crosswalk:* / term_assign_error:*).
-                // A record migrated while a term crosswalk was missing picks the
-                // now-available term up here; but a completed record with NO open
-                // term flag must NOT be touched — a full wp_set_object_terms REPLACE
-                // on every re-run would silently clobber any term a church admin
-                // manually added to the migrated post (data loss on the NEW post).
+                // term flag to clear (missing_term_crosswalk:* / term_assign_error:*),
+                // and even then ONLY for the taxonomies that carry that open flag
+                // (see repairTermsOnExisting). A record migrated while a term
+                // crosswalk was missing picks the now-available term up here; but a
+                // completed record with NO open term flag must NOT be touched — a
+                // full wp_set_object_terms REPLACE on every re-run would silently
+                // clobber any term a church admin manually added to the migrated
+                // post (data loss on the NEW post). Crucially this is scoped PER
+                // TAXONOMY: an open flag in taxonomy A never REPLACEs taxonomy B,
+                // so an admin term added to an unflagged taxonomy survives the heal.
                 // Seed from the persisted flags so no unrelated flag is lost.
                 $persisted = $this->readFlags( $existing );
                 if ( $this->hasOpenTermFlag( $persisted ) ) {
@@ -97,7 +105,10 @@ final class SermonWriter {
             // resume pass does not re-derive.
             $reconciledForResume = $this->reconcileBody( $legacyId, $legacyForResume );
             $flags               = $this->applyPostInsertSpine( $existing, $legacyId, $legacyForResume, $reconciledForResume, $this->readFlags( $existing ) );
-            $this->markComplete( $existing );
+            // COMPLETE is withheld while a comment copy is still outstanding so the
+            // record stays in this resume leg and copyComments() re-runs on the next
+            // write (never skip-forever on irreplaceable parishioner-authored data).
+            $this->markCompleteUnlessCommentFailureOpen( $existing, $flags );
 
             return new WriteResult( $existing, false, $flags, true );
         }
@@ -155,8 +166,11 @@ final class SermonWriter {
 
         // MIGRATION_COMPLETE is written LAST — after meta, terms, and comments —
         // so an abort anywhere before this point leaves a stamped-but-partial post
-        // that the idempotency gate resumes rather than skips.
-        $this->markComplete( $newId );
+        // that the idempotency gate resumes rather than skips. It is WITHHELD while
+        // a comment_copy_failed:* flag is open so the record stays in the resume leg
+        // and copyComments() is re-attempted on a later write — irreplaceable
+        // parishioner-authored data is never stamped-complete-and-skipped-forever.
+        $this->markCompleteUnlessCommentFailureOpen( $newId, $flags );
 
         return new WriteResult( $newId, true, $flags );
     }
@@ -240,6 +254,12 @@ final class SermonWriter {
         // that fails to insert is NEVER a silent drop — it records a
         // comment_copy_failed:<legacyCommentId> flag (parishioner-authored data is
         // irreplaceable), threaded back into the canonical flags row.
+        //
+        // Prior comment-copy failure flags are stripped before re-derivation so a
+        // comment that copies successfully on this (resume) pass clears its open
+        // flag — mirroring the term-flag strip — letting MIGRATION_COMPLETE finally
+        // stamp once every comment is recovered.
+        $flags = $this->stripCommentFailureFlags( $flags );
         $flags = array_merge( $flags, $this->copyComments( $newId, $legacyId ) );
 
         $this->writeFlags( $newId, $flags );
@@ -383,21 +403,40 @@ final class SermonWriter {
      *
      * Legacy term assignments are read READ-ONLY.
      *
-     * @param list<string> $flags
+     * $onlyTargetTaxonomies scopes the REPLACE to a subset of target taxonomies.
+     * On a fresh insert / resume (null) every taxonomy is (re)built from the legacy
+     * source — full replace is correct because the post has no admin-curated terms
+     * yet. On a COMPLETE-branch repair only the taxonomies that actually carry an
+     * open flag are passed, so a taxonomy a church admin manually added a native
+     * term to (and which has NO open flag) is left entirely untouched — its
+     * admin-curated assignment is never clobbered by a full-set REPLACE. Term flags
+     * are stripped ONLY for the taxonomies being re-processed, so an open flag for a
+     * taxonomy outside the scope is preserved verbatim rather than silently dropped.
+     *
+     * @param list<string>      $flags
+     * @param list<string>|null  $onlyTargetTaxonomies Restrict REPLACE to these target taxonomies; null = all.
      * @return list<string>
      */
-    private function applyTerms( int $newId, int $legacyId, array $flags ): array {
-        // Drop stale term flags so this pass re-derives them from scratch — a term
-        // that has since been migrated must clear its open missing_term_crosswalk.
-        $flags = $this->stripTermFlags( $flags );
-
+    private function applyTerms( int $newId, int $legacyId, array $flags, ?array $onlyTargetTaxonomies = null ): array {
         foreach ( MappingContract::taxonomyMap() as $legacyTax => $targetTax ) {
+            if ( null !== $onlyTargetTaxonomies && ! in_array( $targetTax, $onlyTargetTaxonomies, true ) ) {
+                // Out of scope (no open flag) — leave its (possibly admin-curated)
+                // assignment and any unrelated flag exactly as they are.
+                continue;
+            }
+
             $legacyTermIds = wp_get_object_terms( $legacyId, $legacyTax, array( 'fields' => 'ids' ) );
             if ( is_wp_error( $legacyTermIds ) ) {
                 // Legacy taxonomy unreadable — nothing to assign for it.
                 continue;
             }
             $legacyTermIds = array_map( 'intval', (array) $legacyTermIds );
+
+            // Drop this taxonomy's stale term flags so this pass re-derives them
+            // from scratch — a term that has since been migrated must clear its open
+            // missing_term_crosswalk. Scoped per-taxonomy so a flag for a taxonomy
+            // outside the (repair) scope is never dropped without re-derivation.
+            $flags = $this->stripTermFlagsForTaxonomy( $flags, $legacyTax, $targetTax, $legacyTermIds );
 
             $newTermIds = array();
             foreach ( $legacyTermIds as $legacyTermId ) {
@@ -432,9 +471,62 @@ final class SermonWriter {
      * @return list<string>
      */
     private function repairTermsOnExisting( int $newId, int $legacyId, array $flags ): array {
-        $flags = $this->applyTerms( $newId, $legacyId, $flags );
+        // Repair ONLY the taxonomies that carry an open flag. A taxonomy with no
+        // open flag is left entirely untouched, so a native term a church admin
+        // manually added to the migrated post (in a DIFFERENT taxonomy than the one
+        // being healed) is never clobbered by a full-set wp_set_object_terms
+        // REPLACE — the data-loss-on-the-NEW-post hole this gate closes.
+        $scope = $this->openFlagTargetTaxonomies( $flags, $legacyId );
+        $flags = $this->applyTerms( $newId, $legacyId, $flags, $scope );
         $this->writeFlags( $newId, $flags );
         return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Derive the set of TARGET taxonomies that carry an open term flag, so the
+     * COMPLETE-branch repair can REPLACE only those and leave every other
+     * (possibly admin-curated) taxonomy untouched.
+     *
+     *  - term_assign_error:<targetTax> contributes its target taxonomy directly;
+     *  - missing_term_crosswalk:<legacyTermId> contributes the target taxonomy of
+     *    the legacy taxonomy that the legacy term is assigned to on the (read-only)
+     *    legacy post.
+     *
+     * @param list<string> $flags
+     * @return list<string> Distinct target taxonomies with an open flag.
+     */
+    private function openFlagTargetTaxonomies( array $flags, int $legacyId ): array {
+        $taxonomyMap   = MappingContract::taxonomyMap();
+        $missingTermIds = array();
+        $scope          = array();
+
+        foreach ( $flags as $flag ) {
+            $flag = (string) $flag;
+            if ( str_starts_with( $flag, 'term_assign_error:' ) ) {
+                $scope[ substr( $flag, strlen( 'term_assign_error:' ) ) ] = true;
+            } elseif ( str_starts_with( $flag, 'missing_term_crosswalk:' ) ) {
+                $missingTermIds[ (int) substr( $flag, strlen( 'missing_term_crosswalk:' ) ) ] = true;
+            }
+        }
+
+        if ( $missingTermIds !== array() ) {
+            // Resolve each missing legacy term id to its target taxonomy via the
+            // legacy assignment (read-only). A legacy term may appear in only one
+            // legacy taxonomy, so the first match is authoritative.
+            foreach ( $taxonomyMap as $legacyTax => $targetTax ) {
+                $legacyTermIds = wp_get_object_terms( $legacyId, $legacyTax, array( 'fields' => 'ids' ) );
+                if ( is_wp_error( $legacyTermIds ) ) {
+                    continue;
+                }
+                foreach ( array_map( 'intval', (array) $legacyTermIds ) as $legacyTermId ) {
+                    if ( isset( $missingTermIds[ $legacyTermId ] ) ) {
+                        $scope[ $targetTax ] = true;
+                    }
+                }
+            }
+        }
+
+        return array_keys( $scope );
     }
 
     /**
@@ -456,18 +548,48 @@ final class SermonWriter {
     }
 
     /**
-     * Drop previously-derived term flags so applyTerms() can re-derive them from
-     * the current crosswalk state (a resolved term clears its open flag).
+     * Drop the term flags that THIS pass will re-derive for a single taxonomy:
+     *  - term_assign_error:<targetTax> for this target taxonomy (re-derived below);
+     *  - missing_term_crosswalk:<legacyTermId> for every legacy term currently
+     *    assigned to this taxonomy on the (read-only) legacy post.
+     *
+     * Flags for any OTHER taxonomy are preserved verbatim — essential so a scoped
+     * COMPLETE-branch repair never drops an open flag belonging to a taxonomy it is
+     * deliberately leaving untouched.
+     *
+     * @param list<string> $flags
+     * @param list<int>    $legacyTermIds Legacy term ids currently assigned in $legacyTax.
+     * @return list<string>
+     */
+    private function stripTermFlagsForTaxonomy( array $flags, string $legacyTax, string $targetTax, array $legacyTermIds ): array {
+        $errorFlag = 'term_assign_error:' . $targetTax;
+        $missing   = array();
+        foreach ( $legacyTermIds as $legacyTermId ) {
+            $missing[ 'missing_term_crosswalk:' . (int) $legacyTermId ] = true;
+        }
+
+        return array_values( array_filter(
+            $flags,
+            static function ( $flag ) use ( $errorFlag, $missing ): bool {
+                $flag = (string) $flag;
+                return $flag !== $errorFlag && ! isset( $missing[ $flag ] );
+            }
+        ) );
+    }
+
+    /**
+     * Drop previously-derived comment-copy failure flags so copyComments() can
+     * re-derive them from the current copy state (a comment that copies on this
+     * pass clears its open comment_copy_failed flag).
      *
      * @param list<string> $flags
      * @return list<string>
      */
-    private function stripTermFlags( array $flags ): array {
+    private function stripCommentFailureFlags( array $flags ): array {
         return array_values( array_filter(
             $flags,
             static function ( $flag ): bool {
-                return ! str_starts_with( (string) $flag, 'missing_term_crosswalk:' )
-                    && ! str_starts_with( (string) $flag, 'term_assign_error:' );
+                return ! str_starts_with( (string) $flag, 'comment_copy_failed:' );
             }
         ) );
     }
@@ -627,6 +749,41 @@ final class SermonWriter {
     /** Write the MIGRATION_COMPLETE flag LAST (replace/unique — idempotent). */
     private function markComplete( int $newId ): void {
         update_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE, '1' );
+    }
+
+    /**
+     * Stamp MIGRATION_COMPLETE only when no comment_copy_failed:* flag is open.
+     *
+     * A failed comment copy is irreplaceable parishioner-authored data: stamping
+     * COMPLETE with the flag open would route every subsequent re-run to the
+     * COMPLETE branch (a no-op skip whose self-heal is term-only), so the comment
+     * would never be recovered — the exact "never skip-forever" violation. Leaving
+     * the record stamped-but-PARTIAL keeps it in the resume leg, so copyComments()
+     * is re-attempted on the next write and the flag clears once the copy succeeds.
+     *
+     * @param list<string> $flags
+     */
+    private function markCompleteUnlessCommentFailureOpen( int $newId, array $flags ): void {
+        if ( $this->hasOpenCommentFailureFlag( $flags ) ) {
+            return;
+        }
+        $this->markComplete( $newId );
+    }
+
+    /**
+     * Whether any OPEN comment-copy failure flag is present
+     * (comment_copy_failed:*). Gates COMPLETE so an unrecovered, irreplaceable
+     * comment never lets the record be stamped-complete-and-skipped-forever.
+     *
+     * @param list<string> $flags
+     */
+    private function hasOpenCommentFailureFlag( array $flags ): bool {
+        foreach ( $flags as $flag ) {
+            if ( str_starts_with( (string) $flag, 'comment_copy_failed:' ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
