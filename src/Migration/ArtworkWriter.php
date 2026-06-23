@@ -106,19 +106,33 @@ final class ArtworkWriter {
      *   the value we wrote ourselves), then update.
      */
     private function writeOption( string $optionName, array $value ): void {
-        // add_option returns false when the option already exists.
-        if ( add_option( $optionName, $value ) ) {
+        $alreadyWritten = $this->keyAlreadyWritten( $optionName );
+
+        // Detect existence without relying on add_option's ambiguous false return:
+        // a unique sentinel default distinguishes "absent" from "present-but-falsey".
+        $sentinel = "\0__sermonator_absent__\0";
+        $current  = get_option( $optionName, $sentinel );
+
+        if ( $current === $sentinel ) {
+            // No pre-existing value: nothing to back up. Mark first, then write, so a
+            // crash between the two can never leave the value stamped without a marker.
             $this->markKeyWritten( $optionName );
+            add_option( $optionName, $value );
             return;
         }
 
-        // Pre-existing value. Back it up once, only if we have not already
-        // migrated (overwritten) this key in a prior run.
-        if ( ! $this->keyAlreadyWritten( $optionName ) ) {
-            $this->backupOption( $optionName, get_option( $optionName ) );
-            $this->markKeyWritten( $optionName );
+        // Pre-existing value. Back it up once, only if we have not already migrated
+        // (overwritten) this key in a prior run AND the currently-stored value is not
+        // already the value we are about to write. The value-equality check is the
+        // crash-window guard: if a prior run stamped our migrated value but died
+        // before recording the marker, the stored value already equals $value, so we
+        // must NOT back it up as if it were native — that would let rollback restore
+        // the migrated value instead of the true native one.
+        if ( ! $alreadyWritten && $current !== $value ) {
+            $this->backupOption( $optionName, $current );
         }
 
+        $this->markKeyWritten( $optionName );
         update_option( $optionName, $value );
     }
 

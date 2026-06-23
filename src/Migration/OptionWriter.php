@@ -118,21 +118,41 @@ final class OptionWriter {
      * @return bool Whether a pre-existing native value was backed up on this call.
      */
     private function writeOption( string $optionName, mixed $value ): bool {
-        // add_option returns false when the option already exists.
-        if ( add_option( $optionName, $value ) ) {
+        // Record the written-key marker BEFORE the irreversible add_option/
+        // update_option so a crash between the value write and the marker can never
+        // leave the value stamped without the marker. If we crashed the other way
+        // (marker stamped, value not yet written) the resume simply re-writes the
+        // value below — idempotent — and the keyAlreadyWritten guard correctly
+        // skips a (now-bogus) backup of whatever is currently stored.
+        $alreadyWritten = $this->keyAlreadyWritten( $optionName );
+
+        // Detect existence without relying on add_option's ambiguous false return:
+        // a unique sentinel default distinguishes "absent" from "present-but-falsey".
+        $sentinel = "\0__sermonator_absent__\0";
+        $current  = get_option( $optionName, $sentinel );
+
+        if ( $current === $sentinel ) {
+            // No pre-existing value: nothing to back up. Mark first, then write, so a
+            // crash between the two can never leave the value stamped without a marker.
             $this->markKeyWritten( $optionName );
+            add_option( $optionName, $value );
             return false;
         }
 
         $backedUp = false;
         // Pre-existing value. Back it up once, only if we have not already migrated
-        // (overwritten) this key in a prior run.
-        if ( ! $this->keyAlreadyWritten( $optionName ) ) {
-            $this->backupOption( $optionName, get_option( $optionName ) );
-            $this->markKeyWritten( $optionName );
+        // (overwritten) this key in a prior run AND the currently-stored value is
+        // not already the value we are about to write. The value-equality check is
+        // the crash-window guard: if a prior run stamped our migrated value but died
+        // before recording the marker, the stored value already equals $value, so we
+        // must NOT back it up as if it were native — that would let rollback restore
+        // the migrated value instead of the true native one.
+        if ( ! $alreadyWritten && $current !== $value ) {
+            $this->backupOption( $optionName, $current );
             $backedUp = true;
         }
 
+        $this->markKeyWritten( $optionName );
         update_option( $optionName, $value );
 
         return $backedUp;

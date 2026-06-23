@@ -271,6 +271,93 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         $this->assertSame( 'mediaelement', get_option( 'sermonator_player' ) );
     }
 
+    /**
+     * Crash-safety (IMPORTANT #6): the writer's add_option/update_option is
+     * irreversible; the written-key marker is a SEPARATE option write. If the
+     * process aborts AFTER the value is stamped but BEFORE markKeyWritten, the
+     * target option holds OUR OWN migrated value with no marker recorded. A naive
+     * resume sees add_option fail + keyAlreadyWritten false and backs up the
+     * migrated value into OPTION_PRE_MIGRATION_BACKUP as if it were native — so a
+     * later rollback restores the MIGRATED value, not the true native (which, in
+     * the add_option path, never existed; the key must simply not be backed up).
+     *
+     * We inject that exact crash window — migrated value present, marker absent —
+     * and assert the resume does NOT record the migrated value as a native backup.
+     */
+    public function test_resume_after_crash_does_not_backup_migrated_value_as_native(): void {
+        // No native sermonator_player exists; the legacy value is 'mediaelement'.
+        $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
+
+        // Crash injection: the prior run's add_option already stamped the migrated
+        // value, but the process died before markKeyWritten ran. Reproduce that
+        // state exactly: target holds OUR migrated value, NO written-key marker.
+        add_option( 'sermonator_player', 'mediaelement' );
+        $this->assertFalse(
+            get_option( Identifiers::OPTION_MIGRATION_PROGRESS ),
+            'precondition: no progress marker recorded (the crash window)'
+        );
+
+        // Resume.
+        ( new OptionWriter() )->migrate();
+
+        // The migrated value remains live.
+        $this->assertSame( 'mediaelement', get_option( 'sermonator_player' ) );
+
+        // The backup must NOT claim our migrated value as a native pre-existing one.
+        // There was no native value, so the key must not appear in the backup at all;
+        // if it appears, it must NEVER hold the migrated value.
+        $backup = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        if ( is_array( $backup ) && array_key_exists( 'sermonator_player', $backup ) ) {
+            $this->assertNotSame(
+                'mediaelement',
+                $backup['sermonator_player'],
+                'Resume backed up OUR migrated value as if it were the native value; rollback would restore the migrated value.'
+            );
+        } else {
+            $this->assertTrue( true ); // no spurious native backup recorded — correct.
+        }
+    }
+
+    /**
+     * The same crash window when a TRUE native value DID exist and was correctly
+     * backed up by the first run, but the crash struck between the native backup +
+     * marker and... actually the dangerous ordering is the reverse: native present,
+     * first run backs up native and marks key, THEN update_option writes migrated.
+     * If the crash strikes between markKeyWritten and update_option, the resume
+     * sees keyAlreadyWritten true and skips re-backup — correct. The only loss
+     * window is add_option-first (covered above). This test pins the native-present
+     * resume: after a crash that left the migrated value stamped, the ORIGINAL
+     * native backup must survive intact and never be overwritten by the migrated
+     * value.
+     */
+    public function test_resume_preserves_true_native_backup_not_migrated_value(): void {
+        // A church's true native value.
+        add_option( 'sermonator_player', 'native-choice' );
+        $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
+
+        // First run: backs up native, writes migrated.
+        ( new OptionWriter() )->migrate();
+        $backup = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        $this->assertSame( 'native-choice', $backup['sermonator_player'] );
+
+        // Crash injection: wipe the progress marker (as if the run died right after
+        // update_option, before/around the marker persist), leaving the migrated
+        // value live and NO marker — the worst-case resume input.
+        delete_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+
+        // Resume.
+        ( new OptionWriter() )->migrate();
+
+        // The backup must STILL hold the true native value, never the migrated one.
+        $backup = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        $this->assertSame(
+            'native-choice',
+            $backup['sermonator_player'],
+            'Resume overwrote the true native backup with our migrated value.'
+        );
+        $this->assertSame( 'mediaelement', get_option( 'sermonator_player' ) );
+    }
+
     public function test_legacy_options_untouched_byte_equal(): void {
         $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
         $this->fixture->setOption( 'sermonmanager_template', array( 'a' => 1 ) );

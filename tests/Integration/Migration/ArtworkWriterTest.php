@@ -330,6 +330,56 @@ final class ArtworkWriterTest extends WP_UnitTestCase {
         }
     }
 
+    /**
+     * Crash-safety (IMPORTANT #6): the writer's add_option/update_option is
+     * irreversible; the written-key marker is a SEPARATE option write. If the
+     * process aborts AFTER the migrated value is stamped but BEFORE markKeyWritten,
+     * sermonator_term_images holds OUR OWN migrated value with no marker. A naive
+     * resume sees the option exists + keyAlreadyWritten false and backs up the
+     * migrated value into OPTION_PRE_MIGRATION_BACKUP as if it were native — so a
+     * later rollback would restore the MIGRATED value, not the true native (which,
+     * in the add_option path, never existed; the key must simply not be backed up).
+     *
+     * We inject that exact crash window — migrated value present, marker absent —
+     * and assert the resume does NOT record the migrated value as a native backup.
+     */
+    public function test_resume_after_crash_does_not_backup_migrated_value_as_native(): void {
+        $tt = $this->migrateTwoTermsTtMap();
+        $this->fixture->seedArtwork( array( $tt['preacherLegacyTt'] => 500 ) );
+
+        // Compute what the writer will produce, then inject the crash state: the
+        // migrated value already stamped into the target, but NO written-key marker
+        // (the run died between add_option and markKeyWritten).
+        $migrated = array( $tt['newPreacherTt'] => 500 );
+        add_option( Identifiers::OPTION_TERM_IMAGES, $migrated );
+
+        // Wipe only the artwork written-key marker, faithfully reproducing the crash
+        // window (the term-migration progress markers under other sub-keys remain).
+        $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
+        if ( is_array( $progress ) && isset( $progress['artwork']['written_keys'] ) ) {
+            unset( $progress['artwork']['written_keys'] );
+            update_option( Identifiers::OPTION_MIGRATION_PROGRESS, $progress );
+        }
+
+        // Resume.
+        ( new ArtworkWriter() )->migrate( new TermCrosswalk() );
+
+        // The migrated value remains live.
+        $this->assertSame( $migrated, get_option( Identifiers::OPTION_TERM_IMAGES ) );
+
+        // The backup must NOT claim our migrated value as a native pre-existing one.
+        $backup = get_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
+        if ( is_array( $backup ) && array_key_exists( Identifiers::OPTION_TERM_IMAGES, $backup ) ) {
+            $this->assertNotSame(
+                $migrated,
+                $backup[ Identifiers::OPTION_TERM_IMAGES ],
+                'Resume backed up OUR migrated value as if it were native; rollback would restore the migrated value.'
+            );
+        } else {
+            $this->assertTrue( true ); // no spurious native backup recorded — correct.
+        }
+    }
+
     public function test_legacy_options_byte_equal_before_and_after(): void {
         $tt = $this->migrateTwoTermsTtMap();
 
