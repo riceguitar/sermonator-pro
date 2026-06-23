@@ -33,6 +33,11 @@ use Sermonator\Migration\MigrationState;
  * they PRINT the exact id set / blast radius FIRST and refuse to act unless the operator
  * passed --yes (the services re-check their own gates regardless, so a stray --yes can
  * never finalize an unverified migration — confirmation is necessary, not sufficient).
+ * They also acquire the SAME single Orchestrator advisory lock that `migrate` takes
+ * per-chunk (design-notes item 20: "destructive commands ... same advisory lock"): a
+ * destructive reversal/finalize and a concurrent `migrate` run in a second process must
+ * never interleave, so if a live run already holds the lock the destructive command
+ * refuses and touches nothing, leaving the lock intact for its owner.
  *
  * Output is routed through \WP_CLI:: (guarded by class_exists so the class also loads /
  * runs cleanly under a plain phpunit process where WP_CLI is undefined). The command is
@@ -232,7 +237,9 @@ final class MigrationCommand {
      *
      * Prints the EXACT pending-deletion id set FIRST, then refuses to act unless --yes
      * is passed. The Rollback service re-checks its own gates (it refuses outright when
-     * phase()==='finalized') regardless of --yes.
+     * phase()==='finalized') regardless of --yes. Acquires the Orchestrator advisory
+     * lock before acting and aborts (deleting nothing) if a live migration run holds
+     * it, so a concurrent `migrate` can never race this reversal.
      *
      * ## OPTIONS
      *
@@ -259,22 +266,37 @@ final class MigrationCommand {
             return;
         }
 
-        $result = $this->rollback->run();
+        // Acquire the SAME single advisory lock the Orchestrator uses per-chunk, so a
+        // concurrent `migrate` run in a second process can never interleave with this
+        // destructive reversal (force-deleting migration posts + stripping native
+        // term_relationships). If a live run holds the lock we refuse and touch
+        // NOTHING — the lock is left intact for its true owner. Release only on the
+        // path where WE acquired it (in finally), never another run's lock.
+        if ( ! $this->orchestrator->acquireLock() ) {
+            $this->warning( 'Rollback aborted: a migration run is in progress (advisory lock held). Nothing was deleted. Retry once it completes.' );
+            return;
+        }
 
-        $this->log( sprintf(
-            'Deleted: %d posts, %d terms, %d comments, %d options.',
-            count( $result['deleted']['posts'] ),
-            count( $result['deleted']['terms'] ),
-            count( $result['deleted']['comments'] ),
-            count( $result['deleted']['options'] )
-        ) );
-        foreach ( $result['restored'] as $opt ) {
-            $this->log( '  restored option: ' . $opt );
+        try {
+            $result = $this->rollback->run();
+
+            $this->log( sprintf(
+                'Deleted: %d posts, %d terms, %d comments, %d options.',
+                count( $result['deleted']['posts'] ),
+                count( $result['deleted']['terms'] ),
+                count( $result['deleted']['comments'] ),
+                count( $result['deleted']['options'] )
+            ) );
+            foreach ( $result['restored'] as $opt ) {
+                $this->log( '  restored option: ' . $opt );
+            }
+            foreach ( $result['warnings'] as $warning ) {
+                $this->warning( $warning );
+            }
+            $this->success( sprintf( 'Rollback complete — state: %s', $this->state->phase() ) );
+        } finally {
+            $this->orchestrator->releaseLock();
         }
-        foreach ( $result['warnings'] as $warning ) {
-            $this->warning( $warning );
-        }
-        $this->success( sprintf( 'Rollback complete — state: %s', $this->state->phase() ) );
     }
 
     /**
@@ -285,7 +307,9 @@ final class MigrationCommand {
      * (phase()==='verified' + a fresh drift rescan clean). Without --yes it prints the
      * blast radius and aborts. With --yes it passes confirmed=true to the Finalizer,
      * which still enforces every gate — so a stray --yes on an unverified migration is
-     * refused by the service, not finalized.
+     * refused by the service, not finalized. Acquires the Orchestrator advisory lock
+     * before acting and aborts (deleting nothing) if a live migration run holds it, so
+     * a concurrent `migrate` can never race this irreversible delete.
      *
      * ## OPTIONS
      *
@@ -306,21 +330,35 @@ final class MigrationCommand {
             return;
         }
 
-        $result = $this->finalizer->run( true );
-
-        if ( $result['refused'] !== null ) {
-            // A gated refusal is NOT a fatal CLI error — report it and leave state intact.
-            $this->warning( $result['refused'] );
+        // Acquire the SAME single advisory lock the Orchestrator uses per-chunk, so a
+        // concurrent `migrate` run in a second process can never interleave with this
+        // — the ONLY destructive step (wp_delete_post on verified legacy counterparts).
+        // If a live run holds the lock we refuse and touch NOTHING; the lock is left
+        // intact for its owner. Release only on the path where WE acquired it.
+        if ( ! $this->orchestrator->acquireLock() ) {
+            $this->warning( 'Finalize aborted: a migration run is in progress (advisory lock held). Nothing was deleted. Retry once it completes.' );
             return;
         }
 
-        $this->log( sprintf(
-            'Deleted %d legacy posts, %d legacy options; stripped %d back-ref rows.',
-            count( $result['deleted']['posts'] ),
-            count( $result['deleted']['options'] ),
-            (int) $result['stripped']
-        ) );
-        $this->success( sprintf( 'Finalize complete — state: %s (point of no return).', $this->state->phase() ) );
+        try {
+            $result = $this->finalizer->run( true );
+
+            if ( $result['refused'] !== null ) {
+                // A gated refusal is NOT a fatal CLI error — report it and leave state intact.
+                $this->warning( $result['refused'] );
+                return;
+            }
+
+            $this->log( sprintf(
+                'Deleted %d legacy posts, %d legacy options; stripped %d back-ref rows.',
+                count( $result['deleted']['posts'] ),
+                count( $result['deleted']['options'] ),
+                (int) $result['stripped']
+            ) );
+            $this->success( sprintf( 'Finalize complete — state: %s (point of no return).', $this->state->phase() ) );
+        } finally {
+            $this->orchestrator->releaseLock();
+        }
     }
 
     // -------------------------------------------------------------------------

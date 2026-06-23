@@ -253,6 +253,77 @@ final class CliTest extends WP_UnitTestCase {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Advisory-lock contention — destructive commands acquire the SAME single lock
+    // (design-notes item 20: "destructive commands ... same advisory lock") so they
+    // cannot interleave with a live `migrate` run in a second process. A fresh
+    // OPTION_LOCK held by another holder must make rollback/finalize REFUSE to act.
+    // -------------------------------------------------------------------------
+
+    /**
+     * rollback REFUSES (deletes nothing, state unchanged) while a FRESH advisory lock
+     * is held by a live run — even with --yes. This is the race the lock exists to
+     * close: a concurrent `migrate` chunk must never interleave with a force-delete of
+     * migration posts + native term_relationship strips.
+     */
+    public function test_rollback_refuses_while_lock_held(): void {
+        $this->seedDataset();
+
+        $cmd = new MigrationCommand();
+        $cmd->detect( array(), array() );
+        $cmd->migrate( array(), array( 'batch-size' => 50 ) );
+
+        $before = Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON );
+        $this->assertNotEmpty( $before );
+
+        // A live (non-expired) holder owns the single lock.
+        update_option( Orchestrator::OPTION_LOCK, time(), 'no' );
+
+        \Sermonator\Tests\Integration\Support\WpCliShim::reset();
+        $cmd->rollback( array(), array( 'yes' => true ) );
+
+        $after = Crosswalk::migratedPostIds( Identifiers::POST_TYPE_SERMON );
+        $this->assertSame( $before, $after, 'Rollback must delete nothing while the lock is held.' );
+        $this->assertSame( 'migrated', ( new MigrationState() )->phase(), 'State unchanged when the lock is held.' );
+
+        $log = \Sermonator\Tests\Integration\Support\WpCliShim::output();
+        $this->assertStringContainsString( 'Warning:', $log, 'Operator must be warned the lock is held.' );
+
+        // The lock is left intact for its true owner — rollback did not steal/release it.
+        $this->assertNotFalse( get_option( Orchestrator::OPTION_LOCK ), 'A refused rollback must not release another run\'s lock.' );
+    }
+
+    /**
+     * finalize REFUSES (deletes nothing, state unchanged, legacy intact) while a FRESH
+     * advisory lock is held — even when verified + --yes. The ONLY destructive step
+     * must not race a concurrent `migrate` reading legacy it is mid-delete on.
+     */
+    public function test_finalize_refuses_while_lock_held(): void {
+        $seed = $this->seedDataset();
+
+        $cmd = new MigrationCommand();
+        $cmd->detect( array(), array() );
+        $cmd->migrate( array(), array( 'batch-size' => 50 ) );
+        $cmd->verify( array(), array() );
+        $this->assertSame( 'verified', ( new MigrationState() )->phase() );
+
+        // A live holder owns the single lock.
+        update_option( Orchestrator::OPTION_LOCK, time(), 'no' );
+
+        \Sermonator\Tests\Integration\Support\WpCliShim::reset();
+        $cmd->finalize( array(), array( 'yes' => true ) );
+
+        $this->assertSame( 'verified', ( new MigrationState() )->phase(), 'Finalize must not finalize while the lock is held.' );
+        foreach ( $seed['sermons'] as $sid ) {
+            $this->assertInstanceOf( \WP_Post::class, get_post( $sid ), 'Legacy must survive a lock-blocked finalize.' );
+        }
+
+        $log = \Sermonator\Tests\Integration\Support\WpCliShim::output();
+        $this->assertStringContainsString( 'Warning:', $log, 'Operator must be warned the lock is held.' );
+
+        $this->assertNotFalse( get_option( Orchestrator::OPTION_LOCK ), 'A refused finalize must not release another run\'s lock.' );
+    }
+
     /** finalize WITH --yes runs ONLY when state === 'verified'. */
     public function test_finalize_with_yes_runs_only_when_verified(): void {
         $seed = $this->seedDataset();
