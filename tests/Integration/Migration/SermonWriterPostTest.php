@@ -543,6 +543,161 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertNotContains( 'post_parent_unresolved:' . $orphanParent, $resume->flags );
     }
 
+    // ----------------------------------- FIX 2: symmetric KSES restore (sermon)
+
+    /**
+     * FIX 2: insertKsesSafe must restore KSES filter state symmetrically.
+     * If KSES is OFF before write(), it must still be OFF after.
+     */
+    public function test_kses_filter_state_restored_symmetrically_when_off_before(): void {
+        kses_remove_filters();
+        $this->assertFalse(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'precondition: KSES must be OFF before write()'
+        );
+
+        $legacyId = $this->fixture->createSermon();
+        ( new SermonWriter() )->write( $legacyId );
+
+        $this->assertFalse(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'KSES must remain OFF after SermonWriter::write() when it was OFF before (symmetric restore)'
+        );
+
+        kses_init_filters();
+    }
+
+    /**
+     * FIX 2: If KSES is ON before write(), it must still be ON after.
+     */
+    public function test_kses_filter_state_restored_symmetrically_when_on_before(): void {
+        kses_init_filters();
+        $this->assertTrue(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'precondition: KSES must be ON before write()'
+        );
+
+        $legacyId = $this->fixture->createSermon();
+        ( new SermonWriter() )->write( $legacyId );
+
+        $this->assertTrue(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'KSES must remain ON after SermonWriter::write() when it was ON before (symmetric restore)'
+        );
+    }
+
+    // ----------------------------------- FIX 3: orphan adoption uniqueness (sermon)
+
+    /**
+     * FIX 3: Two legacy sermons sharing title + post_date_gmt — when each has a
+     * crash orphan, the writer must NOT mis-adopt across records. Require unique
+     * candidate; refuse if >1 matches.
+     */
+    public function test_sermon_orphan_not_adopted_when_multiple_candidates_match(): void {
+        $sharedTitle = 'Ambiguous Sermon ' . wp_generate_uuid4();
+        $sharedDate  = '2022-08-10 11:00:00';
+
+        $legacyA = (int) wp_insert_post( array(
+            'post_type'     => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'    => $sharedTitle,
+            'post_status'   => 'publish',
+            'post_date'     => $sharedDate,
+            'post_date_gmt' => $sharedDate,
+            'post_content'  => 'Auto blob A',
+        ) );
+        add_post_meta( $legacyA, LegacyIdentifiers::META_DESCRIPTION, '<p>Description A</p>' );
+
+        $legacyB = (int) wp_insert_post( array(
+            'post_type'     => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'    => $sharedTitle,
+            'post_status'   => 'publish',
+            'post_date'     => $sharedDate,
+            'post_date_gmt' => $sharedDate,
+            'post_content'  => 'Auto blob B',
+        ) );
+        add_post_meta( $legacyB, LegacyIdentifiers::META_DESCRIPTION, '<p>Description B</p>' );
+
+        // Inject TWO back-ref-less orphans with the same title + date, creating
+        // an ambiguous situation; the writer must refuse to adopt either.
+        $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => $sharedTitle,
+                'post_date'     => $sharedDate,
+                'post_date_gmt' => $sharedDate,
+                'post_content'  => '<p>Description A</p>',
+            )
+        );
+        $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => $sharedTitle,
+                'post_date'     => $sharedDate,
+                'post_date_gmt' => $sharedDate,
+                'post_content'  => '<p>Description B</p>',
+            )
+        );
+
+        $writer  = new SermonWriter();
+        $resultA = $writer->write( $legacyA );
+        $resultB = $writer->write( $legacyB );
+
+        // Both legacy records must migrate to distinct posts.
+        $this->assertNotSame( $resultA->newId, $resultB->newId, 'Each legacy sermon must map to a distinct new post' );
+
+        // Back-refs must point to the correct legacy ids.
+        $this->assertSame(
+            (string) $legacyA,
+            (string) get_post_meta( $resultA->newId, Crosswalk::LEGACY_POST_ID, true ),
+            'resultA back-ref must point to legacyA'
+        );
+        $this->assertSame(
+            (string) $legacyB,
+            (string) get_post_meta( $resultB->newId, Crosswalk::LEGACY_POST_ID, true ),
+            'resultB back-ref must point to legacyB'
+        );
+    }
+
+    /**
+     * FIX 3: A native look-alike sermon (no back-ref, same title + date, but
+     * DIFFERENT post_content) must NOT be adopted.
+     */
+    public function test_sermon_native_lookalike_not_adopted_when_content_differs(): void {
+        $sharedTitle = 'Lookalike Sermon ' . wp_generate_uuid4();
+        $sharedDate  = '2022-09-01 08:30:00';
+
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'     => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'    => $sharedTitle,
+            'post_status'   => 'publish',
+            'post_date'     => $sharedDate,
+            'post_date_gmt' => $sharedDate,
+            'post_content'  => 'Auto blob',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '<p>Real sermon body</p>' );
+
+        // A native (admin-created) post with matching title + date but different content.
+        $nativeId = $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => $sharedTitle,
+                'post_date'     => $sharedDate,
+                'post_date_gmt' => $sharedDate,
+                'post_content'  => 'DIFFERENT native body — not our orphan',
+            )
+        );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $this->assertNotSame( $nativeId, $result->newId, 'The native look-alike with different content must not be adopted' );
+        $this->assertSame(
+            (string) $legacyId,
+            (string) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true )
+        );
+    }
+
+    // ---
+
     public function test_legacy_post_and_meta_byte_equal_before_and_after(): void {
         $legacyId = (int) wp_insert_post( array(
             'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,

@@ -355,12 +355,17 @@ final class PodcastWriter {
         }
 
         if ( is_int( $value ) || ( is_string( $value ) && ctype_digit( $value ) ) ) {
+            // A value of 0/empty means "not scoped to any term" in Sermon Manager.
+            // Pass through verbatim — no crosswalk attempt, no flag.
+            if ( 0 === (int) $value ) {
+                return $value;
+            }
             $new = $this->terms->newTermId( (int) $value );
             if ( null !== $new ) {
                 return is_string( $value ) ? (string) $new : $new;
             }
-            // Unresolved — never a silent drop. Leave the legacy id in place and
-            // flag it so COMPLETE is withheld and the id self-heals later.
+            // Unresolved positive id — never a silent drop. Leave the legacy id in
+            // place and flag it so COMPLETE is withheld and the id self-heals later.
             $flags[] = 'missing_podcast_term_crosswalk:' . (int) $value;
         }
 
@@ -373,11 +378,16 @@ final class PodcastWriter {
      * quotes/backslashes/unicode are not corrupted by wp_insert_post's unslash.
      */
     private function insertKsesSafe( array $postarr ): int {
-        kses_remove_filters();
+        $kses_on = has_filter( 'content_save_pre', 'wp_filter_post_kses' );
+        if ( $kses_on ) {
+            kses_remove_filters();
+        }
         try {
             $newId = wp_insert_post( wp_slash( $postarr ), true );
         } finally {
-            kses_init_filters();
+            if ( $kses_on ) {
+                kses_init_filters();
+            }
         }
 
         if ( is_wp_error( $newId ) ) {
@@ -473,6 +483,9 @@ final class PodcastWriter {
     private function findBackRefLessPostByLegacyIdentity( \WP_Post $legacy ): ?int {
         global $wpdb;
 
+        // Three-predicate match: GMT date + title + post_content. The content
+        // discriminator guards against mis-adopting a distinct podcast that happens
+        // to share only the first two identity columns (title + date collision).
         $ids = $wpdb->get_col(
             $wpdb->prepare(
                 "SELECT p.ID FROM {$wpdb->posts} p"
@@ -481,18 +494,36 @@ final class PodcastWriter {
                 . " WHERE p.post_type = %s"
                 . "   AND p.post_date_gmt = %s"
                 . "   AND p.post_title = %s"
+                . "   AND p.post_content = %s"
                 . "   AND backref.meta_id IS NULL"
                 . " ORDER BY p.ID ASC",
                 Crosswalk::LEGACY_POST_ID,
                 Identifiers::POST_TYPE_PODCAST,
                 $legacy->post_date_gmt,
-                $legacy->post_title
+                $legacy->post_title,
+                $legacy->post_content
             )
         );
 
         $ids = array_values( array_map( 'intval', (array) $ids ) );
 
-        return $ids === array() ? null : $ids[0];
+        // Refuse to adopt if more than one candidate matches: a cross-adoption
+        // would swap content between distinct feeds. The caller falls through to
+        // a fresh insert, which surfaces the ambiguity without silent data loss.
+        if ( count( $ids ) !== 1 ) {
+            if ( count( $ids ) > 1 ) {
+                error_log( sprintf(
+                    'PodcastWriter: %d back-ref-less orphan candidates for legacy podcast %d (title=%s, date=%s) — refusing adoption to avoid cross-record content swap.',
+                    count( $ids ),
+                    $legacy->ID,
+                    $legacy->post_title,
+                    $legacy->post_date_gmt
+                ) );
+            }
+            return null;
+        }
+
+        return $ids[0];
     }
 
     /** Whether a migrated post has been marked complete. */

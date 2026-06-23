@@ -41,8 +41,10 @@ final class Identifiers {
      * Sentinel companion value written for a non-numeric sermon_date row that the
      * DateNormalizer could NOT parse. Writing a companion for EVERY non-numeric row
      * (parseable or not) keeps META_DATE_NORMALIZED[i] positionally aligned with
-     * META_DATE[i]; this marker flags the unparseable position so a consumer never
-     * mistakes a missing companion for a numeric row and never mis-indexes.
+     * the NON-NUMERIC SUBSEQUENCE of META_DATE (numeric rows are skipped with
+     * `continue` in applyDateNormalization() and receive no companion); this marker
+     * flags the unparseable position so a consumer never mistakes a missing companion
+     * for a parseable row and never mis-indexes within the non-numeric subsequence.
      */
     public const META_DATE_UNPARSEABLE          = 'sermonator_date_unparseable';
 

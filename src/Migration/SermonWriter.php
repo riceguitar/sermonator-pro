@@ -145,6 +145,11 @@ final class SermonWriter {
             return new WriteResult( 0, false, array( 'legacy_post_missing:' . $legacyId ) );
         }
 
+        // Body reconciliation from (post_content, sermon_description, post_content_temp).
+        // Computed BEFORE the crash-orphan probe so the reconciled content can serve
+        // as a third discriminating predicate in findBackRefLessPostByLegacyIdentity().
+        $reconciled = $this->reconcileBody( $legacyId, $legacy );
+
         // POST-LEVEL CRASH-ORPHAN RECOVERY. The fresh insert below writes the
         // LEGACY_POST_ID back-ref ATOMICALLY via meta_input, so the post-then-
         // back-ref window is closed going forward. But a post left back-ref-less by
@@ -154,20 +159,16 @@ final class SermonWriter {
         // rollback-invisible orphan. Before inserting, probe for our own back-ref-
         // less orphan matching this legacy identity and ADOPT it: stamp the back-ref
         // and re-enter the spine on it rather than minting a second post.
-        $orphanId = $this->findBackRefLessPostByLegacyIdentity( $legacy );
+        $orphanId = $this->findBackRefLessPostByLegacyIdentity( $legacy, $reconciled['content'] );
         if ( null !== $orphanId ) {
             Crosswalk::markLegacy( $orphanId, $legacyId );
-            $reconciledForOrphan = $this->reconcileBody( $legacyId, $legacy );
-            $flags = $this->applyPostInsertSpine( $orphanId, $legacyId, $legacy, $reconciledForOrphan, array(), false );
+            $flags = $this->applyPostInsertSpine( $orphanId, $legacyId, $legacy, $reconciled, array(), false );
             $this->markCompleteUnlessCommentFailureOpen( $orphanId, $flags );
 
             return new WriteResult( $orphanId, false, $flags, true );
         }
 
         $flags = array();
-
-        // Body reconciliation from (post_content, sermon_description, post_content_temp).
-        $reconciled = $this->reconcileBody( $legacyId, $legacy );
 
         // post_parent translation for the initial insert: a non-zero legacy parent
         // is translated through the crosswalk; an untranslatable parent collapses to
@@ -1092,11 +1093,16 @@ final class SermonWriter {
      * quotes/backslashes/unicode are not corrupted by wp_insert_post's unslash.
      */
     private function insertKsesSafe( array $postarr ): int {
-        kses_remove_filters();
+        $kses_on = has_filter( 'content_save_pre', 'wp_filter_post_kses' );
+        if ( $kses_on ) {
+            kses_remove_filters();
+        }
         try {
             $newId = wp_insert_post( wp_slash( $postarr ), true );
         } finally {
-            kses_init_filters();
+            if ( $kses_on ) {
+                kses_init_filters();
+            }
         }
 
         if ( is_wp_error( $newId ) ) {
@@ -1122,9 +1128,15 @@ final class SermonWriter {
      *
      * @return int|null The orphan post id to adopt, or null if none.
      */
-    private function findBackRefLessPostByLegacyIdentity( \WP_Post $legacy ): ?int {
+    private function findBackRefLessPostByLegacyIdentity( \WP_Post $legacy, string $reconciledContent ): ?int {
         global $wpdb;
 
+        // Three-predicate match: GMT date + title + reconciled post_content. The
+        // content discriminator guards against mis-adopting a distinct sermon whose
+        // only shared columns with the legacy source are the title and date. The
+        // reconciled content (not the legacy raw post_content) is used because that
+        // is what the writer inserted — the orphan's post_content column holds the
+        // reconciled description, not the legacy auto-blob.
         $ids = $wpdb->get_col(
             $wpdb->prepare(
                 "SELECT p.ID FROM {$wpdb->posts} p"
@@ -1133,18 +1145,36 @@ final class SermonWriter {
                 . " WHERE p.post_type = %s"
                 . "   AND p.post_date_gmt = %s"
                 . "   AND p.post_title = %s"
+                . "   AND p.post_content = %s"
                 . "   AND backref.meta_id IS NULL"
                 . " ORDER BY p.ID ASC",
                 Crosswalk::LEGACY_POST_ID,
                 Identifiers::POST_TYPE_SERMON,
                 $legacy->post_date_gmt,
-                $legacy->post_title
+                $legacy->post_title,
+                $reconciledContent
             )
         );
 
         $ids = array_values( array_map( 'intval', (array) $ids ) );
 
-        return $ids === array() ? null : $ids[0];
+        // Refuse to adopt if more than one candidate matches: a cross-adoption
+        // would swap content between distinct sermons. The caller falls through to
+        // a fresh insert, which surfaces the ambiguity without silent data loss.
+        if ( count( $ids ) !== 1 ) {
+            if ( count( $ids ) > 1 ) {
+                error_log( sprintf(
+                    'SermonWriter: %d back-ref-less orphan candidates for legacy sermon %d (title=%s, date=%s) — refusing adoption to avoid cross-record content swap.',
+                    count( $ids ),
+                    $legacy->ID,
+                    $legacy->post_title,
+                    $legacy->post_date_gmt
+                ) );
+            }
+            return null;
+        }
+
+        return $ids[0];
     }
 
     /** Whether a migrated post has been marked complete. */

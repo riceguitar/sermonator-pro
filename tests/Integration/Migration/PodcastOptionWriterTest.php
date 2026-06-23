@@ -655,6 +655,234 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         );
     }
 
+    // ----------------------------------- FIX 1: term-id-0 unscoped passthrough
+
+    /**
+     * FIX 1: A podcast settings taxonomy key with integer value 0 means "not
+     * scoped to any term" in Sermon Manager. It must NOT trigger a
+     * missing_podcast_term_crosswalk flag, must stamp MIGRATION_COMPLETE, and
+     * must NOT re-write (clobber admin edits) on a second write() call.
+     */
+    public function test_podcast_term_id_zero_is_unscoped_not_flagged(): void {
+        $settings = array(
+            'itunes_author'                => 'Church',
+            LegacyIdentifiers::TAX_SERIES => 0,
+        );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings );
+
+        $writer = new PodcastWriter();
+        $first  = $writer->write( $legacyId );
+
+        $flags = get_post_meta( $first->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $flags = is_array( $flags ) ? $flags : array();
+        foreach ( $flags as $flag ) {
+            $this->assertStringNotContainsString(
+                'missing_podcast_term_crosswalk',
+                (string) $flag,
+                'A term id of 0 (unscoped) must never produce a crosswalk flag'
+            );
+        }
+
+        $this->assertSame(
+            '1',
+            (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'MIGRATION_COMPLETE must be stamped for an unscoped (term id 0) podcast'
+        );
+
+        $settingsAfterFirst = get_post_meta( $first->newId, Identifiers::META_PODCAST_SETTINGS, true );
+
+        $second = $writer->write( $legacyId );
+        $this->assertSame( $first->newId, $second->newId, 'no second insert' );
+        $settingsAfterSecond = get_post_meta( $first->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertSame(
+            $settingsAfterFirst,
+            $settingsAfterSecond,
+            'second write() must not re-write settings (admin edits would be clobbered)'
+        );
+    }
+
+    /**
+     * FIX 1: Same test with string "0" — ctype_digit("0") is true, so the old
+     * code attempted a crosswalk on term id 0 (which returns null) and flagged it.
+     */
+    public function test_podcast_term_id_zero_string_is_unscoped_not_flagged(): void {
+        $settings = array(
+            LegacyIdentifiers::TAX_SERIES => '0',
+        );
+        $legacyId = $this->fixture->createPodcastWithSettings( $settings );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $flags = get_post_meta( $result->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $flags = is_array( $flags ) ? $flags : array();
+        foreach ( $flags as $flag ) {
+            $this->assertStringNotContainsString(
+                'missing_podcast_term_crosswalk',
+                (string) $flag,
+                'String "0" (unscoped) must never produce a crosswalk flag'
+            );
+        }
+        $this->assertSame(
+            '1',
+            (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ),
+            'MIGRATION_COMPLETE must be stamped for a string "0" (unscoped) podcast'
+        );
+    }
+
+    // ----------------------------------- FIX 2: symmetric KSES restore (podcast)
+
+    /**
+     * FIX 2: insertKsesSafe must restore KSES filter state symmetrically.
+     * If KSES is OFF before write(), it must still be OFF after.
+     */
+    public function test_podcast_kses_filter_state_restored_symmetrically_when_off_before(): void {
+        kses_remove_filters();
+        $this->assertFalse(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'precondition: KSES must be OFF before write()'
+        );
+
+        $legacyId = $this->fixture->createPodcast( 'KSES Off Test' );
+        ( new PodcastWriter() )->write( $legacyId );
+
+        $this->assertFalse(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'KSES must remain OFF after PodcastWriter::write() when it was OFF before (symmetric restore)'
+        );
+
+        kses_init_filters();
+    }
+
+    /**
+     * FIX 2: If KSES is ON before write(), it must still be ON after.
+     */
+    public function test_podcast_kses_filter_state_restored_symmetrically_when_on_before(): void {
+        kses_init_filters();
+        $this->assertTrue(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'precondition: KSES must be ON before write()'
+        );
+
+        $legacyId = $this->fixture->createPodcast( 'KSES On Test' );
+        ( new PodcastWriter() )->write( $legacyId );
+
+        $this->assertTrue(
+            (bool) has_filter( 'content_save_pre', 'wp_filter_post_kses' ),
+            'KSES must remain ON after PodcastWriter::write() when it was ON before (symmetric restore)'
+        );
+    }
+
+    // ----------------------------------- FIX 3: orphan adoption uniqueness (podcast)
+
+    /**
+     * FIX 3: Two legacy podcasts sharing title + post_date_gmt — when ONE has a
+     * crash orphan, the writer must NOT mis-adopt the orphan for the OTHER legacy
+     * record (content swap). Require unique candidate; refuse if >1 matches and
+     * additionally discriminate by post_content.
+     */
+    public function test_podcast_orphan_not_adopted_when_multiple_candidates_match(): void {
+        $sharedTitle = 'Ambiguous Feed ' . wp_generate_uuid4();
+        $sharedDate  = '2022-06-15 10:00:00';
+
+        // Two DISTINCT legacy podcasts that share title + date (unusual but possible).
+        $legacyA = (int) wp_insert_post( array(
+            'post_type'     => LegacyIdentifiers::POST_TYPE_PODCAST,
+            'post_title'    => $sharedTitle,
+            'post_status'   => 'publish',
+            'post_date'     => $sharedDate,
+            'post_date_gmt' => $sharedDate,
+            'post_content'  => 'Content from feed A',
+        ) );
+        add_post_meta( $legacyA, LegacyIdentifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Author A' ) );
+
+        $legacyB = (int) wp_insert_post( array(
+            'post_type'     => LegacyIdentifiers::POST_TYPE_PODCAST,
+            'post_title'    => $sharedTitle,
+            'post_status'   => 'publish',
+            'post_date'     => $sharedDate,
+            'post_date_gmt' => $sharedDate,
+            'post_content'  => 'Content from feed B',
+        ) );
+        add_post_meta( $legacyB, LegacyIdentifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Author B' ) );
+
+        // Inject TWO back-ref-less orphan posts matching the same title + date,
+        // so the finder sees >1 candidate and must refuse to adopt (no crosswalk).
+        $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_PODCAST,
+            array(
+                'post_title'    => $sharedTitle,
+                'post_date'     => $sharedDate,
+                'post_date_gmt' => $sharedDate,
+                'post_content'  => 'Content from feed A',
+            )
+        );
+        $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_PODCAST,
+            array(
+                'post_title'    => $sharedTitle,
+                'post_date'     => $sharedDate,
+                'post_date_gmt' => $sharedDate,
+                'post_content'  => 'Content from feed B',
+            )
+        );
+
+        $writer  = new PodcastWriter();
+        $resultA = $writer->write( $legacyA );
+        $resultB = $writer->write( $legacyB );
+
+        // Both legacy records must migrate successfully (fresh inserts, not mis-adopted).
+        $this->assertNotSame( $resultA->newId, $resultB->newId, 'Each legacy record must map to a distinct new post' );
+
+        // Neither result should have cross-adopted: A's settings must appear on A's post, B's on B's.
+        $settingsA = get_post_meta( $resultA->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $settingsB = get_post_meta( $resultB->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertSame( 'Author A', $settingsA['itunes_author'] ?? null, 'legacyA settings must be on resultA post' );
+        $this->assertSame( 'Author B', $settingsB['itunes_author'] ?? null, 'legacyB settings must be on resultB post' );
+    }
+
+    /**
+     * FIX 3: A native look-alike (no back-ref, same title + date, but DIFFERENT
+     * post_content) must NOT be adopted — the content discriminator must reject it.
+     */
+    public function test_podcast_native_lookalike_not_adopted_when_content_differs(): void {
+        $sharedTitle = 'Lookalike Feed ' . wp_generate_uuid4();
+        $sharedDate  = '2022-07-20 09:00:00';
+
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'     => LegacyIdentifiers::POST_TYPE_PODCAST,
+            'post_title'    => $sharedTitle,
+            'post_status'   => 'publish',
+            'post_date'     => $sharedDate,
+            'post_date_gmt' => $sharedDate,
+            'post_content'  => 'Legacy podcast content',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Legacy Church' ) );
+
+        // A native (admin-created) post that happens to share title + date
+        // but has DIFFERENT content — must NOT be adopted as the crash orphan.
+        $nativeId = $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_PODCAST,
+            array(
+                'post_title'    => $sharedTitle,
+                'post_date'     => $sharedDate,
+                'post_date_gmt' => $sharedDate,
+                'post_content'  => 'DIFFERENT native content — not our orphan',
+            )
+        );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        // The native look-alike must NOT have been adopted; a fresh post was created.
+        $this->assertNotSame( $nativeId, $result->newId, 'The native look-alike with different content must not be adopted' );
+        // The new post belongs to legacyId.
+        $this->assertSame(
+            (string) $legacyId,
+            (string) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true )
+        );
+    }
+
+    // ---
+
     public function test_legacy_options_untouched_byte_equal(): void {
         $this->fixture->setOption( 'sermonmanager_player', 'mediaelement' );
         $this->fixture->setOption( 'sermonmanager_template', array( 'a' => 1 ) );
