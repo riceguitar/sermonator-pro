@@ -368,26 +368,56 @@ final class Verifier {
 
     /**
      * Verify the migrated sermonmanager_* options: each legacy option maps via
-     * mapOptionName() to a target option that must exist with an EQUAL value. The
-     * default-podcast pointer carries NO sermonmanager_ prefix, so it is NOT in this
-     * scan — it is verified separately by verifyDefaultPodcast().
+     * mapOptionName() to a target option that must exist with the EXPECTED value.
+     * The default-podcast pointer carries NO sermonmanager_ prefix, so it is NOT in
+     * this scan — it is verified separately by verifyDefaultPodcast().
+     *
+     * For ordinary options the expected target value IS the legacy value (verbatim
+     * prefix swap). For the CLOSED set of id-bearing default-term options
+     * (sermonator_default_series / _preacher / _service_type / _book / _topic) the
+     * value is INTENTIONALLY transformed: OptionWriter remaps the embedded legacy
+     * term id to the NEW term id. Comparing such an option against the raw legacy
+     * value would false-positive every real install (legacy term id != new term id)
+     * — flagging spurious drift AND under-counting the option, which would
+     * permanently block Finalize on a correct migration. So we compute the EXPECTED
+     * remapped value via the SHARED OptionIdRemapper (the exact transform OptionWriter
+     * applied, so the two cannot drift) and compare the target against THAT.
+     *
+     * An option whose remap is still PENDING (the embedded term id was unresolvable
+     * at migrate time, so OptionIdRemapper would re-emit a missing_option_id_crosswalk
+     * flag) is NOT verifiable as clean — the value legitimately still holds the legacy
+     * id awaiting self-heal. We treat a pending remap as drift so completeness is
+     * withheld until the option is re-migrated against the live crosswalk.
      *
      * @param array<string,int> $counts
      * @param list<int>          $drift
      * @param list<int>          $missing
      */
     private function verifyOptions( Manifest $m, array &$drift, array &$missing, array &$counts ): void {
+        $crosswalk = new TermCrosswalk();
+
         foreach ( $this->legacyOptionNames() as $legacyName ) {
             $targetName = MappingContract::mapOptionName( $legacyName );
             if ( $targetName === null ) {
                 continue;
             }
 
-            // Default value-equality: the migrated option must carry the legacy value.
+            // The EXPECTED target value: the legacy value put through the SAME embedded
+            // id remap OptionWriter applied (a no-op for non-id-bearing options).
             $legacyValue = get_option( $legacyName );
-            $marker      = '__sermonator_option_absent__';
-            $newValue    = get_option( $targetName, $marker );
-            if ( $newValue === $marker || $newValue != $legacyValue ) { // loose: serialized round-trip
+            $remapped    = OptionIdRemapper::remap( $targetName, $legacyValue, $crosswalk );
+
+            // A still-pending remap (unresolvable embedded id) cannot verify clean —
+            // the value legitimately differs from BOTH legacy and the eventual new id.
+            if ( $remapped['flags'] !== array() ) {
+                $drift[] = $this->optionSentinel( $legacyName );
+                continue;
+            }
+
+            $expectedValue = $remapped['value'];
+            $marker        = '__sermonator_option_absent__';
+            $newValue      = get_option( $targetName, $marker );
+            if ( $newValue === $marker || $newValue != $expectedValue ) { // loose: serialized round-trip
                 $drift[] = $this->optionSentinel( $legacyName );
                 continue;
             }

@@ -464,6 +464,92 @@ final class VerifierTest extends WP_UnitTestCase {
         $this->assertSame( 'verified', ( new MigrationState() )->phase() );
     }
 
+    public function test_default_term_option_remap_verifies_complete_not_false_drift(): void {
+        // REGRESSION: the 5 id-bearing default-term options (sermonmanager_default_*)
+        // are INTENTIONALLY value-transformed — OptionWriter remaps the embedded
+        // legacy term id to the NEW term id. The migrated target value therefore
+        // differs from the raw legacy value BY DESIGN. A naive legacy==new compare in
+        // verifyOptions() false-positives this as drift AND fails to count the option,
+        // making complete=false and permanently blocking Finalize on any real install
+        // with a sermonmanager_default_series set. The Verifier must compare the
+        // target against the EXPECTED remapped value (via the shared OptionIdRemapper),
+        // so a correctly migrated default-term option verifies clean.
+        $preacher = $this->fixture->createTerm( LegacyIdentifiers::TAX_PREACHER, 'Pastor Bob' );
+        $series   = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Advent' );
+        $sid      = $this->fixture->createSermon();
+        wp_set_object_terms( $sid, array( $preacher ), LegacyIdentifiers::TAX_PREACHER );
+        wp_set_object_terms( $sid, array( $series ), LegacyIdentifiers::TAX_SERIES );
+        $podcast = $this->fixture->createPodcast( 'Feed' );
+        $this->fixture->setOption( LegacyIdentifiers::OPTION_DEFAULT_PODCAST, $podcast );
+
+        // Point the default-series option at the REAL legacy term id (string form,
+        // as WP stores it).
+        $this->fixture->setOption( 'sermonmanager_default_series', (string) $series );
+
+        $orch = new Orchestrator();
+        $orch->detect();
+        $guard = 0;
+        do {
+            $progress = $orch->run( 50 );
+            $guard++;
+        } while ( $progress['phase'] !== 'migrated' && $guard < 100 );
+        $this->assertSame( 'migrated', ( new MigrationState() )->phase() );
+
+        // The migrated target holds the NEW term id (not the legacy one) — proving the
+        // value was intentionally transformed.
+        $newSeries = Crosswalk::findNewTermByLegacyId( $series, Identifiers::TAX_SERIES );
+        $this->assertNotNull( $newSeries );
+        $this->assertSame( (string) $newSeries, (string) get_option( 'sermonator_default_series' ),
+            'Sanity: the default-series option holds the NEW term id (legacy != new).' );
+        $this->assertNotSame( (string) $series, (string) get_option( 'sermonator_default_series' ),
+            'Sanity: the migrated value differs from the raw legacy value by design.' );
+
+        $manifest = ( new MigrationState() )->manifest();
+        $report   = ( new Verifier() )->verify( $manifest );
+
+        $this->assertSame( array(), $report->drift,
+            'A correctly remapped default-term option must NOT be flagged as drift.' );
+        $this->assertTrue( $report->complete,
+            'A correctly remapped default-term option must verify complete (not block Finalize).' );
+        $this->assertSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
+    public function test_default_term_option_corrupted_remap_lands_in_drift_not_complete(): void {
+        // Negative: corrupt the remapped default-term option AFTER migrate so it no
+        // longer holds the EXPECTED new term id. The Verifier must surface drift and
+        // refuse completeness — otherwise Finalize would delete the legacy option with
+        // a broken pointer left behind.
+        $preacher = $this->fixture->createTerm( LegacyIdentifiers::TAX_PREACHER, 'Pastor Bob' );
+        $series   = $this->fixture->createTerm( LegacyIdentifiers::TAX_SERIES, 'Advent' );
+        $sid      = $this->fixture->createSermon();
+        wp_set_object_terms( $sid, array( $preacher ), LegacyIdentifiers::TAX_PREACHER );
+        wp_set_object_terms( $sid, array( $series ), LegacyIdentifiers::TAX_SERIES );
+        $podcast = $this->fixture->createPodcast( 'Feed' );
+        $this->fixture->setOption( LegacyIdentifiers::OPTION_DEFAULT_PODCAST, $podcast );
+        $this->fixture->setOption( 'sermonmanager_default_series', (string) $series );
+
+        $orch = new Orchestrator();
+        $orch->detect();
+        $guard = 0;
+        do {
+            $progress = $orch->run( 50 );
+            $guard++;
+        } while ( $progress['phase'] !== 'migrated' && $guard < 100 );
+        $this->assertSame( 'migrated', ( new MigrationState() )->phase() );
+
+        // Corrupt the target: stamp a value that is NOT the expected remapped new id.
+        update_option( 'sermonator_default_series', '987654' );
+
+        $manifest = ( new MigrationState() )->manifest();
+        $report   = ( new Verifier() )->verify( $manifest );
+
+        $this->assertFalse( $report->complete,
+            'A corrupted default-term remap must make the report incomplete.' );
+        $this->assertNotEmpty( $report->drift,
+            'A default-term option not equal to the expected remapped value must land in drift.' );
+        $this->assertNotSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
     public function test_cleared_target_option_lands_in_drift_not_complete(): void {
         // Negative options path: clear the migrated target option AFTER migrate so it
         // no longer carries the legacy value. The Verifier must surface an option
