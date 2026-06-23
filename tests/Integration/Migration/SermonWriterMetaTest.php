@@ -416,4 +416,140 @@ final class SermonWriterMetaTest extends WP_UnitTestCase {
         $after = $this->snapshot( $legacyId );
         $this->assertSame( $before, $after, 'Legacy post/meta were mutated by the writer.' );
     }
+
+    // ------------------------------------------------------------------ FIX 1: meta-key target collision
+
+    public function test_colliding_source_keys_produce_union_and_flag(): void {
+        // FIX 1 (IMPORTANT): two distinct legacy source keys that resolve to the SAME
+        // target key must produce a UNION on the new post (both values retained) and
+        // record a meta_key_collision:<targetKey> migration flag. The current code
+        // deletes-then-re-adds once per LEGACY key, so the second iteration's delete
+        // wipes the first iteration's writes — silent meta loss.
+        //
+        // sermon_video → sermonator_video_embed (via metaKeyMap)
+        // sermonator_video_embed (stray verbatim) → sermonator_video_embed (unknown key, pass-through)
+        //
+        // Legacy post carries BOTH: the second iteration's delete currently wipes the first.
+        $legacyId = $this->bareSermon();
+        add_post_meta( $legacyId, LegacyIdentifiers::META_VIDEO, '<iframe src="mapped.com"></iframe>' );
+        add_post_meta( $legacyId, \Sermonator\Schema\Identifiers::META_VIDEO_EMBED, '<iframe src="stray.com"></iframe>' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $values = get_post_meta( $result->newId, \Sermonator\Schema\Identifiers::META_VIDEO_EMBED, false );
+        $this->assertCount( 2, $values, 'Both values (union) must be retained on the target key' );
+        $this->assertContains( '<iframe src="mapped.com"></iframe>', $values );
+        $this->assertContains( '<iframe src="stray.com"></iframe>', $values );
+
+        // Flag must be recorded.
+        $this->assertContains(
+            'meta_key_collision:' . \Sermonator\Schema\Identifiers::META_VIDEO_EMBED,
+            $result->flags,
+            'meta_key_collision flag must appear in WriteResult::flags'
+        );
+        $persisted = (array) get_post_meta( $result->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertContains(
+            'meta_key_collision:' . \Sermonator\Schema\Identifiers::META_VIDEO_EMBED,
+            $persisted,
+            'meta_key_collision flag must be persisted in MIGRATION_FLAGS'
+        );
+
+        // Legacy source is READ-ONLY.
+        $this->assertSame( 1, count( get_post_meta( $legacyId, LegacyIdentifiers::META_VIDEO, false ) ) );
+        $this->assertSame( 1, count( get_post_meta( $legacyId, \Sermonator\Schema\Identifiers::META_VIDEO_EMBED, false ) ) );
+    }
+
+    public function test_colliding_source_keys_idempotent_on_resume(): void {
+        // A second write() must produce the same union (not double it) and the flag
+        // must not accumulate duplicates.
+        $legacyId = $this->bareSermon();
+        add_post_meta( $legacyId, LegacyIdentifiers::META_VIDEO, '<iframe src="a.com"></iframe>' );
+        add_post_meta( $legacyId, \Sermonator\Schema\Identifiers::META_VIDEO_EMBED, '<iframe src="b.com"></iframe>' );
+
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+
+        // Crash-inject to force resume.
+        delete_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE );
+        $second = $writer->write( $legacyId );
+        $this->assertTrue( $second->resumed );
+
+        $values = get_post_meta( $first->newId, \Sermonator\Schema\Identifiers::META_VIDEO_EMBED, false );
+        $this->assertCount( 2, $values, 'Resume must produce the same 2-value union, not 4' );
+
+        // Flag de-duplicated.
+        $flagKey = 'meta_key_collision:' . \Sermonator\Schema\Identifiers::META_VIDEO_EMBED;
+        $this->assertCount( 1, array_keys( $second->flags, $flagKey ), 'collision flag must not be duplicated after resume' );
+    }
+
+    // ------------------------------------------------------------------ FIX 3: adopted-orphan stale meta
+
+    public function test_adopted_orphan_stale_meta_is_removed(): void {
+        // FIX 3 (recommended): when an orphan is adopted, any user-meta key on the
+        // orphan that is NOT present in the legacy source must be removed (divergence
+        // from source). Migration's own back-ref keys are EXCLUDED from deletion.
+        $legacyId = $this->bareSermon();
+        add_post_meta( $legacyId, LegacyIdentifiers::META_BIBLE_PASSAGE, 'John 3:16' );
+
+        // Inject orphan carrying a stale meta key absent from legacy.
+        $orphanId = $this->fixture->injectBackRefLessPostOrphan(
+            \Sermonator\Schema\Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => get_post( $legacyId )->post_title,
+                'post_date'     => get_post( $legacyId )->post_date,
+                'post_date_gmt' => get_post( $legacyId )->post_date_gmt,
+                'post_content'  => '<p>The real body of the sermon.</p>',
+            )
+        );
+        // Stale key absent from legacy — simulates an older writer that wrote extra meta.
+        add_post_meta( $orphanId, 'stale_orphan_key', 'leftover_value' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $this->assertSame( $orphanId, $result->newId, 'orphan must be adopted' );
+
+        // Stale key must be removed.
+        $this->assertSame(
+            '',
+            (string) get_post_meta( $result->newId, 'stale_orphan_key', true ),
+            'stale orphan meta key absent from legacy must be removed'
+        );
+
+        // Migration's own back-ref keys must be retained.
+        $this->assertSame(
+            (string) $legacyId,
+            (string) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true ),
+            'LEGACY_POST_ID back-ref must be retained'
+        );
+    }
+
+    public function test_adopted_orphan_own_keys_not_deleted(): void {
+        // Migration's own keys (LEGACY_POST_ID, MIGRATION_COMPLETE, MIGRATION_FLAGS,
+        // LEGACY_SLUG, LEGACY_POST_CONTENT) must NOT be deleted during stale-meta cleanup.
+        $legacyId = $this->bareSermon();
+
+        $orphanId = $this->fixture->injectBackRefLessPostOrphan(
+            \Sermonator\Schema\Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => get_post( $legacyId )->post_title,
+                'post_date'     => get_post( $legacyId )->post_date,
+                'post_date_gmt' => get_post( $legacyId )->post_date_gmt,
+                'post_content'  => '<p>The real body of the sermon.</p>',
+            )
+        );
+        // Pre-stamp some own keys to verify they survive.
+        add_post_meta( $orphanId, Crosswalk::LEGACY_SLUG, 'old-slug' );
+        add_post_meta( $orphanId, Crosswalk::LEGACY_POST_CONTENT, 'old body' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $this->assertSame( $orphanId, $result->newId, 'orphan must be adopted' );
+
+        // Own keys preserved — they were NOT stale, they are the migration's own.
+        $this->assertSame(
+            (string) $legacyId,
+            (string) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true ),
+            'LEGACY_POST_ID must be retained'
+        );
+    }
 }

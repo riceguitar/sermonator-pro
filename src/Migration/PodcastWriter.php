@@ -267,6 +267,19 @@ final class PodcastWriter {
         $rawByKey = get_post_meta( $legacyId );
         $rawByKey = is_array( $rawByKey ) ? $rawByKey : array();
 
+        // FIX (IMPORTANT #9): accumulate the full target multiset FIRST so that two
+        // distinct legacy source keys that resolve to the SAME target key produce a
+        // UNION rather than silent loss. For PodcastWriter the only rename is
+        // sm_podcast_settings → sermonator_podcast_settings; all other keys pass
+        // through verbatim. A stray verbatim sermonator_podcast_settings row on the
+        // legacy post plus the renamed sm_podcast_settings row both resolve to the
+        // same target — the second iteration's delete used to wipe the first.
+        //
+        // array<targetKey, list<value>>
+        $targetValues = array();
+        // array<targetKey, list<legacyKey>>
+        $targetSources = array();
+
         foreach ( array_keys( $rawByKey ) as $legacyKey ) {
             // Never carry our OWN back-ref / state rows across (a podcast being
             // resumed already has them; the legacy podcast never does).
@@ -275,13 +288,17 @@ final class PodcastWriter {
             }
 
             $isSettings = ( LegacyIdentifiers::META_PODCAST_SETTINGS === $legacyKey );
-            $newKey     = $isSettings ? Identifiers::META_PODCAST_SETTINGS : $legacyKey;
+            $newKey     = $isSettings ? Identifiers::META_PODCAST_SETTINGS : (string) $legacyKey;
 
             // UNSERIALIZED per-key values.
             $values = get_post_meta( $legacyId, $legacyKey, false );
             $values = is_array( $values ) ? array_values( $values ) : array();
 
-            delete_post_meta( $newId, $newKey );
+            if ( ! isset( $targetValues[ $newKey ] ) ) {
+                $targetValues[ $newKey ]  = array();
+                $targetSources[ $newKey ] = array();
+            }
+
             foreach ( $values as $value ) {
                 if ( $isSettings ) {
                     // SM historically stores sm_podcast_settings as a SERIALIZED
@@ -301,6 +318,24 @@ final class PodcastWriter {
                         $value = $this->remapSettingsTerms( $value, $flags );
                     }
                 }
+                $targetValues[ $newKey ][]  = $value;
+            }
+            $targetSources[ $newKey ][] = (string) $legacyKey;
+        }
+
+        // Collect collision flags (>1 distinct legacy source key → same target key).
+        $collisionFlags = array();
+        foreach ( $targetSources as $newKey => $sources ) {
+            if ( count( array_unique( $sources ) ) > 1 ) {
+                $collisionFlags[] = 'meta_key_collision:' . $newKey;
+            }
+        }
+
+        // Delete-then-re-add the UNIONED values per target key: idempotent on
+        // resume, preserves the full multiset.
+        foreach ( $targetValues as $newKey => $values ) {
+            delete_post_meta( $newId, $newKey );
+            foreach ( $values as $value ) {
                 // get_post_meta(...,false) values are UNSLASHED; add_post_meta()'s
                 // add_metadata() wp_unslash()es its input, so we MUST wp_slash() here
                 // or a backslash level is stripped (enclosure/audio UNC paths, escaped
@@ -311,6 +346,8 @@ final class PodcastWriter {
                 add_post_meta( $newId, $newKey, wp_slash( $value ) );
             }
         }
+
+        $flags = array_merge( $flags, $collisionFlags );
 
         return array_values( array_unique( $flags ) );
     }
@@ -527,9 +564,15 @@ final class PodcastWriter {
     private function findBackRefLessPostByLegacyIdentity( \WP_Post $legacy ): ?int {
         global $wpdb;
 
-        // Three-predicate match: GMT date + title + post_content. The content
-        // discriminator guards against mis-adopting a distinct podcast that happens
-        // to share only the first two identity columns (title + date collision).
+        // FIX (IMPORTANT #9): match on strong discriminators only — post_date_gmt +
+        // post_title + post_type + back-ref-absent. The previous implementation also
+        // required post_content byte-equality with the legacy raw body, but the
+        // probe's purpose is to adopt an orphan left by an OLDER writer — exactly the
+        // version most likely to have stored a DIFFERENT body. A one-byte content
+        // drift returned zero rows, causing a fresh insert and SILENTLY DUPLICATING
+        // the podcast (no back-ref → invisible to Verifier, Rollback, and the >1
+        // guard). The >1 guard below keeps the safe behaviour: when more than one
+        // back-ref-less candidate matches, none is adopted.
         $ids = $wpdb->get_col(
             $wpdb->prepare(
                 "SELECT p.ID FROM {$wpdb->posts} p"
@@ -538,14 +581,12 @@ final class PodcastWriter {
                 . " WHERE p.post_type = %s"
                 . "   AND p.post_date_gmt = %s"
                 . "   AND p.post_title = %s"
-                . "   AND p.post_content = %s"
                 . "   AND backref.meta_id IS NULL"
                 . " ORDER BY p.ID ASC",
                 Crosswalk::LEGACY_POST_ID,
                 Identifiers::POST_TYPE_PODCAST,
                 $legacy->post_date_gmt,
-                $legacy->post_title,
-                $legacy->post_content
+                $legacy->post_title
             )
         );
 

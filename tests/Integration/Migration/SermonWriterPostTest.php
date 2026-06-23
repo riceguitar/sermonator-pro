@@ -785,10 +785,15 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
     }
 
     /**
-     * FIX 3: A native look-alike sermon (no back-ref, same title + date, but
-     * DIFFERENT post_content) must NOT be adopted.
+     * FIX 2 (IMPORTANT #9): the orphan probe now matches on title+date+type+back-ref-absent
+     * ONLY — post_content is no longer a discriminator. When exactly one back-ref-less
+     * candidate matches, it is ADOPTED regardless of content (the cross-version content-
+     * drift case). A native look-alike (same title+date, different content, no back-ref)
+     * is therefore ALSO adopted if it is the only match — the >1 guard keeps the
+     * ambiguous-multi case safe. The spec accepts this trade-off: a back-ref stamp on a
+     * byte-coinciding native post is content-loss-free and vanishingly rare in practice.
      */
-    public function test_sermon_native_lookalike_not_adopted_when_content_differs(): void {
+    public function test_sermon_single_backref_less_candidate_adopted_regardless_of_content(): void {
         $sharedTitle = 'Lookalike Sermon ' . wp_generate_uuid4();
         $sharedDate  = '2022-09-01 08:30:00';
 
@@ -802,20 +807,23 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         ) );
         add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '<p>Real sermon body</p>' );
 
-        // A native (admin-created) post with matching title + date but different content.
-        $nativeId = $this->fixture->injectBackRefLessPostOrphan(
+        // A back-ref-less post with matching title + date but different content.
+        // After FIX 2 this is ADOPTED (not bypassed) — exactly-one-candidate rule.
+        $candidateId = $this->fixture->injectBackRefLessPostOrphan(
             Identifiers::POST_TYPE_SERMON,
             array(
                 'post_title'    => $sharedTitle,
                 'post_date'     => $sharedDate,
                 'post_date_gmt' => $sharedDate,
-                'post_content'  => 'DIFFERENT native body — not our orphan',
+                'post_content'  => 'DIFFERENT body — content drift / native lookalike',
             )
         );
 
         $result = ( new SermonWriter() )->write( $legacyId );
 
-        $this->assertNotSame( $nativeId, $result->newId, 'The native look-alike with different content must not be adopted' );
+        // ADOPTED: exactly one back-ref-less candidate, so adopted regardless of content.
+        $this->assertSame( $candidateId, $result->newId, 'Single back-ref-less candidate must be adopted regardless of post_content.' );
+        $this->assertFalse( $result->created, 'Adoption must not set created=true.' );
         $this->assertSame(
             (string) $legacyId,
             (string) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true )
@@ -841,5 +849,101 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
 
         $after = $this->snapshot( $legacyId );
         $this->assertSame( $before, $after, 'Legacy post/meta were mutated by the writer.' );
+    }
+
+    // ------------------------------------------------------------------ FIX 2: content-drift orphan adoption
+
+    public function test_crash_orphan_adopted_despite_content_drift(): void {
+        // FIX 2 (IMPORTANT): the orphan-adoption probe currently requires post_content
+        // byte-equality with the FRESHLY-RECONCILED body. An older writer may have
+        // stored a DIFFERENT body (raw legacy content, or a differently-reconciled body)
+        // — a one-byte drift returns zero rows, the code falls through to a fresh insert
+        // and DUPLICATES the sermon. The fix: match on strong discriminators only
+        // (post_date_gmt + post_title + post_type + back-ref-absent), ignoring
+        // post_content when exactly ONE candidate matches.
+        $uuid     = wp_generate_uuid4();
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'Content Drift Sermon ' . $uuid,
+            'post_status'  => 'publish',
+            'post_date'     => '2022-06-15 12:00:00',
+            'post_date_gmt' => '2022-06-15 12:00:00',
+            'post_content' => 'raw legacy blob',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '<p>reconciled body</p>' );
+
+        // Orphan carries a DIFFERENT post_content than what the current writer would
+        // produce — exactly the cross-version content-drift scenario.
+        $orphanId = $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => 'Content Drift Sermon ' . $uuid,
+                'post_date'     => '2022-06-15 12:00:00',
+                'post_date_gmt' => '2022-06-15 12:00:00',
+                'post_content'  => 'OLDER WRITER stored a different body — drift',
+            )
+        );
+        $this->assertSame( '', (string) get_post_meta( $orphanId, Crosswalk::LEGACY_POST_ID, true ), 'precondition: orphan is back-ref-less' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        // Must ADOPT, not create a duplicate.
+        $this->assertFalse( $result->created, 'Orphan with drifted content must be adopted, not re-created.' );
+        $this->assertSame( $orphanId, $result->newId, 'The drifted orphan must be the migration target.' );
+
+        // Exactly ONE migrated sermon — no duplicate.
+        $migrated = get_posts( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+            'meta_key'    => Crosswalk::LEGACY_POST_ID,
+        ) );
+        $this->assertCount( 1, $migrated, 'Content-drift orphan adoption must not leave a duplicate.' );
+        $this->assertSame( array( $orphanId ), array_map( 'intval', $migrated ) );
+
+        // Back-ref stamped on the orphan.
+        $this->assertSame(
+            (string) $legacyId,
+            (string) get_post_meta( $orphanId, Crosswalk::LEGACY_POST_ID, true )
+        );
+    }
+
+    public function test_ambiguous_orphans_refuse_adoption(): void {
+        // The >1-ambiguous-refuses guard must remain green: when more than one
+        // back-ref-less candidate matches title+date+type, none is adopted.
+        $uuid     = wp_generate_uuid4();
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'Ambiguous Sermon ' . $uuid,
+            'post_status'  => 'publish',
+            'post_date'     => '2023-01-01 00:00:00',
+            'post_date_gmt' => '2023-01-01 00:00:00',
+            'post_content' => 'auto',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, 'body' );
+
+        // Two back-ref-less orphans with the same title+date — ambiguous.
+        $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => 'Ambiguous Sermon ' . $uuid,
+                'post_date'     => '2023-01-01 00:00:00',
+                'post_date_gmt' => '2023-01-01 00:00:00',
+            )
+        );
+        $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => 'Ambiguous Sermon ' . $uuid,
+                'post_date'     => '2023-01-01 00:00:00',
+                'post_date_gmt' => '2023-01-01 00:00:00',
+            )
+        );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        // Falls through to fresh insert (not adopting either ambiguous candidate).
+        $this->assertTrue( $result->created, 'Ambiguous orphans (>1 candidate) must not be adopted — fall through to fresh insert.' );
     }
 }

@@ -1577,4 +1577,37 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         // Cleanup.
         unregister_taxonomy( $testTaxonomy );
     }
+
+    // -------------------------------- FIX 1: comment-meta key collision (copyCommentMeta)
+
+    public function test_comment_meta_exact_duplicate_keys_produce_union(): void {
+        // FIX 1 (copyCommentMeta path): copyCommentMeta also has the same delete-then-
+        // re-add-per-source-key shape. For comment meta, keys pass through verbatim
+        // (no rename map), so the only collision is an exact-dup key (same legacy key
+        // appears twice via iteration — only possible if WP somehow allows duplicate
+        // keys, which get_comment_meta($id) returns as a keyed array so duplicate keys
+        // are impossible in practice). The real FIX 1 risk here is in the accumulate-
+        // first path so let's verify the basic guarantee: two distinct values under the
+        // SAME comment-meta key round-trip as a multiset via copyCommentMeta.
+        $legacyId  = $this->bareSermon();
+        $commentId = (int) wp_insert_comment( array(
+            'comment_post_ID'  => $legacyId,
+            'comment_author'   => 'Eve',
+            'comment_content'  => 'Multi-value meta test',
+            'comment_approved' => '1',
+        ) );
+        add_comment_meta( $commentId, 'review_score', '4' );
+        add_comment_meta( $commentId, 'review_score', '5' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $newComments = get_comments( array( 'post_id' => $result->newId ) );
+        $this->assertCount( 1, $newComments );
+        $newCommentId = (int) $newComments[0]->comment_ID;
+
+        $scores = get_comment_meta( $newCommentId, 'review_score', false );
+        $this->assertCount( 2, $scores, 'Both comment-meta values must be copied (multiset preserved)' );
+        $this->assertContains( '4', $scores );
+        $this->assertContains( '5', $scores );
+    }
 }

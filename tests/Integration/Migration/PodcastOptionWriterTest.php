@@ -450,6 +450,87 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         $this->assertSame( $before, $after, 'Legacy podcast post/meta were mutated by the writer.' );
     }
 
+    // -------------------------------- FIX 1 (podcast): meta-key target collision
+
+    public function test_podcast_colliding_source_keys_produce_union_and_flag(): void {
+        // FIX 1 (IMPORTANT, podcast path): sm_podcast_settings → sermonator_podcast_settings
+        // (known rename). A legacy podcast carrying BOTH 'sm_podcast_settings' (renamed)
+        // AND a stray verbatim 'sermonator_podcast_settings' row (unknown key, pass-through)
+        // produces a collision. The current code's second-iteration delete wipes the first.
+        // After the fix both values must be on the new post (union) and a collision flag recorded.
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_PODCAST,
+            'post_title'  => 'Collision Feed ' . wp_generate_uuid4(),
+            'post_status' => 'publish',
+        ) );
+        // The RENAMED source key.
+        add_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Church A' ) );
+        // A stray verbatim target-key row (unknown key path — passes through unchanged).
+        add_post_meta( $legacyId, Identifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Church B' ) );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $values = get_post_meta( $result->newId, Identifiers::META_PODCAST_SETTINGS, false );
+        $this->assertCount( 2, $values, 'Both podcast settings values (union) must be retained on the target key' );
+
+        $this->assertContains(
+            'meta_key_collision:' . Identifiers::META_PODCAST_SETTINGS,
+            $result->flags,
+            'meta_key_collision flag must appear for podcast settings collision'
+        );
+        $persisted = (array) get_post_meta( $result->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertContains(
+            'meta_key_collision:' . Identifiers::META_PODCAST_SETTINGS,
+            $persisted,
+            'collision flag must be persisted in MIGRATION_FLAGS'
+        );
+    }
+
+    // -------------------------------- FIX 2 (podcast): content-drift orphan adoption
+
+    public function test_podcast_crash_orphan_adopted_despite_content_drift(): void {
+        // FIX 2 (IMPORTANT, podcast path): the orphan probe currently uses post_content
+        // byte-equality. An older-writer orphan with a different body must still be adopted
+        // when title+date_gmt uniquely identify it.
+        $uuid     = wp_generate_uuid4();
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_PODCAST,
+            'post_title'   => 'Drift Feed ' . $uuid,
+            'post_status'  => 'publish',
+            'post_date'     => '2022-09-01 08:00:00',
+            'post_date_gmt' => '2022-09-01 08:00:00',
+            'post_content' => 'legacy raw feed body',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Church' ) );
+
+        // Orphan with a DIFFERENT body — cross-version content drift.
+        $orphanId = $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_PODCAST,
+            array(
+                'post_title'    => 'Drift Feed ' . $uuid,
+                'post_date'     => '2022-09-01 08:00:00',
+                'post_date_gmt' => '2022-09-01 08:00:00',
+                'post_content'  => 'OLDER WRITER stored a completely different body',
+            )
+        );
+        $this->assertSame( '', (string) get_post_meta( $orphanId, Crosswalk::LEGACY_POST_ID, true ), 'precondition: orphan is back-ref-less' );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $this->assertFalse( $result->created, 'Podcast orphan with drifted content must be adopted, not re-created.' );
+        $this->assertSame( $orphanId, $result->newId );
+
+        $migrated = get_posts( array(
+            'post_type'   => Identifiers::POST_TYPE_PODCAST,
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+            'meta_key'    => Crosswalk::LEGACY_POST_ID,
+        ) );
+        $this->assertCount( 1, $migrated, 'Content-drift orphan adoption must not duplicate the podcast.' );
+        $this->assertSame( (string) $legacyId, (string) get_post_meta( $orphanId, Crosswalk::LEGACY_POST_ID, true ) );
+    }
+
     // ------------------------------------------------------------------- Options
 
     public function test_sermonmanager_options_mapped_verbatim_value_and_type(): void {
@@ -871,10 +952,13 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
     }
 
     /**
-     * FIX 3: A native look-alike (no back-ref, same title + date, but DIFFERENT
-     * post_content) must NOT be adopted — the content discriminator must reject it.
+     * FIX 2 (IMPORTANT #9): the orphan probe now matches on title+date+type+back-ref-absent
+     * ONLY — post_content is no longer a discriminator. When exactly one back-ref-less
+     * candidate matches, it is ADOPTED regardless of content. A back-ref-less post with
+     * the same title+date (whether native or old-writer orphan) is adopted when it is the
+     * only candidate — the >1 guard keeps ambiguous-multi cases safe.
      */
-    public function test_podcast_native_lookalike_not_adopted_when_content_differs(): void {
+    public function test_podcast_single_backref_less_candidate_adopted_regardless_of_content(): void {
         $sharedTitle = 'Lookalike Feed ' . wp_generate_uuid4();
         $sharedDate  = '2022-07-20 09:00:00';
 
@@ -888,23 +972,23 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         ) );
         add_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Legacy Church' ) );
 
-        // A native (admin-created) post that happens to share title + date
-        // but has DIFFERENT content — must NOT be adopted as the crash orphan.
-        $nativeId = $this->fixture->injectBackRefLessPostOrphan(
+        // A back-ref-less post with matching title + date but different content.
+        // After FIX 2 this is ADOPTED — exactly-one-candidate rule, content ignored.
+        $candidateId = $this->fixture->injectBackRefLessPostOrphan(
             Identifiers::POST_TYPE_PODCAST,
             array(
                 'post_title'    => $sharedTitle,
                 'post_date'     => $sharedDate,
                 'post_date_gmt' => $sharedDate,
-                'post_content'  => 'DIFFERENT native content — not our orphan',
+                'post_content'  => 'DIFFERENT content — content drift or native lookalike',
             )
         );
 
         $result = ( new PodcastWriter() )->write( $legacyId );
 
-        // The native look-alike must NOT have been adopted; a fresh post was created.
-        $this->assertNotSame( $nativeId, $result->newId, 'The native look-alike with different content must not be adopted' );
-        // The new post belongs to legacyId.
+        // ADOPTED: exactly one back-ref-less candidate, adopted regardless of content.
+        $this->assertSame( $candidateId, $result->newId, 'Single back-ref-less candidate must be adopted regardless of post_content.' );
+        $this->assertFalse( $result->created, 'Adoption must not set created=true.' );
         $this->assertSame(
             (string) $legacyId,
             (string) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true )

@@ -602,6 +602,26 @@ final class TermWriterMigrateTermTest extends WP_UnitTestCase {
         $this->assertCount( 1, get_term_meta( $newId, Crosswalk::LEGACY_TERM_ID, false ), 're-run must not duplicate the back-ref' );
     }
 
+    // -------------------------------- FIX 1: term-meta multiset preservation (copyTermMeta)
+
+    public function test_term_meta_multivalue_key_preserved_as_full_multiset(): void {
+        // FIX 1 (copyTermMeta path): two values under the same term-meta key must
+        // round-trip as a multiset (delete-then-re-add). For term meta there is no
+        // rename map — keys pass through verbatim — so exact-dup collision is not
+        // possible, but the basic multiset discipline must still hold.
+        $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_PREACHER, 'Multi Meta ' . wp_generate_uuid4() );
+        add_term_meta( $legacyId, 'campus', 'North Campus' );
+        add_term_meta( $legacyId, 'campus', 'South Campus' );
+
+        $legacy = get_term( $legacyId, LegacyIdentifiers::TAX_PREACHER );
+        $newId  = ( new \Sermonator\Migration\TermWriter() )->migrateTerm( LegacyIdentifiers::TAX_PREACHER, $legacy );
+
+        $campuses = get_term_meta( $newId, 'campus', false );
+        $this->assertCount( 2, $campuses, 'Both term-meta values must be copied (multiset)' );
+        $this->assertContains( 'North Campus', $campuses );
+        $this->assertContains( 'South Campus', $campuses );
+    }
+
     /** @param list<mixed> $flagRows @return list<string> */
     private function flattenFlags( array $flagRows ): array {
         $out = array();

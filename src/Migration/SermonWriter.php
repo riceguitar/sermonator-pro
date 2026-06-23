@@ -181,8 +181,6 @@ final class SermonWriter {
         }
 
         // Body reconciliation from (post_content, sermon_description, post_content_temp).
-        // Computed BEFORE the crash-orphan probe so the reconciled content can serve
-        // as a third discriminating predicate in findBackRefLessPostByLegacyIdentity().
         $reconciled = $this->reconcileBody( $legacyId, $legacy );
 
         // POST-LEVEL CRASH-ORPHAN RECOVERY. The fresh insert below writes the
@@ -194,9 +192,16 @@ final class SermonWriter {
         // rollback-invisible orphan. Before inserting, probe for our own back-ref-
         // less orphan matching this legacy identity and ADOPT it: stamp the back-ref
         // and re-enter the spine on it rather than minting a second post.
-        $orphanId = $this->findBackRefLessPostByLegacyIdentity( $legacy, $reconciled['content'] );
+        $orphanId = $this->findBackRefLessPostByLegacyIdentity( $legacy );
         if ( null !== $orphanId ) {
             Crosswalk::markLegacy( $orphanId, $legacyId );
+            // FIX 3 (recommended): before driving the spine, purge any user-meta key
+            // on the adopted orphan that is NOT present in the legacy source. An older
+            // writer may have written extra keys (stale keys) that the current writer
+            // would not write — leaving them causes divergence from source. Migration's
+            // own back-ref keys are excluded from deletion so the freshly-stamped
+            // LEGACY_POST_ID (and any pre-existing Crosswalk keys) are never removed.
+            $this->purgeOrphanMeta( $orphanId, $legacyId );
             $flags = $this->applyPostInsertSpine( $orphanId, $legacyId, $legacy, $reconciled, array(), false );
             $this->markCompleteUnlessCommentFailureOpen( $orphanId, $flags );
 
@@ -485,9 +490,22 @@ final class SermonWriter {
         $rawByKey = get_post_meta( $legacyId );
         $rawByKey = is_array( $rawByKey ) ? $rawByKey : array();
 
-        $mapped = SermonMetaMapper::map( $rawByKey );
-        $keyMap = MappingContract::metaKeyMap();
+        $mapped  = SermonMetaMapper::map( $rawByKey );
+        $keyMap  = MappingContract::metaKeyMap();
         $dropped = MappingContract::droppedMetaKeys();
+
+        // FIX (IMPORTANT #9): accumulate the full target multiset FIRST so that two
+        // distinct legacy source keys that resolve to the SAME target key produce a
+        // UNION on the new post rather than silent loss (the old per-legacy-key
+        // delete-then-re-add wiped a previous iteration's writes when the target key
+        // collided). Group unserialized values by resolved TARGET key, track which
+        // target keys are touched by more than one DISTINCT legacy source key so we
+        // can raise a meta_key_collision flag for those.
+        //
+        // array<targetKey, list<value>>
+        $targetValues = array();
+        // array<targetKey, list<legacyKey>> — which source keys contributed
+        $targetSources = array();
 
         foreach ( array_keys( $rawByKey ) as $legacyKey ) {
             // sermon_description becomes post_content (handled by the reconciler);
@@ -503,8 +521,29 @@ final class SermonWriter {
             $values = get_post_meta( $legacyId, $legacyKey, false );
             $values = is_array( $values ) ? array_values( $values ) : array();
 
-            // Delete-then-re-add the full multiset: idempotent on resume, preserves
-            // multi-value ordering/arity, replaces single-value rows.
+            if ( ! isset( $targetValues[ $newKey ] ) ) {
+                $targetValues[ $newKey ]  = array();
+                $targetSources[ $newKey ] = array();
+            }
+            foreach ( $values as $v ) {
+                $targetValues[ $newKey ][] = $v;
+            }
+            $targetSources[ $newKey ][] = (string) $legacyKey;
+        }
+
+        // Collect collision flags before writing (raised when >1 distinct legacy
+        // source keys resolve to the same target key).
+        $collisionFlags = array();
+        foreach ( $targetSources as $newKey => $sources ) {
+            if ( count( array_unique( $sources ) ) > 1 ) {
+                $collisionFlags[] = 'meta_key_collision:' . $newKey;
+            }
+        }
+
+        // Now delete-then-re-add the UNIONED values per target key: idempotent on
+        // resume, preserves the full multiset (including values contributed by
+        // multiple legacy source keys), replaces single-value rows.
+        foreach ( $targetValues as $newKey => $values ) {
             delete_post_meta( $newId, $newKey );
             foreach ( $values as $value ) {
                 // get_post_meta(...,false) values are UNSLASHED; add_post_meta()'s
@@ -529,8 +568,73 @@ final class SermonWriter {
         if ( $this->applyDateNormalization( $newId, $legacyId ) ) {
             $flags[] = 'legacy_nonnumeric_date';
         }
+        $flags = array_merge( $flags, $collisionFlags );
 
         return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * FIX 3: purge stale user-meta keys from an adopted crash-orphan.
+     *
+     * When adopting a back-ref-less orphan, it may carry user-meta keys written
+     * by an older writer that the current writer would NOT write (e.g. an extra
+     * denorm key, a renamed key written under its old name, or a key the writer
+     * since dropped). Leaving stale keys causes divergence from the legacy source —
+     * the invariant is that the migrated post's meta is derived entirely from the
+     * legacy source.
+     *
+     * Keys to KEEP (excluded from deletion):
+     *  - keys whose resolved legacy source is present (applyMeta will re-write them)
+     *  - the migration's own back-ref/state keys (Crosswalk::*) which are NEVER
+     *    user data and must be preserved for idempotency/rollback
+     *
+     * We snapshot orphan keys BEFORE applyMeta rewrites them so we delete the
+     * stale keys FIRST (this method is called just before applyPostInsertSpine).
+     */
+    private function purgeOrphanMeta( int $orphanId, int $legacyId ): void {
+        // Keys the migration framework owns — never delete these.
+        $ownKeys = array(
+            Crosswalk::LEGACY_POST_ID,
+            Crosswalk::LEGACY_SLUG,
+            Crosswalk::MIGRATION_COMPLETE,
+            Crosswalk::MIGRATION_FLAGS,
+            Crosswalk::LEGACY_POST_CONTENT,
+        );
+
+        // Build the set of TARGET keys that applyMeta will write from the legacy
+        // source (after rename and excluding dropped keys) — these should NOT be
+        // deleted even if present on the orphan already.
+        $rawByKey = get_post_meta( $legacyId );
+        $rawByKey = is_array( $rawByKey ) ? $rawByKey : array();
+        $keyMap   = MappingContract::metaKeyMap();
+        $dropped  = MappingContract::droppedMetaKeys();
+
+        $legacyTargetKeys = array();
+        foreach ( array_keys( $rawByKey ) as $legacyKey ) {
+            if ( in_array( $legacyKey, $dropped, true ) ) {
+                continue;
+            }
+            $legacyTargetKeys[] = $keyMap[ $legacyKey ] ?? $legacyKey;
+        }
+        $legacyTargetKeys = array_values( array_unique( $legacyTargetKeys ) );
+
+        // Snapshot the orphan's current meta keys.
+        $orphanMeta = get_post_meta( $orphanId );
+        $orphanMeta = is_array( $orphanMeta ) ? $orphanMeta : array();
+
+        foreach ( array_keys( $orphanMeta ) as $key ) {
+            $key = (string) $key;
+            // Keep migration's own keys.
+            if ( in_array( $key, $ownKeys, true ) ) {
+                continue;
+            }
+            // Keep keys that applyMeta will (re-)write from the legacy source.
+            if ( in_array( $key, $legacyTargetKeys, true ) ) {
+                continue;
+            }
+            // Stale key: remove it (all rows for this key).
+            delete_post_meta( $orphanId, $key );
+        }
     }
 
     /**
@@ -1519,15 +1623,24 @@ final class SermonWriter {
      *
      * @return int|null The orphan post id to adopt, or null if none.
      */
-    private function findBackRefLessPostByLegacyIdentity( \WP_Post $legacy, string $reconciledContent ): ?int {
+    private function findBackRefLessPostByLegacyIdentity( \WP_Post $legacy ): ?int {
         global $wpdb;
 
-        // Three-predicate match: GMT date + title + reconciled post_content. The
-        // content discriminator guards against mis-adopting a distinct sermon whose
-        // only shared columns with the legacy source are the title and date. The
-        // reconciled content (not the legacy raw post_content) is used because that
-        // is what the writer inserted — the orphan's post_content column holds the
-        // reconciled description, not the legacy auto-blob.
+        // FIX (IMPORTANT #9): match on strong discriminators only — post_date_gmt +
+        // post_title + post_type + back-ref-absent. The previous implementation also
+        // required post_content byte-equality (bound to the FRESHLY-RECONCILED body),
+        // but the probe's purpose is to adopt an orphan left by an OLDER writer —
+        // exactly the version most likely to have stored a DIFFERENT body (raw legacy
+        // content, or a differently-reconciled body). A one-byte content drift returned
+        // zero rows, the code fell through to a fresh wp_insert_post, and an
+        // irreplaceable sermon was SILENTLY DUPLICATED (no back-ref → invisible to the
+        // Verifier, Rollback, and the >1 guard — reopening the duplicate-orphan hole
+        // on the real cross-version crash-resume path).
+        //
+        // Without the content predicate a title+date collision (two DISTINCT sermons
+        // with the same title and exact same GMT date) would produce >1 candidates —
+        // the >1 guard below refuses adoption in that case, falling through to a fresh
+        // insert and surfacing the ambiguity, which is the correct safe behaviour.
         $ids = $wpdb->get_col(
             $wpdb->prepare(
                 "SELECT p.ID FROM {$wpdb->posts} p"
@@ -1536,14 +1649,12 @@ final class SermonWriter {
                 . " WHERE p.post_type = %s"
                 . "   AND p.post_date_gmt = %s"
                 . "   AND p.post_title = %s"
-                . "   AND p.post_content = %s"
                 . "   AND backref.meta_id IS NULL"
                 . " ORDER BY p.ID ASC",
                 Crosswalk::LEGACY_POST_ID,
                 Identifiers::POST_TYPE_SERMON,
                 $legacy->post_date_gmt,
-                $legacy->post_title,
-                $reconciledContent
+                $legacy->post_title
             )
         );
 
