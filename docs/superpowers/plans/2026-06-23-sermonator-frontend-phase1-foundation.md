@@ -1307,5 +1307,22 @@ is the signature reused by Tasks 5/6; `register()` slug derivation matches block
 
 ## Phase 0 outcome
 
-_(Filled in during Task 0, Step 5 — records block-template precedence + parts result on
-TT5/classic and the proceed-vs-fallback decision.)_
+**Run 2026-06-23 on the Local "sermonator-test" site (TT5, WP 7.0). RESULT: PASS →
+PROCEED BLOCK-FIRST.** No fallback to `template_include` needed.
+
+Evidence (throwaway mu-plugin registering `sermonator/spike` + a
+`sermonator//single-sermonator_sermon` block template; since deleted):
+- `wp_is_block_theme()` = BLOCK; `register_block_template()` available (WP 7.0).
+- `get_block_template('sermonator//single-sermonator_sermon')` resolved with
+  **`source=plugin`** — the plugin template participates in resolution.
+- HTTP single sermon `/sermons/the-light-has-come/` = 200; the plugin's
+  `single-sermonator_sermon` **beat TT5's generic `single` with zero config** — spike block
+  rendered **exactly once**, `<header>` and `<footer>` template parts both resolved, post
+  title present.
+- **Meta-by-presence confirmed:** removing the `wp:sermonator/spike` line from the template
+  content → spike markers dropped to **0**. No request-scoped guard required.
+- Classic theme `twentytwentyone` installed on the test site for Task 7/10 classic-path
+  verification (the `single_template` filter path — stable, not spiked here).
+
+Implication for the build: Tasks 4–7 proceed as written. The `RenderGuard` is correctly
+absent; single-meta is governed purely by template composition.
