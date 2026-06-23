@@ -26,9 +26,18 @@ final class PodcastFeed {
 
     public function register(): void {
         add_feed( self::FEED, array( $this, 'render' ) );
+        // Belt-and-suspenders: if anything routes through feed_content_type() for our feed,
+        // return RSS rather than the WP default of application/octet-stream.
+        add_filter( 'feed_content_type', array( $this, 'contentType' ), 10, 2 );
+    }
+
+    public function contentType( string $type, string $feed ): string {
+        return $feed === self::FEED ? 'application/rss+xml' : $type;
     }
 
     public function render(): void {
+        // Send the content type as the very first action so it is emitted before any body
+        // output (otherwise nginx falls back to application/octet-stream).
         $charset = (string) get_option( 'blog_charset' ) ?: 'UTF-8';
         if ( ! headers_sent() ) {
             header( 'Content-Type: application/rss+xml; charset=' . $charset, true );
