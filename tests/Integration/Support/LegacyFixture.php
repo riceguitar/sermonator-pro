@@ -66,6 +66,21 @@ final class LegacyFixture {
         add_post_meta( $postId, $key, wp_slash( $value ) );
     }
 
+    /**
+     * Seed a legacy COMMENT meta value so the DB row holds the EXACT bytes
+     * supplied (literal backslashes, escaped quotes, serialized inner strings),
+     * mirroring how real legacy commentmeta lives in the DB. add_comment_meta()'s
+     * internal wp_unslash() would otherwise strip a backslash level off the seeded
+     * value, so we wp_slash() the input first — the value read back via
+     * get_comment_meta() is then byte-identical to $value. This makes the test
+     * exercise the WRITER copy path, not the fixture.
+     *
+     * @param mixed $value Scalar or array meta value (wp_slash recurses into arrays).
+     */
+    public function seedRawCommentMeta( int $commentId, string $key, mixed $value ): void {
+        add_comment_meta( $commentId, $key, wp_slash( $value ) );
+    }
+
     public function createTerm( string $taxonomy, string $name ): int {
         $result = wp_insert_term( $name, $taxonomy );
         if ( is_wp_error( $result ) ) {

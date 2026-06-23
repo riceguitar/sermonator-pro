@@ -226,6 +226,54 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         $this->assertSame( 'Church', $stored['itunes_author'] );
     }
 
+    public function test_podcast_meta_and_settings_with_backslashes_round_trip_byte_exact(): void {
+        // CRITICAL #2: PodcastWriter::applyMeta wrote ALL podcast meta — the remapped
+        // settings array AND every verbatim non-settings key — via add_post_meta
+        // WITHOUT wp_slash(). get_post_meta(...,false) is UNSLASHED; add_post_meta()'s
+        // wp_unslash() then strips a backslash level, corrupting enclosure/audio UNC
+        // paths, escaped quotes in itunes_* fields, and serialized-string values. We
+        // seed legacy meta via seedRawMeta (wp_slash so the DB row holds the exact
+        // bytes) so the test exercises the WRITER path, then assert byte-equality.
+        $settings = array(
+            'itunes_author'  => 'St. Mary\'s "Voice" \\ Choir',
+            'itunes_summary' => 'Quote: \\"Peace\\" and a path C:\\feeds\\main',
+            'unc_image'      => '\\\\server\\share\\art.png',
+            'nested'         => array( 'slashy' => 'a \\ b \\"c\\"' ),
+        );
+        $verbatimEnclosure = '\\\\nas\\media\\episode-01.mp3';
+        $verbatimQuote     = 'Subtitle \\"Sunday\\" service';
+
+        $legacyId = $this->fixture->createPodcastWithSettings(
+            $settings,
+            'Feed',
+            '',
+            array() // extra meta seeded below via seedRawMeta so bytes survive
+        );
+        // Overwrite the settings row with a raw-seeded one so backslashes survive in
+        // the DB exactly. createPodcastWithSettings used add_post_meta (no slash), so
+        // delete + re-seed the settings via the raw helper.
+        delete_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS );
+        $this->fixture->seedRawMeta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, $settings );
+        $this->fixture->seedRawMeta( $legacyId, 'enclosure', $verbatimEnclosure );
+        $this->fixture->seedRawMeta( $legacyId, 'subtitle', $verbatimQuote );
+
+        // Precondition: the legacy rows hold the EXACT bytes (fixture path OK).
+        $this->assertSame( $settings, get_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, true ) );
+        $this->assertSame( $verbatimEnclosure, get_post_meta( $legacyId, 'enclosure', true ) );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        // Verbatim non-settings keys: byte-exact, no backslash level lost.
+        $this->assertSame( $verbatimEnclosure, get_post_meta( $result->newId, 'enclosure', true ) );
+        $this->assertSame( $verbatimQuote, get_post_meta( $result->newId, 'subtitle', true ) );
+
+        // The remapped settings array (no term refs here) must round-trip byte-exact
+        // under the new key — wp_slash recurses into the array so every nested
+        // backslash/escaped-quote survives.
+        $stored = get_post_meta( $result->newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertSame( $settings, $stored, 'podcast settings backslashes must round-trip byte-exact' );
+    }
+
     public function test_podcast_body_kses_safe_iframe_survives(): void {
         $iframe   = '<iframe src="https://example.com/feed"></iframe>';
         $legacyId = $this->fixture->createPodcastWithSettings( array( 'itunes_author' => 'C' ), 'Feed', $iframe );

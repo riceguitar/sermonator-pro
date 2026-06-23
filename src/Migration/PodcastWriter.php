@@ -226,7 +226,14 @@ final class PodcastWriter {
                         $value = $this->remapSettingsTerms( $value, $flags );
                     }
                 }
-                add_post_meta( $newId, $newKey, $value );
+                // get_post_meta(...,false) values are UNSLASHED; add_post_meta()'s
+                // add_metadata() wp_unslash()es its input, so we MUST wp_slash() here
+                // or a backslash level is stripped (enclosure/audio UNC paths, escaped
+                // quotes in itunes_* fields, serialized-string values). For the settings
+                // path the remap above runs FIRST, then we wp_slash the resulting value;
+                // wp_slash() recurses into arrays so the remapped settings array
+                // round-trips byte-exact. Mirrors the SermonWriter post-meta discipline.
+                add_post_meta( $newId, $newKey, wp_slash( $value ) );
             }
         }
 

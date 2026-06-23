@@ -271,6 +271,53 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         $this->assertSame( 'plain', get_comment_meta( $newId, 'flat_scalar', true ) );
     }
 
+    public function test_commentmeta_with_backslashes_round_trips_byte_exact(): void {
+        // CRITICAL #1: copyCommentMeta wrote add_comment_meta WITHOUT wp_slash().
+        // get_comment_meta(...,false) returns UNSLASHED values; add_comment_meta()'s
+        // internal wp_unslash() then strips a backslash level on copy, corrupting any
+        // backslash / escaped-quote / serialized-inner-string commentmeta (a stored
+        // serialized string un-serializes to false downstream). We seed the legacy
+        // commentmeta via seedRawCommentMeta (wp_slash so the DB row holds the exact
+        // bytes) so the test exercises the WRITER path, then assert byte-equality on
+        // the migrated comment.
+        $legacyId  = $this->bareSermon();
+        $commentId = (int) wp_insert_comment( array(
+            'comment_post_ID'  => $legacyId,
+            'comment_author'   => 'Slashy',
+            'comment_content'  => 'Has backslash meta',
+            'comment_approved' => '1',
+        ) );
+
+        $backslashPath   = 'C:\\Users\\church\\audio\\sermon.mp3';
+        $escapedQuote    = 'He said \\"Amen\\" loudly';
+        $serializedInner = serialize( 'a string with a \\ backslash' );
+        $arrayWithSlash  = array( 'unc' => '\\\\server\\share\\clip.wav', 'q' => 'say \\"hi\\"' );
+
+        $this->fixture->seedRawCommentMeta( $commentId, 'audio_path', $backslashPath );
+        $this->fixture->seedRawCommentMeta( $commentId, 'quoted', $escapedQuote );
+        $this->fixture->seedRawCommentMeta( $commentId, 'serialized_inner', $serializedInner );
+        $this->fixture->seedRawCommentMeta( $commentId, 'array_meta', $arrayWithSlash );
+
+        // Precondition: the seeded legacy row holds the EXACT bytes (fixture path OK).
+        $this->assertSame( $backslashPath, get_comment_meta( $commentId, 'audio_path', true ) );
+        $this->assertSame( $serializedInner, get_comment_meta( $commentId, 'serialized_inner', true ) );
+
+        $result   = ( new SermonWriter() )->write( $legacyId );
+        $comments = get_comments( array( 'post_id' => $result->newId, 'status' => 'any' ) );
+        $this->assertCount( 1, $comments );
+        $newId = (int) $comments[0]->comment_ID;
+
+        // Byte-equality on the migrated comment — no backslash level lost.
+        $this->assertSame( $backslashPath, get_comment_meta( $newId, 'audio_path', true ) );
+        $this->assertSame( $escapedQuote, get_comment_meta( $newId, 'quoted', true ) );
+        $this->assertSame( $serializedInner, get_comment_meta( $newId, 'serialized_inner', true ) );
+        $this->assertSame( $arrayWithSlash, get_comment_meta( $newId, 'array_meta', true ) );
+
+        // The serialized-inner-string must still un-serialize correctly downstream
+        // (a lost backslash would make maybe_unserialize return the raw string/false).
+        $this->assertSame( 'a string with a \\ backslash', maybe_unserialize( get_comment_meta( $newId, 'serialized_inner', true ) ) );
+    }
+
     public function test_second_write_copies_zero_duplicate_comments(): void {
         $legacyId = $this->bareSermon();
         wp_insert_comment( array(

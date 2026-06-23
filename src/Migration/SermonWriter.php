@@ -905,7 +905,13 @@ final class SermonWriter {
 
             delete_comment_meta( $newCommentId, $key );
             foreach ( $values as $value ) {
-                add_comment_meta( $newCommentId, $key, $value );
+                // get_comment_meta(...,false) values are UNSLASHED; add_comment_meta()'s
+                // add_metadata() wp_unslash()es its input, so we MUST wp_slash() here or
+                // a backslash level is stripped (UNC/audio paths, escaped quotes,
+                // serialized inner strings — a stored serialized string would otherwise
+                // un-serialize to false downstream). Mirrors the post-meta path.
+                // wp_slash() recurses into arrays so array meta round-trips byte-exact.
+                add_comment_meta( $newCommentId, $key, wp_slash( $value ) );
             }
         }
     }
