@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/sermon-card",
+  "title": "Sermon Card",
+  "category": "widgets",
+  "icon": "id",
+  "description": "A compact card for one sermon — for use inside a query loop on archives.",
+  "textdomain": "sermonator",
+  "usesContext": [ "postId" ],
+  "attributes": {
+    "postId": { "type": "number" }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}

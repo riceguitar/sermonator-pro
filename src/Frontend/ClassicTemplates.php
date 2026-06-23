@@ -18,6 +18,8 @@ use Sermonator\Schema\Identifiers as ID;
 final class ClassicTemplates {
     public function hook(): void {
         add_filter( 'single_template', array( $this, 'singleTemplate' ) );
+        add_filter( 'archive_template', array( $this, 'archiveTemplate' ) );
+        add_filter( 'taxonomy_template', array( $this, 'taxonomyTemplate' ) );
         add_filter( 'the_content', array( $this, 'maybeAppendMeta' ) );
     }
 
@@ -28,14 +30,31 @@ final class ClassicTemplates {
         if ( wp_is_block_theme() || ! is_singular( ID::POST_TYPE_SERMON ) ) {
             return $template;
         }
+        return $this->resolve( 'single-sermonator-sermon.php', $template );
+    }
 
-        // Theme override wins: a theme can ship sermonator/single-sermonator-sermon.php.
-        $themeTemplate = locate_template( array( 'sermonator/single-sermonator-sermon.php' ) );
+    public function archiveTemplate( string $template ): string {
+        if ( wp_is_block_theme() || ! is_post_type_archive( ID::POST_TYPE_SERMON ) ) {
+            return $template;
+        }
+        return $this->resolve( 'archive-sermonator-sermon.php', $template );
+    }
+
+    public function taxonomyTemplate( string $template ): string {
+        if ( wp_is_block_theme() || ! is_tax( ID::sermonTaxonomies() ) ) {
+            return $template;
+        }
+        return $this->resolve( 'taxonomy-sermonator.php', $template );
+    }
+
+    /** Theme override (sermonator/<file>) wins; otherwise the plugin's classic template. */
+    private function resolve( string $file, string $fallback ): string {
+        $themeTemplate = locate_template( array( 'sermonator/' . $file ) );
         if ( $themeTemplate !== '' ) {
             return $themeTemplate;
         }
-
-        return dirname( SERMONATOR_FILE ) . '/templates/classic/single-sermonator-sermon.php';
+        $pluginTemplate = dirname( SERMONATOR_FILE ) . '/templates/classic/' . $file;
+        return file_exists( $pluginTemplate ) ? $pluginTemplate : $fallback;
     }
 
     public function maybeAppendMeta( string $content ): string {

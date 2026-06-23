@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/taxonomy-filter",
+  "title": "Sermon Taxonomy List",
+  "category": "widgets",
+  "icon": "filter",
+  "description": "A list of links for one sermon taxonomy (preachers, series, topics, books, or service types).",
+  "textdomain": "sermonator",
+  "attributes": {
+    "taxonomy": { "type": "string", "default": "sermonator_series" },
+    "showCount": { "type": "boolean", "default": true },
+    "hideEmpty": { "type": "boolean", "default": true }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}
