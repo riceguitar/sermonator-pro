@@ -71,6 +71,11 @@ final class OptionWriter {
      * @return array{written: int, backed_up: int}
      */
     public function migrate(): array {
+        // MUST-FIX #1: re-register the legacy schema so a DEACTIVATED legacy plugin
+        // does not make any embedded id-remap term read observe an unregistered
+        // source. Idempotent; a no-op when the legacy plugin is active.
+        LegacySchemaRegistrar::ensureRegistered();
+
         $legacyOptions = $this->readLegacySermonManagerOptions();
         $mapped        = OptionMapper::map( $legacyOptions );
 

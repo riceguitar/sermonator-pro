@@ -46,6 +46,11 @@ final class PodcastWriter {
     }
 
     public function write( int $legacyId ): WriteResult {
+        // MUST-FIX #1: re-register the legacy schema so a DEACTIVATED legacy plugin
+        // does not make the legacy podcast post/meta reads return empty over rows
+        // that still exist. Idempotent; a no-op when the legacy plugin is active.
+        LegacySchemaRegistrar::ensureRegistered();
+
         // --- Idempotency gate (status-agnostic, authoritative via back-ref) ---
         $existing = Crosswalk::findNewByLegacyId( $legacyId, Identifiers::POST_TYPE_PODCAST );
         if ( null !== $existing ) {

@@ -38,6 +38,11 @@ final class ArtworkWriter {
      * @return array{written: int, dropped: list<int>, conflicts: list<int>}
      */
     public function migrate( TermCrosswalk $crosswalk ): array {
+        // MUST-FIX #1: re-register the legacy schema so a DEACTIVATED legacy plugin
+        // does not make any term/post read in the artwork remap path observe an
+        // unregistered source. Idempotent; a no-op when the legacy plugin is active.
+        LegacySchemaRegistrar::ensureRegistered();
+
         $ttIdMap = $crosswalk->ttIdMap();
 
         $legacyImages   = $this->readArray( LegacyIdentifiers::OPTION_TERM_IMAGES );

@@ -310,6 +310,11 @@ final class TermWriter {
      * @return array{migrated:int, skipped:int, flags:list<string>}
      */
     public function migrateAll(): array {
+        // MUST-FIX #1: re-register the legacy schema so a DEACTIVATED legacy plugin
+        // does not make get_terms() return an empty/WP_Error over legacy term rows
+        // that still exist. Idempotent; a no-op when the legacy plugin is active.
+        LegacySchemaRegistrar::ensureRegistered();
+
         $migrated = 0;
         $skipped  = 0;
         $flags    = array();

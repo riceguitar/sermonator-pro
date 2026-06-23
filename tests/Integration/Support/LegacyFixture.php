@@ -5,24 +5,22 @@ declare(strict_types=1);
 namespace Sermonator\Tests\Integration\Support;
 
 use Sermonator\Migration\LegacyIdentifiers;
+use Sermonator\Migration\LegacySchemaRegistrar;
 
 /**
  * Builds a legacy Sermon Manager (wpfc_*) dataset in the WordPress test DB so
  * the Detector (and B2's end-to-end test) can run against realistic source data.
  */
 final class LegacyFixture {
+    /**
+     * Register the legacy wpfc_* schema for seeding. DELEGATES to the production
+     * LegacySchemaRegistrar so tests exercise the SAME registration the migration
+     * entry points perform — rather than a hand-rolled fixture schema that would
+     * mask the deactivated-legacy data-loss bug (MUST-FIX #1) by registering the
+     * taxonomies even when production would not.
+     */
     public function registerLegacySchema(): void {
-        if ( ! post_type_exists( LegacyIdentifiers::POST_TYPE_SERMON ) ) {
-            register_post_type( LegacyIdentifiers::POST_TYPE_SERMON, array( 'public' => true, 'label' => 'Legacy Sermon' ) );
-        }
-        if ( ! post_type_exists( LegacyIdentifiers::POST_TYPE_PODCAST ) ) {
-            register_post_type( LegacyIdentifiers::POST_TYPE_PODCAST, array( 'public' => false, 'label' => 'Legacy Podcast' ) );
-        }
-        foreach ( LegacyIdentifiers::sermonTaxonomies() as $taxonomy ) {
-            if ( ! taxonomy_exists( $taxonomy ) ) {
-                register_taxonomy( $taxonomy, LegacyIdentifiers::POST_TYPE_SERMON, array( 'public' => true ) );
-            }
-        }
+        LegacySchemaRegistrar::ensureRegistered();
     }
 
     /**

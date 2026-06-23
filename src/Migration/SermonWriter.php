@@ -54,6 +54,14 @@ final class SermonWriter {
     }
 
     public function write( int $legacyId ): WriteResult {
+        // MUST-FIX #1: the legacy Sermon Manager plugin is normally DEACTIVATED at
+        // migration time, which UNREGISTERS the wpfc_* taxonomies/post types — so
+        // wp_get_object_terms / get_post for the source would WP_Error/return empty
+        // over rows that still exist, silently dropping every primary term assignment.
+        // Re-register the legacy schema first (idempotent; a no-op when active) so the
+        // legacy reads below are registration-agnostic.
+        LegacySchemaRegistrar::ensureRegistered();
+
         // --- Idempotency gate (status-agnostic, authoritative via back-ref) ---
         //
         // Three observably-distinct outcomes (see WriteResult):
@@ -625,9 +633,27 @@ final class SermonWriter {
                 continue;
             }
 
+            // Re-derive this taxonomy's unreadable flag from scratch on every pass:
+            // drop any prior legacy_taxonomy_unreadable:<legacyTax> so a taxonomy that
+            // became readable on this pass clears its open flag (self-heal), and is
+            // re-recorded below only if the read STILL fails.
+            $flags = array_values( array_filter(
+                $flags,
+                static function ( $flag ) use ( $legacyTax ): bool {
+                    return (string) $flag !== 'legacy_taxonomy_unreadable:' . $legacyTax;
+                }
+            ) );
+
             $legacyTermIds = wp_get_object_terms( $legacyId, $legacyTax, array( 'fields' => 'ids' ) );
             if ( is_wp_error( $legacyTermIds ) ) {
-                // Legacy taxonomy unreadable — nothing to assign for it.
+                // MUST-FIX #1: the legacy schema was already re-registered at the
+                // write() entry point, so reaching a WP_Error here means the taxonomy
+                // is genuinely unreadable and this sermon's primary term assignment
+                // could NOT be read. NEVER a silent continue: record a flag that
+                // WITHHOLDS MIGRATION_COMPLETE (markCompleteUnlessCommentFailureOpen)
+                // and keeps the record in the resume / self-heal leg so a later write
+                // re-reads it once the taxonomy is readable again.
+                $flags[] = 'legacy_taxonomy_unreadable:' . $legacyTax;
                 continue;
             }
             $legacyTermIds = array_map( 'intval', (array) $legacyTermIds );
@@ -813,6 +839,14 @@ final class SermonWriter {
                 $scope[ substr( $flag, strlen( 'term_assign_error:' ) ) ] = true;
             } elseif ( str_starts_with( $flag, 'missing_term_crosswalk:' ) ) {
                 $missingTermIds[ (int) substr( $flag, strlen( 'missing_term_crosswalk:' ) ) ] = true;
+            } elseif ( str_starts_with( $flag, 'legacy_taxonomy_unreadable:' ) ) {
+                // MUST-FIX #1: a legacy taxonomy that was unreadable on a prior pass
+                // must be re-driven through applyTerms so its primary assignment is
+                // re-read once readable. Scope the repair to that legacy tax's target.
+                $legacyTax = substr( $flag, strlen( 'legacy_taxonomy_unreadable:' ) );
+                if ( isset( $taxonomyMap[ $legacyTax ] ) ) {
+                    $scope[ $taxonomyMap[ $legacyTax ] ] = true;
+                }
             }
         }
 
@@ -820,9 +854,16 @@ final class SermonWriter {
             // Resolve each missing legacy term id to its target taxonomy via the
             // legacy assignment (read-only). A legacy term may appear in only one
             // legacy taxonomy, so the first match is authoritative.
+            //
+            // MUST-FIX #1: the legacy schema is re-registered at the write() entry
+            // point, so this read is registration-agnostic. A WP_Error here is a
+            // genuinely-unreadable taxonomy; widen the repair scope to its target so
+            // applyTerms re-records the legacy_taxonomy_unreadable flag (and withholds
+            // COMPLETE) instead of silently narrowing the heal scope.
             foreach ( $taxonomyMap as $legacyTax => $targetTax ) {
                 $legacyTermIds = wp_get_object_terms( $legacyId, $legacyTax, array( 'fields' => 'ids' ) );
                 if ( is_wp_error( $legacyTermIds ) ) {
+                    $scope[ $targetTax ] = true;
                     continue;
                 }
                 foreach ( array_map( 'intval', (array) $legacyTermIds ) as $legacyTermId ) {
@@ -847,7 +888,11 @@ final class SermonWriter {
     private function hasOpenTermFlag( array $flags ): bool {
         foreach ( $flags as $flag ) {
             if ( str_starts_with( (string) $flag, 'missing_term_crosswalk:' )
-                || str_starts_with( (string) $flag, 'term_assign_error:' ) ) {
+                || str_starts_with( (string) $flag, 'term_assign_error:' )
+                // MUST-FIX #1: a legacy_taxonomy_unreadable flag means a primary
+                // term assignment could not be read on a prior pass — drive the
+                // COMPLETE-branch term repair so it is re-read and the flag clears.
+                || str_starts_with( (string) $flag, 'legacy_taxonomy_unreadable:' ) ) {
                 return true;
             }
         }
@@ -1244,6 +1289,15 @@ final class SermonWriter {
         if ( $this->hasOpenCommentFailureFlag( $flags ) ) {
             return;
         }
+        // MUST-FIX #1: a legacy taxonomy that is STILL unreadable after the schema
+        // re-registration (e.g. a wpfc_* taxonomy that genuinely could not be made
+        // readable) means this record's primary term assignments could not be read.
+        // Withhold COMPLETE so the record stays in the resume leg and applyTerms()
+        // re-reads on the next write — never stamped-complete-and-skipped-forever
+        // with silently-dropped term assignments.
+        if ( $this->hasOpenTaxonomyUnreadableFlag( $flags ) ) {
+            return;
+        }
         $this->markComplete( $newId );
     }
 
@@ -1257,6 +1311,25 @@ final class SermonWriter {
     private function hasOpenCommentFailureFlag( array $flags ): bool {
         foreach ( $flags as $flag ) {
             if ( str_starts_with( (string) $flag, 'comment_copy_failed:' ) ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether any OPEN legacy_taxonomy_unreadable:* flag is present (MUST-FIX #1).
+     * Recorded when a legacy term read STILL returns WP_Error after the schema
+     * re-registration — meaning a primary term assignment could not be read. Gates
+     * COMPLETE (the record stays in the resume leg) and drives the COMPLETE-branch
+     * term self-heal, so a transiently-unreadable taxonomy is re-read on a later
+     * write rather than silently dropped and skipped forever.
+     *
+     * @param list<string> $flags
+     */
+    private function hasOpenTaxonomyUnreadableFlag( array $flags ): bool {
+        foreach ( $flags as $flag ) {
+            if ( str_starts_with( (string) $flag, 'legacy_taxonomy_unreadable:' ) ) {
                 return true;
             }
         }

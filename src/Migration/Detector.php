@@ -11,6 +11,11 @@ namespace Sermonator\Migration;
  */
 final class Detector {
     public function hasLegacyData(): bool {
+        // MUST-FIX #1: the legacy plugin is normally DEACTIVATED at migration time,
+        // so the wpfc_* post type is unregistered and WP_Query would find 0 even
+        // though the rows exist. Re-register the legacy schema (no-op if active).
+        LegacySchemaRegistrar::ensureRegistered();
+
         $q = new \WP_Query( array(
             'post_type'      => LegacyIdentifiers::POST_TYPE_SERMON,
             'post_status'    => 'any',
@@ -22,6 +27,11 @@ final class Detector {
     }
 
     public function detect(): Manifest {
+        // MUST-FIX #1: re-register the legacy schema so a DEACTIVATED legacy plugin
+        // (the normal drop-in-replacement config) cannot make get_posts/get_terms
+        // return empty over rows that still exist. No-op when the plugin is active.
+        LegacySchemaRegistrar::ensureRegistered();
+
         $counts    = array();
         $checksums = array();
 
