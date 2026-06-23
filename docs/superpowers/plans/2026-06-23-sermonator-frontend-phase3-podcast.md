@@ -92,3 +92,28 @@ front-end effort. Read-only otherwise.
 ## Out of scope
 schema.org/OG + cross-theme pass (Phase 4); per-episode chapters; transcripts; multiple-feed
 UI beyond `?podcast=ID`.
+
+## Phase 3 adversarial-review outcomes (2026-06-23)
+
+Two-lens review — extra rigor on the backfill (data preservation) + Apple feed compliance.
+
+**Backfill (the only DB write):** native-only, fill-missing-only, crash-consistent
+touched-IDs log, and legacy byte-immutability across every migration interleaving were all
+**VERIFIED-SAFE**. Fixes applied: reject `Content-Length` > 4 GB (a bogus huge size would
+advertise a broken enclosure AND be permanently unrepairable); `reject_unsafe_urls` + http(s)
+scheme check (SSRF on a not-fully-trusted audio URL); race-guard re-read of the size before
+writing (no overwrite under concurrency); **refuse to run while a migration is in flight**
+(phase ∉ {none, finalized}) since the migration owns `_sermonator_audio_size` in its window.
+Accepted/documented: rollback restores the pre-backfill (missing) state, not a later manual
+edit.
+
+**Feed:** Apple/RSS required tags, `itunes:explicit` true/false, nested category, content
+type, `?podcast=ID` validation, draft exclusion, and all escaping were **VERIFIED-CORRECT**.
+Fix applied (IMPORTANT): `FeedBuilder` strips C0 control chars illegal in XML 1.0 — a single
+`0x0C` in a title otherwise breaks the entire feed for every client. Minor: log
+(`sermonator_feed_truncated`) when >300 episodes are dropped, instead of silently.
+
+Deferred: block editor inspector JS (no client `edit` yet — consistent with earlier phases).
+
+Result: unit 110, integration 381 — green on WP 7.0; live feed `application/rss+xml`, valid
+XML, correct enclosure lengths; backfill dry-run/candidate detection verified on Local.
