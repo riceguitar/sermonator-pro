@@ -261,6 +261,9 @@ final class SermonWriterMetaTest extends WP_UnitTestCase {
 
         $writer = new SermonWriter();
         $first  = $writer->write( $legacyId );
+        // A full write() now stamps COMPLETE LAST; crash-inject a partial so the
+        // second write re-drives the meta steps via the RESUME leg.
+        delete_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE );
         $second = $writer->write( $legacyId );
         $this->assertTrue( $second->resumed );
 

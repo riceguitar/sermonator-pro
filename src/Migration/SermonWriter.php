@@ -10,21 +10,30 @@ use Sermonator\Schema\Identifiers;
  * Writes one legacy wpfc_sermon into a new sermonator_sermon, non-destructively,
  * idempotently, and crash-safely.
  *
- * THIS TASK (12) covers the post/body/idempotency facet of write():
+ * write() is the full pipeline:
  *  - the idempotency gate (resolve via Crosswalk::findNewByLegacyId, status-
- *    agnostic) distinguishes a COMPLETE record (skip — return existing,
- *    created=false) from a stamped-but-PARTIAL record (resume — re-enter on the
- *    existing post, never insert a second one);
+ *    agnostic) distinguishes a COMPLETE record (skip the post/body/meta/comments
+ *    steps but STILL re-run term repair — "post exists" must never short-circuit
+ *    a now-resolvable term) from a stamped-but-PARTIAL record (resume — re-enter
+ *    on the existing post, never insert a second one);
  *  - the post is inserted preserving the legacy post columns, with the body
  *    reconciled from (post_content, sermon_description, post_content_temp);
  *  - the insert is wp_slash'd and run with KSES DISABLED so iframes/shortcodes
  *    in preserved content survive verbatim, then KSES is restored;
  *  - the legacy back-ref is stamped IMMEDIATELY after insert (crash-safety spine);
- *  - MIGRATION_COMPLETE is NOT written here — Tasks 13/14 add meta/terms/comments
- *    and write COMPLETE LAST, so an abort between insert and COMPLETE is resumed.
+ *  - meta is applied from the per-key UNSERIALIZED values (arrays round-trip),
+ *    with non-numeric sermon_date companions normalized alongside the raw;
+ *  - legacy term assignments are translated through the taxonomy-aware crosswalk
+ *    and re-assigned per target taxonomy (missing crosswalk → flag, never a
+ *    silent drop; WP_Error → flag, never a crash; repair re-appliable later);
+ *  - comments are copied depth-first with new ids, remapped parents, preserved
+ *    author/email/url/date/approved/type/IP/agent/karma + commentmeta, each
+ *    stamped with LEGACY_COMMENT_ID so re-runs copy zero duplicates;
+ *  - MIGRATION_COMPLETE is written LAST, after every step, so an abort anywhere
+ *    before it leaves a stamped-but-partial post that the gate resumes.
  *
- * Legacy data is read READ-ONLY; shared attachment posts are referenced by id and
- * never mutated.
+ * Legacy data (posts, meta, terms, comments, commentmeta) is read READ-ONLY;
+ * shared attachment posts are referenced by id and never mutated.
  */
 final class SermonWriter {
     private ?DateNormalizer $dates;
@@ -52,28 +61,35 @@ final class SermonWriter {
         //                                 second insert.
         $existing = Crosswalk::findNewByLegacyId( $legacyId, Identifiers::POST_TYPE_SERMON );
         if ( null !== $existing ) {
-            if ( $this->isComplete( $existing ) ) {
-                // COMPLETE — skip; do NOT touch the post (already self-healed).
-                return new WriteResult( $existing, false, $this->readFlags( $existing ), false );
-            }
-
-            // Stamped but PARTIAL — RESUME on the existing post (never insert).
-            // Re-enter the same back-ref-first / self-healing block we run after a
-            // fresh insert, idempotently re-driving it on $existing. Tasks 13/14
-            // extend this resume path (meta/terms/comments) without retrofitting
-            // the gate: they hook the post-insert block, which the resume branch
-            // already routes through.
             $legacyForResume = get_post( $legacyId );
             if ( ! $legacyForResume instanceof \WP_Post ) {
                 // Legacy source vanished after a partial stamp — surface, do not crash.
                 return new WriteResult( $existing, false, $this->readFlags( $existing ), false );
             }
 
+            if ( $this->isComplete( $existing ) ) {
+                // COMPLETE — a no-op skip for the post/body/meta/comments steps, but
+                // term repair STILL runs (self-heal): a record migrated while a term
+                // crosswalk was missing must pick the now-available term up on a
+                // later pass — "post exists" must never short-circuit term repair.
+                // Seed from the persisted flags so an open missing_term_crosswalk
+                // flag is re-evaluated (and dropped once it resolves), and so no
+                // unrelated flag is lost by writeFlags()'s replace semantics.
+                $flags = $this->repairTermsOnExisting( $existing, $legacyId, $this->readFlags( $existing ) );
+                return new WriteResult( $existing, false, $flags, false );
+            }
+
+            // Stamped but PARTIAL — RESUME on the existing post (never insert).
+            // Re-enter the same back-ref-first / self-healing block we run after a
+            // fresh insert, idempotently re-driving it on $existing (meta/terms/
+            // comments), then write MIGRATION_COMPLETE LAST.
+            //
             // Seed from the persisted flags so replace-semantics on writeFlags()
             // never drops a prior flag (e.g. post_parent_unresolved) that this
             // resume pass does not re-derive.
             $reconciledForResume = $this->reconcileBody( $legacyId, $legacyForResume );
             $flags               = $this->applyPostInsertSpine( $existing, $legacyId, $legacyForResume, $reconciledForResume, $this->readFlags( $existing ) );
+            $this->markComplete( $existing );
 
             return new WriteResult( $existing, false, $flags, true );
         }
@@ -129,7 +145,10 @@ final class SermonWriter {
         // --- Crash-safety spine: back-ref FIRST, then idempotent self-healing. ---
         $flags = $this->applyPostInsertSpine( $newId, $legacyId, $legacy, $reconciled, $flags );
 
-        // NOTE: MIGRATION_COMPLETE is intentionally NOT written here (Task 14).
+        // MIGRATION_COMPLETE is written LAST — after meta, terms, and comments —
+        // so an abort anywhere before this point leaves a stamped-but-partial post
+        // that the idempotency gate resumes rather than skips.
+        $this->markComplete( $newId );
 
         return new WriteResult( $newId, true, $flags );
     }
@@ -198,6 +217,19 @@ final class SermonWriter {
         // resume path, idempotently. Returns any meta-derived flags (e.g.
         // legacy_nonnumeric_date) to fold into the canonical flags row.
         $flags = array_merge( $flags, $this->applyMeta( $newId, $legacyId ) );
+
+        // Term assignment (Task 14) — translate each legacy assignment through the
+        // taxonomy-aware crosswalk and re-assign per target taxonomy. A missing
+        // crosswalk records a flag (never a silent drop); a wp_set_object_terms
+        // WP_Error records a flag (never a crash). The previously-recorded term
+        // flags are dropped before re-derivation so a now-resolved term clears its
+        // open missing_term_crosswalk flag on this pass.
+        $flags = $this->applyTerms( $newId, $legacyId, $flags );
+
+        // Comment copy (Task 14) — depth-first, new ids, remapped parents, stamped
+        // with LEGACY_COMMENT_ID so already-copied comments are skipped (idempotent
+        // on resume), commentmeta copied with the unserialize discipline.
+        $this->copyComments( $newId, $legacyId );
 
         $this->writeFlags( $newId, $flags );
 
@@ -319,6 +351,234 @@ final class SermonWriter {
     private function isUnixTimestamp( string $value ): bool {
         $stripped = ltrim( $value, '-' );
         return '' !== $stripped && ctype_digit( $stripped );
+    }
+
+    /**
+     * Translate every legacy term assignment through the taxonomy-aware crosswalk
+     * and re-assign per target taxonomy. Idempotent: wp_set_object_terms replaces
+     * the full set for each taxonomy, so a resume / repair pass converges without
+     * duplicate assignments.
+     *
+     * Discipline (the closed adversarial holes):
+     *  - resolve via Crosswalk::findNewTermByLegacyId keyed by the MAPPED target
+     *    taxonomy, so a legacy term resolves only to its correct new taxonomy;
+     *  - a legacy term with NO crosswalk is NEVER silently dropped — it records a
+     *    missing_term_crosswalk:<legacyTermId> flag and is left unassigned, so a
+     *    later pass (once the term is migrated) can self-heal it;
+     *  - a wp_set_object_terms WP_Error records a term_assign_error:<taxonomy> flag
+     *    rather than crashing the whole migration;
+     *  - prior term flags (missing_term_crosswalk:*, term_assign_error:*) are
+     *    stripped before re-derivation so a now-resolved term clears its open flag.
+     *
+     * Legacy term assignments are read READ-ONLY.
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function applyTerms( int $newId, int $legacyId, array $flags ): array {
+        // Drop stale term flags so this pass re-derives them from scratch — a term
+        // that has since been migrated must clear its open missing_term_crosswalk.
+        $flags = $this->stripTermFlags( $flags );
+
+        foreach ( MappingContract::taxonomyMap() as $legacyTax => $targetTax ) {
+            $legacyTermIds = wp_get_object_terms( $legacyId, $legacyTax, array( 'fields' => 'ids' ) );
+            if ( is_wp_error( $legacyTermIds ) ) {
+                // Legacy taxonomy unreadable — nothing to assign for it.
+                continue;
+            }
+            $legacyTermIds = array_map( 'intval', (array) $legacyTermIds );
+
+            $newTermIds = array();
+            foreach ( $legacyTermIds as $legacyTermId ) {
+                $newTermId = Crosswalk::findNewTermByLegacyId( $legacyTermId, $targetTax );
+                if ( null === $newTermId ) {
+                    // Never a silent drop — flag and leave unassigned for self-heal.
+                    $flags[] = 'missing_term_crosswalk:' . $legacyTermId;
+                    continue;
+                }
+                $newTermIds[] = (int) $newTermId;
+            }
+
+            // Replace the full set for this taxonomy (idempotent). An empty set is
+            // still applied so a taxonomy whose terms were all unresolved stays
+            // empty rather than retaining a stale assignment from a prior pass.
+            $result = wp_set_object_terms( $newId, $newTermIds, $targetTax );
+            if ( is_wp_error( $result ) ) {
+                $flags[] = 'term_assign_error:' . $targetTax;
+            }
+        }
+
+        return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Re-run ONLY the term-repair step on an already-COMPLETE post, persisting the
+     * re-derived flags. "Post exists" must never short-circuit term repair: a post
+     * migrated while a term crosswalk was missing picks the now-available term up
+     * here. The post/body/meta/comments are intentionally left untouched.
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function repairTermsOnExisting( int $newId, int $legacyId, array $flags ): array {
+        $flags = $this->applyTerms( $newId, $legacyId, $flags );
+        $this->writeFlags( $newId, $flags );
+        return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Drop previously-derived term flags so applyTerms() can re-derive them from
+     * the current crosswalk state (a resolved term clears its open flag).
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function stripTermFlags( array $flags ): array {
+        return array_values( array_filter(
+            $flags,
+            static function ( $flag ): bool {
+                return ! str_starts_with( (string) $flag, 'missing_term_crosswalk:' )
+                    && ! str_starts_with( (string) $flag, 'term_assign_error:' );
+            }
+        ) );
+    }
+
+    /**
+     * Copy every legacy comment onto the new post, depth-first, with NEW ids and
+     * remapped parents. Idempotent and crash-safe:
+     *
+     *  - comments are processed parent-before-child (ordered by legacy comment id)
+     *    so the new parent id is known before its replies are inserted;
+     *  - the old→new id map is rebuilt from the LEGACY_COMMENT_ID back-refs already
+     *    present on the new post, so a resume re-uses prior insertions instead of
+     *    duplicating them, and comment_parent is remapped to the NEW parent id;
+     *  - a comment already carrying its LEGACY_COMMENT_ID back-ref is SKIPPED
+     *    (idempotent — a second write copies zero duplicates);
+     *  - author/email/url/date/date_gmt/content/approved/type/user_id + IP/agent/
+     *    karma are preserved verbatim;
+     *  - commentmeta is copied with the unserialize discipline (per-key
+     *    get_comment_meta(...,false) values, so arrays round-trip);
+     *  - the back-ref is stamped on the new comment immediately after insert.
+     *
+     * Legacy comments are read READ-ONLY.
+     */
+    private function copyComments( int $newId, int $legacyId ): void {
+        $legacyComments = get_comments( array(
+            'post_id' => $legacyId,
+            'status'  => 'all',
+            'orderby' => 'comment_ID',
+            'order'   => 'ASC',
+            'type'    => '', // every type, including pingbacks/trackbacks
+        ) );
+
+        // Rebuild the old→new id map from back-refs already on the new post so a
+        // resume remaps parents correctly and skips already-copied comments.
+        $oldToNew = $this->existingCommentMap( $newId );
+
+        foreach ( $legacyComments as $legacy ) {
+            $legacyCommentId = (int) $legacy->comment_ID;
+
+            // Already copied (idempotent skip).
+            if ( isset( $oldToNew[ $legacyCommentId ] ) ) {
+                continue;
+            }
+
+            $legacyParentId = (int) $legacy->comment_parent;
+            $newParentId    = 0;
+            if ( 0 !== $legacyParentId && isset( $oldToNew[ $legacyParentId ] ) ) {
+                $newParentId = $oldToNew[ $legacyParentId ];
+            }
+
+            $commentarr = array(
+                'comment_post_ID'      => $newId,
+                'comment_author'       => $legacy->comment_author,
+                'comment_author_email' => $legacy->comment_author_email,
+                'comment_author_url'   => $legacy->comment_author_url,
+                'comment_author_IP'    => $legacy->comment_author_IP,
+                'comment_date'         => $legacy->comment_date,
+                'comment_date_gmt'     => $legacy->comment_date_gmt,
+                'comment_content'      => $legacy->comment_content,
+                'comment_karma'        => $legacy->comment_karma,
+                'comment_approved'     => $legacy->comment_approved,
+                'comment_agent'        => $legacy->comment_agent,
+                'comment_type'         => $legacy->comment_type,
+                'comment_parent'       => $newParentId,
+                'user_id'              => $legacy->user_id,
+            );
+
+            // KSES is irrelevant for comments; preserve content verbatim by
+            // slashing so wp_insert_comment's unslash round-trips exactly.
+            $newCommentId = wp_insert_comment( wp_slash( $commentarr ) );
+            if ( ! $newCommentId ) {
+                continue; // do not crash the migration on a single bad comment
+            }
+            $newCommentId = (int) $newCommentId;
+
+            // Back-ref FIRST (crash-safety + idempotency spine for comments).
+            add_comment_meta( $newCommentId, Crosswalk::LEGACY_COMMENT_ID, $legacyCommentId, true );
+            $oldToNew[ $legacyCommentId ] = $newCommentId;
+
+            $this->copyCommentMeta( $legacyCommentId, $newCommentId );
+        }
+    }
+
+    /**
+     * Rebuild the legacy→new comment id map from LEGACY_COMMENT_ID back-refs on
+     * the new post's comments. Reads $wpdb directly so a comment inserted moments
+     * earlier on this run is mapped without a stale comment-cache miss.
+     *
+     * @return array<int,int> legacy comment id → new comment id
+     */
+    private function existingCommentMap( int $newPostId ): array {
+        global $wpdb;
+
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT cm.comment_id AS new_id, cm.meta_value AS legacy_id"
+                . " FROM {$wpdb->commentmeta} cm"
+                . " INNER JOIN {$wpdb->comments} c ON c.comment_ID = cm.comment_id"
+                . " WHERE cm.meta_key = %s AND c.comment_post_ID = %d",
+                Crosswalk::LEGACY_COMMENT_ID,
+                $newPostId
+            )
+        );
+
+        $map = array();
+        foreach ( (array) $rows as $row ) {
+            $map[ (int) $row->legacy_id ] = (int) $row->new_id;
+        }
+        return $map;
+    }
+
+    /**
+     * Copy commentmeta from a legacy comment to its new counterpart with the
+     * unserialize discipline: per-key UNSERIALIZED values (get_comment_meta(...,
+     * false)) so arrays round-trip (core re-serializes) instead of being double-
+     * serialized. Delete-then-re-add the full multiset per key → idempotent on
+     * resume. The migration's own LEGACY_COMMENT_ID back-ref is never copied.
+     */
+    private function copyCommentMeta( int $legacyCommentId, int $newCommentId ): void {
+        $byKey = get_comment_meta( $legacyCommentId );
+        $byKey = is_array( $byKey ) ? $byKey : array();
+
+        foreach ( array_keys( $byKey ) as $key ) {
+            if ( Crosswalk::LEGACY_COMMENT_ID === $key ) {
+                continue; // never carry our own back-ref across
+            }
+
+            $values = get_comment_meta( $legacyCommentId, $key, false );
+            $values = is_array( $values ) ? array_values( $values ) : array();
+
+            delete_comment_meta( $newCommentId, $key );
+            foreach ( $values as $value ) {
+                add_comment_meta( $newCommentId, $key, $value );
+            }
+        }
+    }
+
+    /** Write the MIGRATION_COMPLETE flag LAST (replace/unique — idempotent). */
+    private function markComplete( int $newId ): void {
+        update_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE, '1' );
     }
 
     /**

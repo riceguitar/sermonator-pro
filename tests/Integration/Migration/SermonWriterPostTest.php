@@ -195,16 +195,21 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         // A back-ref present but MIGRATION_COMPLETE absent is the PARTIAL leg:
         // created=false AND resumed=true. The resume re-enters the post-insert
         // self-healing block on the SAME post (no duplicate, no second insert).
+        //
+        // A full write() now stamps COMPLETE LAST, so we CRASH-INJECT a partial by
+        // deleting the COMPLETE flag — exactly the on-disk state an abort between
+        // the insert and the final COMPLETE stamp would leave behind.
         $legacyId = $this->fixture->createSermon();
 
         $writer = new SermonWriter();
         $first  = $writer->write( $legacyId );
         $this->assertTrue( $first->created );
 
+        delete_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE );
         $this->assertSame(
             '',
             (string) get_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE, true ),
-            'precondition: post is stamped but partial'
+            'precondition: post is stamped but partial (crash-injected)'
         );
 
         $second = $writer->write( $legacyId );
@@ -246,6 +251,8 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertContains( 'post_content_preserved', $first->flags );
         $this->assertContains( 'post_parent_unresolved:' . $orphanParent, $first->flags );
 
+        // Crash-inject a partial so the second write takes the RESUME leg.
+        delete_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE );
         $second = $writer->write( $legacyId );
         $this->assertTrue( $second->resumed );
 
@@ -280,20 +287,22 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertSame( $desc, $new->post_content );
     }
 
-    public function test_back_ref_present_immediately_and_not_yet_complete(): void {
+    public function test_back_ref_present_and_record_completed(): void {
         $legacyId = $this->fixture->createSermon();
 
         $result = ( new SermonWriter() )->write( $legacyId );
 
-        // Back-ref stamped right after insert.
+        // Back-ref stamped right after insert (the crash-safety spine: written
+        // FIRST, immediately after the post insert).
         $this->assertSame(
             (string) $legacyId,
             get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, true )
         );
         $this->assertSame( $result->newId, Crosswalk::findNewByLegacyId( $legacyId ) );
 
-        // This task leaves the post "stamped but partial" — Task 14 writes COMPLETE.
-        $this->assertSame( '', (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+        // A full write() finishes by stamping MIGRATION_COMPLETE LAST (Task 14):
+        // back-ref FIRST, COMPLETE LAST — both present after a successful write.
+        $this->assertSame( '1', (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
     }
 
     public function test_resume_does_not_create_a_second_post(): void {
@@ -303,7 +312,8 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $first  = $writer->write( $legacyId );
         $this->assertTrue( $first->created );
 
-        // Second run: back-ref exists but NOT complete → resume the SAME post.
+        // Second run: back-ref exists → resolve the SAME post, never a second
+        // insert (whether the record is complete-skip or partial-resume).
         $second = $writer->write( $legacyId );
         $this->assertFalse( $second->created );
         $this->assertSame( $first->newId, $second->newId );
