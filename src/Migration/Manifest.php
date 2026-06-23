@@ -33,6 +33,22 @@ final class Manifest {
         return $this->checksums[ $legacyId ] ?? null;
     }
 
+    /**
+     * The legacy post ids the manifest checksummed at detect time, ascending.
+     * This is the authoritative source-of-record the Verifier enumerates from —
+     * driving verification off the MANIFEST (not the current live DB) is what lets
+     * a legacy post deleted/inserted AFTER detect be caught (a vanished id stays in
+     * this set and is flagged missing; a newly-inserted live id is absent from it
+     * and is cross-checked separately).
+     *
+     * @return list<int>
+     */
+    public function checksummedLegacyIds(): array {
+        $ids = array_map( 'intval', array_keys( $this->checksums ) );
+        sort( $ids );
+        return array_values( $ids );
+    }
+
     /** @return array{counts: array<string,int>, checksums: array<int,string>} */
     public function toArray(): array {
         return array( 'counts' => $this->counts, 'checksums' => $this->checksums );

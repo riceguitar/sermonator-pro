@@ -310,6 +310,179 @@ final class VerifierTest extends WP_UnitTestCase {
         $this->assertNotSame( 'verified', ( new MigrationState() )->phase() );
     }
 
+    public function test_default_podcast_remap_is_explicitly_verified(): void {
+        // The clean dataset seeds wpfc_sm_default_podcast and migrates it to
+        // sermonator_default_podcast (legacy podcast id → new podcast post id). The
+        // Verifier must PROVE that remap explicitly — it carries no sermonmanager_
+        // prefix, so it lives outside the option LIKE scan.
+        $data = $this->seedAndMigrate();
+
+        // Sanity: the remap actually landed on the live migrated podcast.
+        $newPodcastId = Crosswalk::findNewByLegacyId( $data['podcast'], Identifiers::POST_TYPE_PODCAST );
+        $this->assertNotNull( $newPodcastId );
+        $this->assertSame( (int) $newPodcastId, (int) get_option( Identifiers::OPTION_DEFAULT_PODCAST ),
+            'Sanity: default-podcast option holds the new podcast post id.' );
+
+        $manifest = ( new MigrationState() )->manifest();
+        $report   = ( new Verifier() )->verify( $manifest );
+
+        $this->assertTrue( $report->complete, 'A correct default-podcast remap must verify complete.' );
+        $this->assertSame( 1, $report->counts['default_podcast'],
+            'The verified default-podcast remap must be counted.' );
+        $this->assertSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
+    public function test_default_podcast_wrong_target_lands_in_drift_not_complete(): void {
+        // Negative: corrupt the remapped target option AFTER migrate so it no longer
+        // points at the live migrated podcast. The Verifier must catch the broken
+        // pointer (drift + missing) and refuse completeness — otherwise Finalize
+        // would delete the legacy option and lose the pointer.
+        $this->seedAndMigrate();
+        $manifest = ( new MigrationState() )->manifest();
+        $this->assertNotNull( $manifest );
+
+        update_option( Identifiers::OPTION_DEFAULT_PODCAST, 999999 ); // not a live podcast
+
+        $report = ( new Verifier() )->verify( $manifest );
+
+        $this->assertFalse( $report->complete,
+            'A default-podcast pointer to a non-podcast must make the report incomplete.' );
+        $this->assertNotEmpty( $report->drift, 'A broken default-podcast remap must land in drift.' );
+        $this->assertNotSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
+    public function test_orphan_counterpart_without_offsetting_skip_is_not_complete(): void {
+        // A pure SURPLUS: every legacy id keeps its clean counterpart (no skip), yet
+        // an EXTRA migrated sermon is minted with NO offsetting legacy source. The
+        // counts-based completeness check must catch the surplus — otherwise an
+        // over-migrated target verifies clean and authorizes the destructive Finalize.
+        $this->seedAndMigrate();
+        $manifest = ( new MigrationState() )->manifest();
+        $this->assertNotNull( $manifest );
+
+        // Orphan: a migrated sermon whose legacy back-ref is NOT in the manifest.
+        $orphan = (int) wp_insert_post( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_title'  => 'Orphan surplus sermon',
+            'post_status' => 'publish',
+            'meta_input'  => array(
+                Crosswalk::LEGACY_POST_ID     => 8675309, // a legacy id that never existed
+                Crosswalk::MIGRATION_COMPLETE => '1',
+            ),
+        ) );
+        $this->assertGreaterThan( 0, $orphan );
+
+        $report = ( new Verifier() )->verify( $manifest );
+
+        $this->assertFalse( $report->complete,
+            'An orphan/surplus migrated record with no offsetting skip must NOT verify complete.' );
+        $this->assertNotEmpty( $report->missing, 'The surplus counterpart must surface in missing.' );
+        $this->assertNotSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
+    public function test_duplicate_counterpart_for_one_legacy_id_is_not_complete(): void {
+        // EXACTLY-ONE-counterpart: a SECOND migrated sermon stamped with an EXISTING
+        // legacy id (a duplicate) — Crosswalk::findNewByLegacyId silently collapses
+        // >1 to the lowest id, so the duplicate would otherwise pass. The Verifier
+        // must detect the surplus via the true cardinality.
+        $data = $this->seedAndMigrate();
+        $manifest = ( new MigrationState() )->manifest();
+        $this->assertNotNull( $manifest );
+
+        $dup = (int) wp_insert_post( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_title'  => 'Duplicate counterpart',
+            'post_status' => 'publish',
+            'meta_input'  => array(
+                Crosswalk::LEGACY_POST_ID     => $data['sermons'][0],
+                Crosswalk::MIGRATION_COMPLETE => '1',
+            ),
+        ) );
+        $this->assertGreaterThan( 0, $dup );
+        $this->assertSame( 2, Crosswalk::countNewByLegacyId( $data['sermons'][0], Identifiers::POST_TYPE_SERMON ),
+            'Sanity: the legacy id now has two counterparts.' );
+
+        $report = ( new Verifier() )->verify( $manifest );
+
+        $this->assertFalse( $report->complete,
+            'A duplicate counterpart for one legacy id must NOT verify complete.' );
+        $this->assertContains( $data['sermons'][0], $report->missing,
+            'A legacy id with >1 counterpart is not cleanly migrated.' );
+        $this->assertNotSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
+    public function test_legacy_post_deleted_after_detect_is_flagged_missing(): void {
+        // Manifest-driven enumeration: a legacy sermon DELETED after detect is no
+        // longer live, but it is still in the manifest's checksummed ids. The
+        // Verifier must enumerate it from the MANIFEST (not the live DB) and flag it
+        // missing — otherwise verification would gate Finalize against a manifest
+        // whose source has vanished.
+        $data = $this->seedAndMigrate();
+        $manifest = ( new MigrationState() )->manifest();
+        $this->assertNotNull( $manifest );
+
+        $vanished = $data['sermons'][0];
+        $this->assertContains( $vanished, $manifest->checksummedLegacyIds(),
+            'Sanity: the legacy id is in the manifest before deletion.' );
+
+        // Delete the migrated counterpart AND the legacy source (post-detect deletion).
+        $newId = Crosswalk::findNewByLegacyId( $vanished, Identifiers::POST_TYPE_SERMON );
+        $this->assertNotNull( $newId );
+        wp_delete_post( (int) $newId, true );
+        wp_delete_post( $vanished, true );
+
+        $report = ( new Verifier() )->verify( $manifest );
+
+        $this->assertContains( $vanished, $report->missing,
+            'A legacy id present in the manifest but deleted after detect must be missing.' );
+        $this->assertFalse( $report->complete );
+        $this->assertNotSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
+    public function test_sermonmanager_option_round_trips_and_verifies(): void {
+        // The options-verification path: seed a real sermonmanager_* option BEFORE
+        // detect so it migrates to its sermonator_* counterpart, then assert the
+        // Verifier proves the value-equality round-trip (this path was previously
+        // unexercised — no test ever seeded a sermonmanager_* option).
+        $this->fixture->setOption( 'sermonmanager_player', array( 'theme' => 'dark', 'autoplay' => 0 ) );
+
+        $this->seedAndMigrate();
+
+        // Sanity: the option migrated to the sermonator_ namespace, value-equal.
+        $this->assertEquals(
+            array( 'theme' => 'dark', 'autoplay' => 0 ),
+            get_option( 'sermonator_player' ),
+            'Sanity: the sermonmanager_ option migrated value-equal.'
+        );
+
+        $manifest = ( new MigrationState() )->manifest();
+        $report   = ( new Verifier() )->verify( $manifest );
+
+        $this->assertTrue( $report->complete, 'A migrated sermonmanager_ option must verify complete.' );
+        $this->assertGreaterThanOrEqual( 1, $report->counts['options'],
+            'The verified option must be counted.' );
+        $this->assertSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
+    public function test_cleared_target_option_lands_in_drift_not_complete(): void {
+        // Negative options path: clear the migrated target option AFTER migrate so it
+        // no longer carries the legacy value. The Verifier must surface an option
+        // drift sentinel and refuse completeness.
+        $this->fixture->setOption( 'sermonmanager_player', array( 'theme' => 'dark' ) );
+        $this->seedAndMigrate();
+        $manifest = ( new MigrationState() )->manifest();
+        $this->assertNotNull( $manifest );
+
+        delete_option( 'sermonator_player' ); // target option cleared post-migrate
+
+        $report = ( new Verifier() )->verify( $manifest );
+
+        $this->assertFalse( $report->complete,
+            'A cleared migrated option must make the report incomplete.' );
+        $this->assertNotEmpty( $report->drift, 'A cleared/absent target option must land in drift.' );
+        $this->assertNotSame( 'verified', ( new MigrationState() )->phase() );
+    }
+
     public function test_advisory_flags_do_not_block_completeness(): void {
         // legacy_nonnumeric_date (raw preserved + normalized companion) and
         // post_content_preserved (old body preserved + flagged) are ADVISORY — no

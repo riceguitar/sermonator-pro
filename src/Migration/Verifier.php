@@ -73,6 +73,17 @@ final class Verifier {
     /** Sentinel offset for a drifted OPTION (keyed by a stable hash of the name). */
     private const OPTION_DRIFT_BASE = -2000000000;
 
+    /**
+     * Sentinel offset for a SURPLUS migrated post counterpart — a migrated record
+     * whose legacy back-ref is not in the manifest's enumerated legacy set, or a
+     * duplicate counterpart for one legacy id. Recorded in missing[] (a list<int>)
+     * so an over-migrated target cannot verify clean on a balanced count.
+     */
+    private const SURPLUS_BASE = -3000000000;
+
+    /** Sentinel for the default-podcast pointer remap (a single, distinct slot). */
+    private const DEFAULT_PODCAST_SENTINEL = -4000000000;
+
     private MigrationState $state;
 
     public function __construct( ?MigrationState $state = null ) {
@@ -87,17 +98,28 @@ final class Verifier {
         $missing   = array();
         $openFlags = array();
         $counts    = array(
-            'sermons'  => 0,
-            'podcasts' => 0,
-            'terms'    => 0,
-            'options'  => 0,
+            'sermons'         => 0,
+            'podcasts'        => 0,
+            'terms'           => 0,
+            'options'         => 0,
+            'default_podcast' => 0,
         );
 
         // (1)+(2) Posts: source-fixity drift + legacy→target completeness.
+        //
+        // Enumeration is driven from the MANIFEST's recorded legacy ids (not the
+        // current live DB) so a legacy post deleted AFTER detect is still asserted
+        // (and flagged missing), while a legacy post inserted AFTER detect is caught
+        // by the live↔manifest cross-check below. Sermons are checksummed
+        // individually; podcasts are not (the manifest only records their count), so
+        // for podcasts the manifest "expected set" is the live legacy set and the
+        // recorded count is the surplus/shortfall oracle.
         $this->verifyPostType(
             LegacyIdentifiers::POST_TYPE_SERMON,
             Identifiers::POST_TYPE_SERMON,
             'sermons',
+            $m->checksummedLegacyIds(),
+            $m->count( 'sermons' ),
             $m,
             $drift,
             $missing,
@@ -108,6 +130,8 @@ final class Verifier {
             LegacyIdentifiers::POST_TYPE_PODCAST,
             Identifiers::POST_TYPE_PODCAST,
             'podcasts',
+            $this->legacyPostIds( LegacyIdentifiers::POST_TYPE_PODCAST ),
+            $m->count( 'podcasts' ),
             $m,
             $drift,
             $missing,
@@ -116,10 +140,16 @@ final class Verifier {
         );
 
         // (3) Terms: completeness via the crosswalk + field-by-field fixity drift.
-        $this->verifyTerms( $drift, $missing, $openFlags, $counts );
+        $this->verifyTerms( $m, $drift, $missing, $openFlags, $counts );
 
-        // Options: completeness + value drift (default-podcast is intentionally remapped).
-        $this->verifyOptions( $drift, $counts );
+        // Options: completeness + value drift over the sermonmanager_* set.
+        $this->verifyOptions( $m, $drift, $missing, $counts );
+
+        // The default-podcast pointer is INTENTIONALLY remapped (legacy podcast id →
+        // new podcast post id), carries no sermonmanager_ prefix, and so is verified
+        // explicitly OUTSIDE the sermonmanager_ scan — proving the remap landed on a
+        // live migrated podcast before Finalize is ever authorized to delete it.
+        $this->verifyDefaultPodcast( $drift, $missing, $counts );
 
         $drift     = array_values( array_unique( $drift ) );
         $missing   = array_values( array_unique( $missing ) );
@@ -141,11 +171,26 @@ final class Verifier {
     }
 
     /**
-     * Verify one post type: per legacy id, fold a checksum mismatch into drift[] and
-     * a missing/dirty counterpart into missing[] (with its open failure flags into
-     * openFlags[]). A CLEAN counterpart increments the per-type count.
+     * Verify one post type against the MANIFEST's expected legacy id set.
      *
-     * @param array<string,int> $counts
+     * For each EXPECTED legacy id: fold a checksum mismatch into drift[], assert
+     * EXACTLY ONE migrated counterpart (a duplicate >1 lands in missing[] via a
+     * surplus sentinel — Crosswalk silently collapses >1 to the lowest id, so we
+     * cannot rely on it), and fold a missing/dirty counterpart into missing[] (its
+     * open failure flags into openFlags[]). A CLEAN, unique counterpart increments
+     * the per-type count.
+     *
+     * Then two completeness cross-checks the bare legacy→target loop cannot see:
+     *  - LIVE↔MANIFEST: a live legacy id absent from the manifest was inserted AFTER
+     *    detect (the manifest's source no longer matches the DB) → missing sentinel.
+     *  - SURPLUS: a migrated counterpart whose legacy back-ref is NOT an expected id
+     *    (an orphan/over-migrated record), or the verified-clean count exceeding the
+     *    manifest's recorded count → surplus sentinel. This defeats an offsetting
+     *    "skip one + duplicate another" that balances a bare count.
+     *
+     * @param list<int>          $expectedLegacyIds The manifest's legacy ids for this type.
+     * @param int                $manifestCount     The manifest's recorded count for this type.
+     * @param array<string,int>  $counts
      * @param list<int>          $drift
      * @param list<int>          $missing
      * @param list<string>       $openFlags
@@ -154,36 +199,79 @@ final class Verifier {
         string $legacyType,
         string $newType,
         string $countKey,
+        array $expectedLegacyIds,
+        int $manifestCount,
         Manifest $m,
         array &$drift,
         array &$missing,
         array &$openFlags,
         array &$counts
     ): void {
-        foreach ( $this->legacyPostIds( $legacyType ) as $legacyId ) {
+        $expectedSet = array();
+        foreach ( $expectedLegacyIds as $legacyId ) {
+            $expectedSet[ (int) $legacyId ] = true;
+        }
+
+        foreach ( array_keys( $expectedSet ) as $legacyId ) {
             // (1) Source-fixity drift — only for ids the manifest checksummed.
             $expected = $m->checksum( $legacyId );
             if ( $expected !== null && LegacyChecksum::forPost( $legacyId ) !== $expected ) {
                 $drift[] = $legacyId;
             }
 
-            // (2) Legacy→target completeness: exactly one counterpart, no failure flag.
-            $newId = Crosswalk::findNewByLegacyId( $legacyId, $newType );
-            if ( $newId === null ) {
+            // (2) Legacy→target completeness: EXACTLY one counterpart, no failure flag.
+            $counterparts = Crosswalk::countNewByLegacyId( $legacyId, $newType );
+            if ( $counterparts === 0 ) {
                 $missing[] = $legacyId;
                 continue;
             }
+            if ( $counterparts > 1 ) {
+                // A duplicate counterpart for one legacy id — the lowest id may even
+                // be clean, but the surplus copy means the target is over-migrated.
+                $missing[] = $legacyId;
+                $missing[] = self::SURPLUS_BASE - $legacyId;
+                continue;
+            }
 
-            $failures = $this->openFailureFlags( $this->postFlags( $newId ) );
-            if ( $failures !== array() ) {
+            $newId    = Crosswalk::findNewByLegacyId( $legacyId, $newType );
+            $failures = $newId === null ? array() : $this->openFailureFlags( $this->postFlags( $newId ) );
+            if ( $newId === null || $failures !== array() ) {
                 // A counterpart carrying an open failure flag is NOT clean — count it
                 // as missing AND surface the flags.
-                $missing[]  = $legacyId;
-                $openFlags  = array_merge( $openFlags, $failures );
+                $missing[] = $legacyId;
+                $openFlags = array_merge( $openFlags, $failures );
                 continue;
             }
 
             $counts[ $countKey ]++;
+        }
+
+        // LIVE↔MANIFEST: a live legacy id the manifest never recorded was inserted
+        // AFTER detect — the manifest no longer describes the source.
+        foreach ( $this->legacyPostIds( $legacyType ) as $liveId ) {
+            if ( ! isset( $expectedSet[ $liveId ] ) ) {
+                $missing[] = self::SURPLUS_BASE - $liveId;
+            }
+        }
+
+        // SURPLUS: any migrated counterpart pointing at a legacy id NOT in the
+        // manifest set is an orphan/over-migrated record.
+        foreach ( Crosswalk::migratedPostIds( $newType ) as $migratedId ) {
+            $backRef = (int) get_post_meta( $migratedId, Crosswalk::LEGACY_POST_ID, true );
+            if ( ! isset( $expectedSet[ $backRef ] ) ) {
+                $missing[] = self::SURPLUS_BASE - $migratedId;
+            }
+        }
+
+        // Count guard: the verified-clean count MUST equal the manifest's recorded
+        // count. A SURPLUS (more clean than recorded) is over-migration the per-id
+        // "exactly one" loop cannot express on its own. A SHORTFALL (fewer clean than
+        // recorded) catches a manifest legacy id whose enumeration is not individually
+        // driven — notably PODCASTS, which the manifest records only by count (no
+        // per-id checksum), so a podcast deleted AFTER detect shrinks the live set
+        // silently and is caught here.
+        if ( $counts[ $countKey ] !== $manifestCount ) {
+            $missing[] = self::SURPLUS_BASE - ( $manifestCount + 1 );
         }
     }
 
@@ -200,8 +288,13 @@ final class Verifier {
      * @param list<int>          $missing
      * @param list<string>       $openFlags
      */
-    private function verifyTerms( array &$drift, array &$missing, array &$openFlags, array &$counts ): void {
-        $taxonomyMap = MappingContract::taxonomyMap();
+    private function verifyTerms( Manifest $m, array &$drift, array &$missing, array &$openFlags, array &$counts ): void {
+        $taxonomyMap   = MappingContract::taxonomyMap();
+        $expectedTerms = 0;
+
+        foreach ( LegacyIdentifiers::sermonTaxonomies() as $legacyTaxonomy ) {
+            $expectedTerms += $m->count( 'terms_' . $legacyTaxonomy );
+        }
 
         foreach ( LegacyIdentifiers::sermonTaxonomies() as $legacyTaxonomy ) {
             $targetTaxonomy = $taxonomyMap[ $legacyTaxonomy ] ?? null;
@@ -263,35 +356,30 @@ final class Verifier {
                 $counts['terms']++;
             }
         }
+
+        // COUNT guard: verified-clean terms MUST equal the manifest's recorded term
+        // total. A surplus is an orphan/duplicate migrated term; a shortfall catches
+        // a legacy term deleted AFTER detect (the live get_terms scan would no longer
+        // enumerate it) — both block completeness.
+        if ( $counts['terms'] !== $expectedTerms ) {
+            $missing[] = self::TERM_DRIFT_BASE - ( $expectedTerms + 1 );
+        }
     }
 
     /**
      * Verify the migrated sermonmanager_* options: each legacy option maps via
-     * mapOptionName() to a target option that must exist with an EQUAL value —
-     * except the default-podcast pointer, which is intentionally remapped from the
-     * legacy podcast id to the new post id (value differs by design, so we assert it
-     * resolves to a real migrated podcast instead).
+     * mapOptionName() to a target option that must exist with an EQUAL value. The
+     * default-podcast pointer carries NO sermonmanager_ prefix, so it is NOT in this
+     * scan — it is verified separately by verifyDefaultPodcast().
      *
      * @param array<string,int> $counts
      * @param list<int>          $drift
+     * @param list<int>          $missing
      */
-    private function verifyOptions( array &$drift, array &$counts ): void {
+    private function verifyOptions( Manifest $m, array &$drift, array &$missing, array &$counts ): void {
         foreach ( $this->legacyOptionNames() as $legacyName ) {
             $targetName = MappingContract::mapOptionName( $legacyName );
             if ( $targetName === null ) {
-                continue;
-            }
-
-            if ( $legacyName === LegacyIdentifiers::OPTION_DEFAULT_PODCAST ) {
-                // Intentionally remapped: the new value is the NEW podcast post id.
-                $legacyPodcastId = (int) get_option( $legacyName );
-                $expectedNewId   = Crosswalk::findNewByLegacyId( $legacyPodcastId, Identifiers::POST_TYPE_PODCAST );
-                $actual          = (int) get_option( $targetName, 0 );
-                if ( $expectedNewId === null || $actual !== (int) $expectedNewId ) {
-                    $drift[] = $this->optionSentinel( $legacyName );
-                    continue;
-                }
-                $counts['options']++;
                 continue;
             }
 
@@ -306,6 +394,59 @@ final class Verifier {
 
             $counts['options']++;
         }
+
+        // COUNT guard: verified-clean options MUST equal the manifest's recorded
+        // sermonmanager_* count (default-podcast is excluded by both this scan and
+        // Detector::countLegacyOptions's LIKE). A surplus is an orphan target option;
+        // a shortfall catches a sermonmanager_* option deleted AFTER detect (no longer
+        // enumerated by the live LIKE scan) — both block completeness.
+        if ( $counts['options'] !== $m->count( 'options' ) ) {
+            $missing[] = self::OPTION_DRIFT_BASE - ( $m->count( 'options' ) + 1 );
+        }
+    }
+
+    /**
+     * Verify the default-podcast pointer remap EXPLICITLY, outside the
+     * sermonmanager_ LIKE scan (the legacy option is wpfc_sm_default_podcast — no
+     * sermonmanager_ prefix — and mapOptionName() returns null for it, so the old
+     * in-loop branch was unreachable dead code).
+     *
+     * When the legacy pointer is set, the migrated target option MUST equal
+     * Crosswalk::findNewByLegacyId(legacyPodcastId, PODCAST) AND that new id MUST
+     * resolve to a LIVE migrated podcast post. A mismatch — or a pointer to a podcast
+     * that never migrated — pushes a drift sentinel so the silently-failed remap
+     * cannot verify 'complete' and let Finalize delete the legacy option, losing the
+     * pointer.
+     *
+     * @param array<string,int> $counts
+     * @param list<int>          $drift
+     * @param list<int>          $missing
+     */
+    private function verifyDefaultPodcast( array &$drift, array &$missing, array &$counts ): void {
+        $legacy = get_option( LegacyIdentifiers::OPTION_DEFAULT_PODCAST );
+        if ( false === $legacy || '' === $legacy || null === $legacy ) {
+            return; // No legacy pointer → nothing to remap, nothing to verify.
+        }
+
+        $legacyPodcastId = (int) $legacy;
+        $expectedNewId   = Crosswalk::findNewByLegacyId( $legacyPodcastId, Identifiers::POST_TYPE_PODCAST );
+        $marker          = '__sermonator_option_absent__';
+        $actual          = get_option( Identifiers::OPTION_DEFAULT_PODCAST, $marker );
+
+        // The target option must be present, equal to the remapped new id, and that
+        // new id must point at a LIVE migrated podcast (not a stale/deleted post).
+        if (
+            $expectedNewId === null
+            || $actual === $marker
+            || (int) $actual !== (int) $expectedNewId
+            || get_post_type( (int) $expectedNewId ) !== Identifiers::POST_TYPE_PODCAST
+        ) {
+            $drift[]   = self::DEFAULT_PODCAST_SENTINEL;
+            $missing[] = self::DEFAULT_PODCAST_SENTINEL;
+            return;
+        }
+
+        $counts['default_podcast']++;
     }
 
     // -------------------------------------------------------------------------
