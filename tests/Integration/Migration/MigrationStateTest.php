@@ -271,6 +271,31 @@ final class MigrationStateTest extends WP_UnitTestCase {
         $this->assertSame( 2, $stored->count( 'sermons' ) );
     }
 
+    public function test_setManifest_allows_first_write_at_advanced_phase_but_refuses_overwrite(): void {
+        // B2b round-2 review (finalize-restructure-0): "write-once" means NO OVERWRITE.
+        // A FIRST manifest write is permitted even at an advanced phase (the corrupted-
+        // state recovery — no oracle exists to poison), but OVERWRITING an existing
+        // manifest past 'detected' is refused (the verifier-soundness guarantee).
+        $state = new MigrationState();
+        $state->set( 'detected' );
+        $state->set( 'migrating' );
+
+        // No manifest stored yet → a FIRST write at 'migrating' is allowed (recovery).
+        $this->assertNull( $state->manifest() );
+        $state->setManifest( new Manifest( array( 'sermons' => 1 ), array( 5 => 'h5' ) ) );
+        $this->assertSame( 'h5', $state->manifest()->checksum( 5 ) );
+
+        // A subsequent OVERWRITE at the advanced phase is refused (the oracle now exists).
+        $threw = false;
+        try {
+            $state->setManifest( new Manifest( array( 'sermons' => 99 ), array( 5 => 'POISONED' ) ) );
+        } catch ( \InvalidArgumentException $e ) {
+            $threw = true;
+        }
+        $this->assertTrue( $threw, 'Overwriting an existing manifest past detected must be refused.' );
+        $this->assertSame( 'h5', $state->manifest()->checksum( 5 ), 'The original detect-time oracle must be intact.' );
+    }
+
     public function test_manifest_round_trips_podcast_checksums(): void {
         // B2b review (legacy-immutability-0): podcasts now carry a SEPARATE detect-time
         // checksum map (kept distinct from the sermon map so sermon/podcast can still be

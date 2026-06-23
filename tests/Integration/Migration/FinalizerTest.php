@@ -586,6 +586,34 @@ final class FinalizerTest extends WP_UnitTestCase {
             'A resumed finalize must reach the finalized terminal phase.' );
     }
 
+    public function test_pending_deletions_equals_what_finalize_actually_deletes(): void {
+        // B2b round-2 review (finalize-restructure-1): the CLI blast-radius preview
+        // (pendingDeletions) must enumerate from the SAME immutable manifest the drain
+        // deletes from, so the previewed set is provably what finalize actually deletes.
+        $data = $this->seedDataset();
+        $this->migrateAndVerify();
+
+        $preview = ( new Finalizer() )->pendingDeletions();
+        $this->assertNotEmpty( $preview['posts'] );
+
+        $result = ( new Finalizer() )->run( true );
+        $this->assertNull( $result['refused'] );
+
+        $previewPosts = $preview['posts'];
+        $actualPosts  = $result['deleted']['posts'];
+        sort( $previewPosts );
+        sort( $actualPosts );
+        $this->assertSame( $previewPosts, $actualPosts,
+            'The finalize blast-radius preview must equal the legacy posts finalize actually deletes.' );
+
+        $previewOpts = $preview['options'];
+        $actualOpts  = $result['deleted']['options'];
+        sort( $previewOpts );
+        sort( $actualOpts );
+        $this->assertSame( $previewOpts, $actualOpts,
+            'The previewed option set must equal what finalize actually deletes.' );
+    }
+
     private function sharedCategoryCountFresh( int $ttId ): int {
         global $wpdb;
         return (int) $wpdb->get_var(

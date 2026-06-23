@@ -177,24 +177,27 @@ final class MigrationState {
     /**
      * Capture the detect-time manifest (the legacy-shape oracle).
      *
-     * WRITE-ONCE w.r.t. lifecycle. The manifest is the IMMUTABLE detect-time fixity
-     * snapshot the drift oracle compares the live legacy source against. It may be
-     * (re)captured only while the migration has not yet begun (phase ∈ {none,
-     * detected}); once work has started, overwriting it would re-pin checksums to
-     * current (possibly post-edit) values, silently destroying the drift oracle and
-     * letting a drifted legacy record verify clean and be finalized (irreversible
-     * loss of the church's true source). So we refuse the overwrite in any later
-     * phase. (A deliberate re-detect requires first retreating to 'detected' via
-     * Rollback.)
+     * WRITE-ONCE w.r.t. lifecycle, in the precise sense of NO OVERWRITE. The manifest
+     * is the IMMUTABLE detect-time fixity snapshot the drift oracle compares the live
+     * legacy source against. Once a manifest EXISTS, overwriting it after work has begun
+     * would re-pin checksums to current (possibly post-edit) values, silently destroying
+     * the drift oracle and letting a drifted legacy record verify clean and be finalized
+     * (irreversible loss of the church's true source) — so an OVERWRITE is refused in any
+     * phase past 'detected'. A FIRST write (no manifest yet stored) is always permitted,
+     * even at an advanced phase: there is no oracle to poison, and this is the sanctioned
+     * defensive recovery for a corrupted/partial state row (Orchestrator::detect's
+     * advanced-phase-with-no-manifest fall-through). A deliberate re-detect/re-baseline
+     * requires first retreating to 'detected' via Rollback.
      *
-     * @throws \InvalidArgumentException when the migration has advanced past 'detected'.
+     * @throws \InvalidArgumentException when OVERWRITING an existing manifest past 'detected'.
      */
     public function setManifest( Manifest $m ): void {
-        $data = $this->load();
-        if ( ! in_array( $data['phase'], array( 'none', 'detected' ), true ) ) {
+        $data               = $this->load();
+        $alreadyHasManifest = isset( $data['manifest'] ) && is_array( $data['manifest'] );
+        if ( $alreadyHasManifest && ! in_array( $data['phase'], array( 'none', 'detected' ), true ) ) {
             throw new \InvalidArgumentException(
                 sprintf(
-                    'Refusing to overwrite the detect-time manifest in phase "%s" — it is the immutable fixity oracle (re-detect only after a rollback to "detected").',
+                    'Refusing to OVERWRITE the detect-time manifest in phase "%s" — it is the immutable fixity oracle (re-detect only after a rollback to "detected").',
                     $data['phase']
                 )
             );

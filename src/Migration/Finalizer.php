@@ -109,15 +109,19 @@ final class Finalizer {
         $posts    = array();
         $manifest = $this->state->manifest();
         if ( $manifest !== null ) {
+            // Enumerate BOTH types from the IMMUTABLE manifest — the SAME source
+            // drainDestructive() deletes from — so the printed blast radius is provably
+            // the exact set run() would delete (never over-reporting a podcast inserted
+            // after detect, which the drain would not touch).
             foreach ( $manifest->checksummedLegacyIds() as $legacyId ) {
                 if ( $this->isDeletableCounterpart( (int) $legacyId, Identifiers::POST_TYPE_SERMON ) ) {
                     $posts[] = (int) $legacyId;
                 }
             }
-        }
-        foreach ( $this->legacyPostIds( LegacyIdentifiers::POST_TYPE_PODCAST ) as $legacyId ) {
-            if ( $this->isDeletableCounterpart( $legacyId, Identifiers::POST_TYPE_PODCAST ) ) {
-                $posts[] = $legacyId;
+            foreach ( $manifest->checksummedPodcastLegacyIds() as $legacyId ) {
+                if ( $this->isDeletableCounterpart( (int) $legacyId, Identifiers::POST_TYPE_PODCAST ) ) {
+                    $posts[] = (int) $legacyId;
+                }
             }
         }
         $posts = array_values( array_unique( $posts ) );

@@ -113,8 +113,10 @@ final class Orchestrator {
                 // Do NOT re-baseline — return the immutable detect-time manifest.
                 return $existing;
             }
-            // Defensive only: an advanced phase with no stored manifest cannot poison
-            // an oracle that does not exist, so fall through to a fresh detect.
+            // Defensive recovery: an advanced phase with no stored manifest (a
+            // corrupted/partial state row) cannot poison an oracle that does not exist,
+            // so fall through to capture a fresh manifest. setManifest permits this FIRST
+            // write at any phase (it only refuses an OVERWRITE of an existing manifest).
         }
 
         $manifest = $this->detector->detect();
