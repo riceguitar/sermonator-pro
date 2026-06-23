@@ -17,7 +17,9 @@ final class Assets {
     public const SCRIPT_HANDLE = 'sermonator-audio-player';
 
     public function hook(): void {
-        add_action( 'init', array( $this, 'register' ) );
+        // Handles are registered on init by FrontendServiceProvider (before block
+        // registration so block.json style/viewScript references resolve); here we only
+        // wire the conditional front-end enqueue. maybeEnqueue() self-heals if needed.
         add_action( 'wp_enqueue_scripts', array( $this, 'maybeEnqueue' ) );
     }
 

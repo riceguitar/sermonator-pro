@@ -68,6 +68,54 @@ final class TemplateDataTest extends TestCase {
         $this->assertNull( $view->preachedTimestamp );
     }
 
+    public function test_negative_pre_1970_timestamp_is_preserved(): void {
+        Functions\when( 'get_the_title' )->justReturn( 'T' );
+        Functions\when( 'get_permalink' )->justReturn( 'http://x/' );
+        Functions\when( 'get_the_terms' )->justReturn( array() );
+        // A sermon preached before 1970 has a negative Unix timestamp; it must NOT be dropped.
+        $meta = array( ID::META_DATE => array( '-1734775200' ) );
+        Functions\when( 'get_post_meta' )->alias(
+            static fn( $id, $key, $single ) => $single ? ( $meta[ $key ][0] ?? '' ) : ( $meta[ $key ] ?? array() )
+        );
+
+        $view = ( new TemplateData() )->sermon( 8 );
+
+        $this->assertSame( -1734775200, $view->preachedTimestamp );
+    }
+
+    public function test_lone_dash_date_is_null(): void {
+        Functions\when( 'get_the_title' )->justReturn( 'T' );
+        Functions\when( 'get_permalink' )->justReturn( 'http://x/' );
+        Functions\when( 'get_the_terms' )->justReturn( array() );
+        $meta = array( ID::META_DATE => array( '-' ) );
+        Functions\when( 'get_post_meta' )->alias(
+            static fn( $id, $key, $single ) => $single ? ( $meta[ $key ][0] ?? '' ) : ( $meta[ $key ] ?? array() )
+        );
+
+        $this->assertNull( ( new TemplateData() )->sermon( 9 )->preachedTimestamp );
+    }
+
+    public function test_term_link_wp_error_yields_unlinked_term(): void {
+        Functions\when( 'get_the_title' )->justReturn( 'T' );
+        Functions\when( 'get_permalink' )->justReturn( 'http://x/' );
+        Functions\when( 'get_post_meta' )->justReturn( '' );
+        Functions\when( 'get_term_link' )->justReturn( 'WPERR' );
+        // Override the blanket is_wp_error stub: treat the sentinel as an error.
+        Functions\when( 'is_wp_error' )->alias( static fn( $v ) => $v === 'WPERR' );
+        Functions\when( 'get_the_terms' )->alias( static function ( $id, $tax ) {
+            if ( $tax === ID::TAX_PREACHER ) {
+                $t       = new \stdClass();
+                $t->name = 'Pastor John';
+                return array( $t );
+            }
+            return array();
+        } );
+
+        $view = ( new TemplateData() )->sermon( 10 );
+
+        $this->assertSame( array( array( 'name' => 'Pastor John', 'url' => '' ) ), $view->preachers );
+    }
+
     public function test_maps_terms_with_links(): void {
         Functions\when( 'get_the_title' )->justReturn( 'T' );
         Functions\when( 'get_permalink' )->justReturn( 'http://x/' );

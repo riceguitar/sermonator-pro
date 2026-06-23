@@ -14,7 +14,7 @@ final class AudioPlayerBlock extends AbstractBlock {
     }
 
     public function render( array $attributes, string $content, \WP_Block $block ): string {
-        $postId = $this->resolvePostId( $attributes, $block );
+        $postId = $this->renderablePostId( $attributes, $block );
         if ( $postId <= 0 ) {
             return '';
         }

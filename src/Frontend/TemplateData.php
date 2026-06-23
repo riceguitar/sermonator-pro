@@ -21,7 +21,7 @@ final class TemplateData {
             id:                $postId,
             title:             (string) get_the_title( $postId ),
             permalink:         (string) get_permalink( $postId ),
-            preachedTimestamp: ( $rawDate !== '' && ctype_digit( $rawDate ) ) ? (int) $rawDate : null,
+            preachedTimestamp: $this->parseTimestamp( $rawDate ),
             biblePassage:      $str( ID::META_BIBLE_PASSAGE ),
             audioUrl:          $str( ID::META_AUDIO ),
             audioDuration:     $str( ID::META_AUDIO_DURATION ),
@@ -35,6 +35,20 @@ final class TemplateData {
             books:             $this->terms( $postId, ID::TAX_BOOK ),
             serviceTypes:      $this->terms( $postId, ID::TAX_SERVICE_TYPE ),
         );
+    }
+
+    /**
+     * Parse a stored sermon_date (a SIGNED Unix timestamp — sermons preached before
+     * 1970-01-01 are negative). Mirrors the migration layer's ctype_digit( ltrim( …, '-' ) )
+     * check so a pre-1970 date is preserved here exactly as the migration writes it, instead
+     * of being silently dropped to null (which would omit the date row entirely).
+     */
+    private function parseTimestamp( string $raw ): ?int {
+        if ( $raw === '' ) {
+            return null;
+        }
+        $digits = ltrim( $raw, '-' );
+        return ( $digits !== '' && ctype_digit( $digits ) ) ? (int) $raw : null;
     }
 
     /** @return list<array{name:string,url:string}> */

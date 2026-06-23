@@ -20,6 +20,7 @@ final class RendererTest extends TestCase {
         Functions\when( 'wp_kses_post' )->returnArg();
         Functions\when( 'wp_kses' )->returnArg();
         Functions\when( 'wp_kses_allowed_html' )->justReturn( array() );
+        Functions\when( 'wp_oembed_get' )->justReturn( false );
         Functions\when( 'esc_html__' )->returnArg();
         Functions\when( '__' )->returnArg();
     }
@@ -86,8 +87,16 @@ final class RendererTest extends TestCase {
     public function test_video_prefers_embed_then_url_then_empty(): void {
         $r = new Renderer();
         $this->assertStringContainsString( '<iframe', $r->video( $this->view( array( 'embed' => '<iframe src="x"></iframe>' ) ) ) );
+        // wp_oembed_get stubbed to false → falls back to a plain link.
         $this->assertStringContainsString( 'http://x/v', $r->video( $this->view( array( 'vurl' => 'http://x/v' ) ) ) );
         $this->assertSame( '', $r->video( $this->view() ) );
+    }
+
+    public function test_video_url_uses_oembed_when_available(): void {
+        Functions\when( 'wp_oembed_get' )->justReturn( '<iframe class="oembed" src="http://x/player"></iframe>' );
+        $html = ( new Renderer() )->video( $this->view( array( 'vurl' => 'http://youtube.com/watch?v=x' ) ) );
+        $this->assertStringContainsString( 'oembed', $html );
+        $this->assertStringContainsString( 'sermonator-video', $html );
     }
 
     public function test_date_label_uses_wp_date(): void {

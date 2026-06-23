@@ -29,6 +29,17 @@ final class Plugin {
             return;
         }
 
+        add_action(
+            'init',
+            static function (): void {
+                load_plugin_textdomain(
+                    'sermonator',
+                    false,
+                    dirname( plugin_basename( SERMONATOR_FILE ) ) . '/languages'
+                );
+            }
+        );
+
         ( new \Sermonator\Model\Registrar() )->hook();
         ( new \Sermonator\Model\Capabilities() )->grant();
 

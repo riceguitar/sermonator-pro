@@ -54,9 +54,13 @@ final class Renderer {
             return '<div class="sermonator-video">' . wp_kses( $v->videoEmbed, $this->allowedVideoHtml() ) . '</div>';
         }
         if ( $v->videoUrl !== '' ) {
-            return '<div class="sermonator-video">'
-                . '<a href="' . esc_url( $v->videoUrl ) . '">' . esc_html( $v->videoUrl ) . '</a>'
-                . '</div>';
+            // Prefer an inline oEmbed player (cached by WP; only known providers resolve);
+            // fall back to a plain link when the URL is not oEmbeddable.
+            $oembed = wp_oembed_get( $v->videoUrl );
+            $inner  = ( is_string( $oembed ) && $oembed !== '' )
+                ? $oembed
+                : '<a href="' . esc_url( $v->videoUrl ) . '">' . esc_html( $v->videoUrl ) . '</a>';
+            return '<div class="sermonator-video">' . $inner . '</div>';
         }
         return '';
     }
@@ -72,6 +76,10 @@ final class Renderer {
      * Allowed HTML for a stored video embed. wp_kses_post() strips <iframe>, which would
      * silently delete YouTube/Vimeo embeds, so we extend the post allowlist with iframe (and
      * <video>/<source> for self-hosted) limited to safe, embed-relevant attributes.
+     *
+     * `style` is deliberately NOT allowed: kses does not parse CSS, so an allowed style
+     * attribute would let an editor turn an iframe into a full-page invisible overlay
+     * (clickjacking). Sizing is handled by width/height + the stylesheet's max-width.
      *
      * @return array<string,array<string,bool>>
      */
@@ -89,7 +97,6 @@ final class Renderer {
             'referrerpolicy'  => true,
             'name'            => true,
             'class'           => true,
-            'style'           => true,
             'sandbox'         => true,
         );
         $allowed['video']  = array(
@@ -100,7 +107,6 @@ final class Renderer {
             'preload'  => true,
             'poster'   => true,
             'class'    => true,
-            'style'    => true,
         );
         $allowed['source'] = array(
             'src'  => true,

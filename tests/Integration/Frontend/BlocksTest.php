@@ -49,4 +49,22 @@ final class BlocksTest extends WP_UnitTestCase {
         $html = do_blocks( '<!-- wp:sermonator/video {"postId":' . $id . '} /-->' );
         $this->assertStringContainsString( '<iframe', $html );
     }
+
+    public function test_block_does_not_disclose_draft_sermon_to_anonymous(): void {
+        wp_set_current_user( 0 );
+        $id = (int) self::factory()->post->create( array(
+            'post_type'   => ID::POST_TYPE_SERMON,
+            'post_status' => 'draft',
+        ) );
+        update_post_meta( $id, ID::META_BIBLE_PASSAGE, 'Secret 1:1' );
+
+        $html = trim( do_blocks( '<!-- wp:sermonator/sermon-meta {"postId":' . $id . '} /-->' ) );
+        $this->assertSame( '', $html, 'A draft sermon must not be disclosed via an explicit postId.' );
+    }
+
+    public function test_block_renders_nothing_for_non_sermon_post(): void {
+        $id   = (int) self::factory()->post->create( array( 'post_type' => 'post' ) );
+        $html = trim( do_blocks( '<!-- wp:sermonator/sermon-meta {"postId":' . $id . '} /-->' ) );
+        $this->assertSame( '', $html, 'A non-sermon post id must render nothing.' );
+    }
 }

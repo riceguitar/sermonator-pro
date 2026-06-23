@@ -1305,6 +1305,44 @@ git commit -m "test(frontend): golden-HTML meta parity (no composition drift)"
 is the signature reused by Tasks 5/6; `register()` slug derivation matches block.json names;
 `ClassicTemplates`/`Assets`/`BlockTemplates` method names match their Task-9 wiring.
 
+## Phase 1 adversarial-review outcomes (2026-06-23)
+
+Three-lens review (security / WP-correctness / correctness-design). Confirmed findings
+**resolved** this round (all tested + live-verified):
+- **CRITICAL** — pre-1970 (negative) `sermonator_date` was dropped to null (`ctype_digit`
+  rejects the `-`), omitting the date row → data loss. Now `parseTimestamp()` mirrors the
+  migration's `ctype_digit( ltrim( …, '-' ) )`. Unit-tested (negative + lone-dash).
+- **IMPORTANT (security)** — blocks rendered any `postId` regardless of status/type →
+  draft/private/non-sermon disclosure. Added `AbstractBlock::renderablePostId()` gate
+  (`get_post_type === sermon && (is_post_publicly_viewable || current_user_can read_post)`).
+  Integration-tested (draft + non-sermon → empty); editor preview preserved via read_post.
+- **IMPORTANT (security)** — `style` in the video kses allowlist was a full-page-overlay
+  clickjacking primitive. Removed from iframe/video allowlists.
+- **IMPORTANT** — double `init` asset registration removed; `load_plugin_textdomain` +
+  `Domain Path` added (self-hosted .mo loading); dead `align:wide` block support removed.
+- **IMPORTANT (spec gap)** — `videoUrl` now renders an inline **oEmbed** (cached, known
+  providers only) with a link fallback. Live-verified (YouTube URL → iframe).
+- **MINOR** — strengthened parity test to compare block-sequence vs classic composition
+  (real cross-path drift check, not block-vs-self); added `WP_Error` term-link unit test;
+  `single_template` short-circuits on block themes (`wp_is_block_theme()`).
+
+**Deferred (recorded, intentionally NOT done in Phase 1):**
+- **Editor preview JS** — blocks are server-registered/insertable but have no client `edit`,
+  so the Site-Editor preview is server-rendered (often blank without loop context). Needs a
+  small editor script + a build step → Phase 2.
+- **iframe `src` host-allowlist** — deliberately NOT added: legacy embeds come from many
+  providers and a host allowlist would silently drop migrated embeds, violating the
+  data-preservation bar. Trust model = "a user who can edit a sermon is trusted" (custom
+  `sermonator_sermon` caps). Revisit with a per-provider allowlist + `register_post_meta`
+  `auth_callback` when the admin/editing UI lands.
+- **Header/footer template-part slug fragility** on non-standard block themes — Phase-4
+  cross-theme pass (spec §13).
+- **Off-single `viewScript` auto-enqueue** — confirm the player JS loads when the
+  audio-player block is placed on a non-sermon page; low risk, verify in Phase 2.
+
+Result: unit 93, integration 347 — all green on WP 7.0; published single renders rich on
+TT5 (block) + twentytwentyone (classic); draft gated.
+
 ## Phase 0 outcome
 
 **Run 2026-06-23 on the Local "sermonator-test" site (TT5, WP 7.0). RESULT: PASS →

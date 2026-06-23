@@ -7,6 +7,7 @@
  * Requires at least: 7.0
  * License: GPL-2.0-or-later
  * Text Domain: sermonator
+ * Domain Path: /languages
  *
  * @package Sermonator
  */

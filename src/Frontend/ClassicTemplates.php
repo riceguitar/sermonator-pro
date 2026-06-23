@@ -22,7 +22,10 @@ final class ClassicTemplates {
     }
 
     public function singleTemplate( string $template ): string {
-        if ( ! is_singular( ID::POST_TYPE_SERMON ) ) {
+        // Block themes render via the registered block template; only classic themes use the
+        // PHP template hierarchy. Short-circuiting here makes the two paths mutually
+        // exclusive by construction rather than relying on WP's resolution order.
+        if ( wp_is_block_theme() || ! is_singular( ID::POST_TYPE_SERMON ) ) {
             return $template;
         }
 
