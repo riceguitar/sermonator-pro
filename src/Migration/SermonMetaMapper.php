@@ -34,8 +34,18 @@ final class SermonMetaMapper {
                 continue; // e.g. wpfc_service_type denormalized copy
             }
 
-            if ( LegacyIdentifiers::META_DATE === $key && isset( $values[0] ) && ! self::isUnixTimestamp( $values[0] ) ) {
-                $flags[] = 'legacy_nonnumeric_date';
+            // Scan EVERY date row, not just the first: a multi-row sermon_date
+            // whose first value is numeric but a later value is non-numeric must
+            // still flag (and the writer writes a normalized companion for that
+            // later row). First-row-only inspection would silently disagree with
+            // the per-row companion set.
+            if ( LegacyIdentifiers::META_DATE === $key ) {
+                foreach ( $values as $dateValue ) {
+                    if ( ! self::isUnixTimestamp( (string) $dateValue ) ) {
+                        $flags[] = 'legacy_nonnumeric_date';
+                        break;
+                    }
+                }
             }
 
             $newKey          = $keyMap[ $key ] ?? $key; // known → renamed; unknown → verbatim

@@ -9,27 +9,76 @@ namespace Sermonator\Migration;
  * sermon_description (→ post_content). The old auto-generated post_content blob
  * is discarded, EXCEPT when it holds substantive text not represented in the
  * description — that text is preserved as a backup and flagged, never dropped.
+ *
+ * post_content_temp has its OWN single canonical home: the writer copies it
+ * verbatim as its own meta row. It is therefore NEVER routed to the backup body
+ * here (that would be a second home + a double-flag). It is fed in only as an
+ * additional "already-represented" corpus, so that an $oldPostContent fragment
+ * whose substantive text is already captured by the temp row is recognised as
+ * preserved and is not redundantly backed up either.
  */
 final class PostContentReconciler {
     /**
      * @return array{content: string, backup: ?string, flag: bool}
      */
-    public static function reconcile( string $oldPostContent, ?string $description ): array {
+    public static function reconcile( string $oldPostContent, ?string $description, ?string $postContentTemp = null ): array {
         $content = $description ?? '';
 
-        $blob = trim( $oldPostContent );
+        // The corpus already preserved elsewhere: the canonical description body
+        // PLUS the post_content_temp row (its own canonical home). $oldPostContent
+        // is backed up only if it is substantive relative to BOTH.
+        $representedCorpus = (string) $description;
+        if ( $postContentTemp !== null && trim( $postContentTemp ) !== '' ) {
+            $representedCorpus .= "\n\n" . $postContentTemp;
+        }
+
+        // Only $oldPostContent can land in the backup. post_content_temp is never
+        // backed up (single canonical home = its own meta row → no double-flag).
+        $pieces = array();
+        if ( self::isUniqueSubstantive( $oldPostContent, $representedCorpus ) ) {
+            // A structural payload (iframe/audio/video/img/embed/object/shortcode)
+            // carries irreplaceable data that strip_tags() empties — so it must be
+            // kept REGARDLESS of visible text. Only the purely-textual branch keeps
+            // the visibleText !== '' suppression (a blank-after-strip text blob has
+            // nothing to preserve).
+            if ( self::hasStructuralPayload( $oldPostContent, $representedCorpus )
+                || self::visibleText( $oldPostContent ) !== '' ) {
+                $pieces[] = $oldPostContent;
+            }
+        }
+
+        // Build backup and flag.
+        $backup = count( $pieces ) > 0 ? implode( "\n\n", $pieces ) : null;
+        $flag = count( $pieces ) > 0;
+
+        return array( 'content' => $content, 'backup' => $backup, 'flag' => $flag );
+    }
+
+    /**
+     * True if the blob is unique and substantive relative to the description.
+     * A blob is substantive if it contains a shortcode/media-structural payload
+     * (which cannot be represented as plain text), or if its visible text is not
+     * entirely contained within the description's visible text.
+     */
+    private static function isUniqueSubstantive( string $blob, string $description ): bool {
+        $blob = trim( $blob );
         if ( '' === $blob ) {
-            return array( 'content' => $content, 'backup' => null, 'flag' => false );
+            return false;
         }
-
-        // If every non-trivial word of the blob already appears in the description's
-        // text, the blob is the degraded derivative — discard it.
-        if ( self::isContainedIn( $blob, (string) $description ) ) {
-            return array( 'content' => $content, 'backup' => null, 'flag' => false );
+        if ( self::hasStructuralPayload( $blob, $description ) ) {
+            return true;
         }
+        return ! str_contains( self::visibleText( $description ), self::visibleText( $blob ) );
+    }
 
-        // Unique substantive text — preserve verbatim and flag for human review.
-        return array( 'content' => $content, 'backup' => $oldPostContent, 'flag' => true );
+    /**
+     * True if the blob contains a shortcode token or media/structural HTML tags
+     * that represent data not present in plain description text.
+     */
+    private static function hasStructuralPayload( string $blob, string $description ): bool {
+        $hasShortcode = (bool) preg_match( '/\[[a-z][a-z0-9_\-]*[\s\]]/i', $blob );
+        $hasMediaHtml = (bool) preg_match( '/<(iframe|audio|video|img|script|embed|object)\b/i', $blob );
+        return $hasShortcode || $hasMediaHtml;
     }
 
     /** True if the blob's visible text is a substring of the description's visible text. */

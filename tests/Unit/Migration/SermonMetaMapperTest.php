@@ -71,4 +71,23 @@ final class SermonMetaMapperTest extends TestCase {
         $out = SermonMetaMapper::map( array( 'sermon_date' => array( '1612137600' ) ) );
         $this->assertNotContains( 'legacy_nonnumeric_date', $out['flags'] );
     }
+
+    public function test_flags_when_a_later_date_row_is_nonnumeric(): void {
+        // First row numeric, later row non-numeric: the flag must still fire (scan
+        // EVERY row, not just $values[0]), to agree with the per-row companion set.
+        $out = SermonMetaMapper::map( array(
+            'sermon_date' => array( '1612137600', '01/05/2021' ),
+        ) );
+        $this->assertContains( 'legacy_nonnumeric_date', $out['flags'] );
+    }
+
+    public function test_flag_not_duplicated_for_multiple_nonnumeric_rows(): void {
+        $out = SermonMetaMapper::map( array(
+            'sermon_date' => array( '01/05/2021', '03/14/2022' ),
+        ) );
+        $this->assertSame(
+            array( 'legacy_nonnumeric_date' ),
+            array_values( array_filter( $out['flags'], static fn ( $f ) => 'legacy_nonnumeric_date' === $f ) )
+        );
+    }
 }
