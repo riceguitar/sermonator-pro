@@ -93,6 +93,22 @@ final class PodcastWriter {
             return new WriteResult( 0, false, array( 'legacy_post_missing:' . $legacyId ) );
         }
 
+        // POST-LEVEL CRASH-ORPHAN RECOVERY (mirrors SermonWriter). The fresh insert
+        // below writes the LEGACY_POST_ID back-ref ATOMICALLY via meta_input, so
+        // the post-then-back-ref window is closed going forward. A podcast left
+        // back-ref-less by an OLDER writer is invisible to the authoritative
+        // back-ref probe above and would otherwise be DUPLICATED. Probe for our own
+        // back-ref-less orphan matching this legacy identity and ADOPT it (stamp the
+        // back-ref, re-enter the spine) rather than minting a second feed post.
+        $orphanId = $this->findBackRefLessPostByLegacyIdentity( $legacy );
+        if ( null !== $orphanId ) {
+            Crosswalk::markLegacy( $orphanId, $legacyId );
+            $flags = $this->applyPostInsertSpine( $orphanId, $legacyId, $this->readFlags( $orphanId ) );
+            $this->markCompleteUnlessTermCrosswalkOpen( $orphanId, $flags );
+
+            return new WriteResult( $orphanId, false, $flags, true );
+        }
+
         $postarr = array(
             'post_type'      => Identifiers::POST_TYPE_PODCAST,
             'post_title'     => $legacy->post_title,
@@ -107,6 +123,11 @@ final class PodcastWriter {
             'post_excerpt'   => $legacy->post_excerpt,
             'post_password'  => $legacy->post_password,
             'post_content'   => $legacy->post_content,
+            // ATOMIC back-ref: write LEGACY_POST_ID in the SAME insert call so post
+            // existence and the back-ref are one operation — a crash can no longer
+            // leave a back-ref-less, duplicate-prone orphan. markLegacy still runs
+            // in the spine (unique=true → no-op here, idempotent on resume).
+            'meta_input'     => array( Crosswalk::LEGACY_POST_ID => $legacyId ),
         );
 
         $newId = $this->insertKsesSafe( $postarr );
@@ -398,6 +419,42 @@ final class PodcastWriter {
                 return ! str_starts_with( (string) $flag, 'missing_podcast_term_crosswalk:' );
             }
         ) );
+    }
+
+    /**
+     * Find OUR post-level crash orphan: a sermonator_podcast post matching the
+     * legacy source's identity (GMT date + title) but carrying NO LEGACY_POST_ID
+     * back-ref — the signature of a post inserted under an older writer whose run
+     * died before the separate markLegacy stamp. post_name is excluded (WordPress
+     * may uniquify the slug). Reads $wpdb directly (cache-safe). Strict to avoid
+     * mis-adopting a distinct podcast; an adopt onto a byte-identical native post
+     * only stamps a back-ref (no content loss).
+     *
+     * @return int|null The orphan post id to adopt, or null if none.
+     */
+    private function findBackRefLessPostByLegacyIdentity( \WP_Post $legacy ): ?int {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT p.ID FROM {$wpdb->posts} p"
+                . " LEFT JOIN {$wpdb->postmeta} backref"
+                . "   ON backref.post_id = p.ID AND backref.meta_key = %s"
+                . " WHERE p.post_type = %s"
+                . "   AND p.post_date_gmt = %s"
+                . "   AND p.post_title = %s"
+                . "   AND backref.meta_id IS NULL"
+                . " ORDER BY p.ID ASC",
+                Crosswalk::LEGACY_POST_ID,
+                Identifiers::POST_TYPE_PODCAST,
+                $legacy->post_date_gmt,
+                $legacy->post_title
+            )
+        );
+
+        $ids = array_values( array_map( 'intval', (array) $ids ) );
+
+        return $ids === array() ? null : $ids[0];
     }
 
     /** Whether a migrated post has been marked complete. */

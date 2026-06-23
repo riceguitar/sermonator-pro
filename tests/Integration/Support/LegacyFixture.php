@@ -142,6 +142,59 @@ final class LegacyFixture {
         return $termId;
     }
 
+    /**
+     * Simulate the EARLIER crash window — between wp_insert_term and the
+     * LEGACY_SLUG ownership stamp. The orphan term carries the legacy NAME and
+     * legacy SLUG but NEITHER the LEGACY_SLUG marker NOR the LEGACY_TERM_ID
+     * back-ref. To the LEGACY_SLUG-joined adoption probe it is invisible, and in
+     * a non-hierarchical taxonomy a re-insert collides on NAME and throws — the
+     * crash-wedge this regression guards. A resumed run must still resolve this
+     * same-NAME back-ref-less term and ADOPT it rather than throw.
+     *
+     * @return int The orphan term id (carrying NO migration markers at all).
+     */
+    public function injectMarkerlessCrashOrphanTerm( string $targetTaxonomy, string $name, string $slug, string $description = '' ): int {
+        $result = wp_insert_term(
+            wp_slash( $name ),
+            $targetTaxonomy,
+            array( 'slug' => $slug, 'description' => wp_slash( $description ) )
+        );
+        if ( is_wp_error( $result ) ) {
+            throw new \RuntimeException( 'injectMarkerlessCrashOrphanTerm failed: ' . $result->get_error_message() );
+        }
+
+        // No LEGACY_SLUG, no back-ref — the term looks exactly like a bare insert
+        // whose run died before the ownership marker was stamped.
+        return (int) $result['term_id'];
+    }
+
+    /**
+     * Simulate the post-level crash window between wp_insert_post and the separate
+     * Crosswalk::markLegacy back-ref stamp (the OLD non-atomic writer order): a NEW
+     * post lands in the target post type carrying the legacy identity columns (GMT
+     * date + title + slug) but NO LEGACY_POST_ID back-ref. To the authoritative
+     * back-ref probe it is invisible, so a resumed run that does not reconcile would
+     * insert a SECOND visible post. A correct resume must ADOPT this orphan.
+     *
+     * @param array<string,mixed> $columns Override post columns (post_title, etc.).
+     * @return int The orphan post id (carrying NO back-ref).
+     */
+    public function injectBackRefLessPostOrphan( string $postType, array $columns = array() ): int {
+        kses_remove_filters();
+        try {
+            $id = (int) wp_insert_post( wp_slash( array_merge( array(
+                'post_type'   => $postType,
+                'post_status' => 'publish',
+            ), $columns ) ) );
+        } finally {
+            kses_init_filters();
+        }
+
+        // No LEGACY_POST_ID back-ref — exactly the state an abort between the
+        // insert and the (old) separate markLegacy stamp would leave behind.
+        return $id;
+    }
+
     public function createPodcast( string $title = 'Default' ): int {
         $id = (int) wp_insert_post( array(
             'post_type'   => LegacyIdentifiers::POST_TYPE_PODCAST,

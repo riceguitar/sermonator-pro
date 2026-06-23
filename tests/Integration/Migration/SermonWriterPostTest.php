@@ -327,6 +327,85 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertCount( 1, $all );
     }
 
+    public function test_back_ref_written_atomically_in_the_insert(): void {
+        // CRITICAL #4: the LEGACY_POST_ID back-ref must be written ATOMICALLY in
+        // the SAME insert call (meta_input), not as a separate later statement.
+        // The single canonical back-ref row is present on a freshly-created post.
+        $legacyId = $this->fixture->createSermon();
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+        $this->assertTrue( $result->created );
+
+        $backRefRows = get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, false );
+        $this->assertCount( 1, $backRefRows, 'Exactly one back-ref row (atomic insert + idempotent markLegacy).' );
+        $this->assertSame( (string) $legacyId, (string) $backRefRows[0] );
+    }
+
+    public function test_crash_orphan_back_ref_less_post_is_adopted_not_duplicated(): void {
+        // CRITICAL #4: the duplicate-post crash window. An OLDER writer inserted the
+        // post but the process aborted BEFORE the separate markLegacy stamp, leaving
+        // a back-ref-less orphan. The authoritative back-ref probe can't see it, so
+        // a naive resume would mint a SECOND visible sermon (invisible to the >1
+        // guard, the Verifier, and Rollback — all of which enumerate by back-ref).
+        // The writer must ADOPT the orphan (stamp the back-ref, drive the spine
+        // forward) and yield EXACTLY ONE post.
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'Crash Window Sermon',
+            'post_status'  => 'publish',
+            'post_date'     => '2021-03-07 10:00:00',
+            'post_date_gmt' => '2021-03-07 10:00:00',
+            'post_content' => 'Auto blob',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '<p>The real body.</p>' );
+
+        // Inject the back-ref-less orphan exactly as the old insert-then-crash left
+        // it: the legacy identity columns, NO LEGACY_POST_ID back-ref.
+        $orphanId = $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_SERMON,
+            array(
+                'post_title'    => 'Crash Window Sermon',
+                'post_date'     => '2021-03-07 10:00:00',
+                'post_date_gmt' => '2021-03-07 10:00:00',
+                'post_content'  => '<p>The real body.</p>',
+            )
+        );
+        $this->assertSame( '', (string) get_post_meta( $orphanId, Crosswalk::LEGACY_POST_ID, true ), 'precondition: orphan is back-ref-less' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        // ADOPTED: the writer resolved the orphan, did NOT create a fresh post.
+        $this->assertFalse( $result->created, 'A back-ref-less orphan must be adopted, not re-created.' );
+        $this->assertSame( $orphanId, $result->newId, 'The orphan id must be the migration target.' );
+
+        // Exactly ONE migrated sermon — no duplicate.
+        $migrated = get_posts( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+            'meta_key'    => Crosswalk::LEGACY_POST_ID,
+        ) );
+        $this->assertCount( 1, $migrated, 'Adoption must not leave a second back-ref-less duplicate.' );
+        $this->assertSame( array( $orphanId ), array_map( 'intval', $migrated ) );
+
+        // The orphan now carries the back-ref and resolves authoritatively.
+        $this->assertSame( (string) $legacyId, (string) get_post_meta( $orphanId, Crosswalk::LEGACY_POST_ID, true ) );
+        $this->assertSame( $orphanId, Crosswalk::findNewByLegacyId( $legacyId, Identifiers::POST_TYPE_SERMON ) );
+
+        // Idempotent: a re-run resolves the same post, still exactly one.
+        $second = ( new SermonWriter() )->write( $legacyId );
+        $this->assertFalse( $second->created );
+        $this->assertSame( $orphanId, $second->newId );
+        $this->assertCount( 1, get_posts( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+            'meta_key'    => Crosswalk::LEGACY_POST_ID,
+        ) ) );
+    }
+
     public function test_slug_uniquified_records_flag_and_legacy_slug(): void {
         // Occupy the slug with a pre-existing sermonator_sermon so WP must
         // uniquify the migrated post's slug.

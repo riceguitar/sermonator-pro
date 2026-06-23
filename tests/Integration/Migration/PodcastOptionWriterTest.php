@@ -314,6 +314,79 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         $this->assertSame( $settings, get_post_meta( $first->newId, Identifiers::META_PODCAST_SETTINGS, true ) );
     }
 
+    public function test_podcast_back_ref_written_atomically_in_the_insert(): void {
+        // CRITICAL #4: the LEGACY_POST_ID back-ref must be written ATOMICALLY in the
+        // SAME insert call (meta_input). A single canonical back-ref row is present
+        // on a freshly-created podcast.
+        $legacyId = $this->fixture->createPodcastWithSettings( array( 'itunes_author' => 'Church' ) );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+        $this->assertTrue( $result->created );
+
+        $backRefRows = get_post_meta( $result->newId, Crosswalk::LEGACY_POST_ID, false );
+        $this->assertCount( 1, $backRefRows, 'Exactly one back-ref row (atomic insert + idempotent markLegacy).' );
+        $this->assertSame( (string) $legacyId, (string) $backRefRows[0] );
+    }
+
+    public function test_podcast_crash_orphan_back_ref_less_post_is_adopted_not_duplicated(): void {
+        // CRITICAL #4: duplicate-post crash window for podcasts. An OLDER writer
+        // inserted the podcast but aborted BEFORE the separate markLegacy stamp,
+        // leaving a back-ref-less orphan invisible to the authoritative probe. A
+        // naive resume would mint a SECOND visible feed. The writer must ADOPT the
+        // orphan and yield exactly one post.
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'     => LegacyIdentifiers::POST_TYPE_PODCAST,
+            'post_title'    => 'Crash Window Feed',
+            'post_status'   => 'publish',
+            'post_date'     => '2021-04-09 08:00:00',
+            'post_date_gmt' => '2021-04-09 08:00:00',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Church' ) );
+
+        $orphanId = $this->fixture->injectBackRefLessPostOrphan(
+            Identifiers::POST_TYPE_PODCAST,
+            array(
+                'post_title'    => 'Crash Window Feed',
+                'post_date'     => '2021-04-09 08:00:00',
+                'post_date_gmt' => '2021-04-09 08:00:00',
+            )
+        );
+        $this->assertSame( '', (string) get_post_meta( $orphanId, Crosswalk::LEGACY_POST_ID, true ), 'precondition: orphan is back-ref-less' );
+
+        $result = ( new PodcastWriter() )->write( $legacyId );
+
+        $this->assertFalse( $result->created, 'A back-ref-less orphan must be adopted, not re-created.' );
+        $this->assertSame( $orphanId, $result->newId );
+
+        $migrated = get_posts( array(
+            'post_type'   => Identifiers::POST_TYPE_PODCAST,
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+            'meta_key'    => Crosswalk::LEGACY_POST_ID,
+        ) );
+        $this->assertCount( 1, $migrated, 'Adoption must not leave a second back-ref-less duplicate.' );
+        $this->assertSame( array( $orphanId ), array_map( 'intval', $migrated ) );
+
+        $this->assertSame( (string) $legacyId, (string) get_post_meta( $orphanId, Crosswalk::LEGACY_POST_ID, true ) );
+        $this->assertSame( $orphanId, Crosswalk::findNewByLegacyId( $legacyId, Identifiers::POST_TYPE_PODCAST ) );
+
+        // Settings were applied during the adoption-driven spine.
+        $this->assertSame( array( 'itunes_author' => 'Church' ), get_post_meta( $orphanId, Identifiers::META_PODCAST_SETTINGS, true ) );
+
+        // Idempotent re-run: same post, still one.
+        $second = ( new PodcastWriter() )->write( $legacyId );
+        $this->assertFalse( $second->created );
+        $this->assertSame( $orphanId, $second->newId );
+        $this->assertCount( 1, get_posts( array(
+            'post_type'   => Identifiers::POST_TYPE_PODCAST,
+            'post_status' => 'any',
+            'fields'      => 'ids',
+            'numberposts' => -1,
+            'meta_key'    => Crosswalk::LEGACY_POST_ID,
+        ) ) );
+    }
+
     public function test_partial_podcast_resumes_not_reinserts(): void {
         $legacyId = $this->fixture->createPodcast( 'Resumable' );
         $writer   = new PodcastWriter();

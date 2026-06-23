@@ -37,6 +37,19 @@ use WP_Term;
  *   collision and minting a duplicate '-legacy-{id}' term with a FALSE
  *   slug_collision flag. This crash-orphan probe runs BEFORE the native-collision
  *   probe and again in the residual term_exists fallback.
+ * - DO adopt OUR EARLIER-WINDOW crash orphan too (CRITICAL #3). A term that died
+ *   in the window between wp_insert_term and the LEGACY_SLUG stamp carries the
+ *   legacy NAME and legacy SLUG but NO markers at all, so the LEGACY_SLUG-joined
+ *   probe above cannot see it. In a non-hierarchical taxonomy a blind re-insert
+ *   collides on NAME and either THROWS (wedging the whole migration — terms run
+ *   first) or mints a duplicate '-legacy-{id}' term with a false slug_collision
+ *   flag. So before the native-collision decision we probe for a back-ref-less
+ *   term matching BOTH the legacy NAME AND the legacy SLUG and ADOPT it (stamp the
+ *   back-ref + LEGACY_SLUG, never editing the term) — exactly one term, no false
+ *   flag. The match is narrowed to NAME-AND-SLUG (not name alone) so a church's
+ *   NATIVE term that shares only the SLUG (a DIFFERENT name) is still protected by
+ *   the deterministic-suffix branch and never adopted. A residual no-throw guard
+ *   in the term_exists fallback covers WP builds that raise on a NAME-only match.
  * - Write ordering (crash-safety): LEGACY_SLUG ownership marker FIRST, then the
  *   back-refs (term_id + tt_id), then flags (COMPLETE-LAST) — all only after a
  *   confirmed, non-error insert (never before the is_wp_error guard).
@@ -87,6 +100,27 @@ final class TermWriter {
             return $this->adoptTerm( $orphanTermId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $flags );
         }
 
+        // CRASH-WEDGE RECOVERY — the EARLIER window (CRITICAL #3). The marker probe
+        // above sees only orphans that reached the LEGACY_SLUG stamp. A term that
+        // died in the window between wp_insert_term and that stamp carries the
+        // legacy NAME and legacy SLUG but NO markers at all, so it is invisible to
+        // the marker-joined probe. In a non-hierarchical taxonomy wp_insert_term
+        // raises term_exists on a NAME match, so a blind re-insert would collide on
+        // NAME and THROW — permanently wedging the whole migration (terms run first
+        // in the orchestrator). A duplicate '-legacy-{id}' term with a FALSE
+        // slug_collision flag is the other failure mode. So BEFORE the native-
+        // collision decision we look for a back-ref-less term matching BOTH the
+        // legacy NAME AND the legacy SLUG and ADOPT it (stamp the back-ref +
+        // LEGACY_SLUG onto it, never editing the term) — yielding exactly one term
+        // and no spurious slug_collision flag (finding #3/#11). The match is
+        // narrowed to NAME-AND-SLUG so a church's NATIVE term that shares only the
+        // SLUG (a DIFFERENT name) is still protected by the deterministic-suffix
+        // branch below and never adopted.
+        $sameNameSlugOrphanId = $this->findBackRefLessTermByNameAndSlug( $name, $legacySlug, $targetTaxonomy );
+        if ( $sameNameSlugOrphanId !== null ) {
+            return $this->adoptTerm( $sameNameSlugOrphanId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $flags );
+        }
+
         // Detect a NATIVE-term slug collision BEFORE the first insert. The
         // back-ref probe above already returned null, and the crash-orphan probe
         // found no back-ref-less term of ours, so any term already occupying this
@@ -133,6 +167,31 @@ final class TermWriter {
             $orphanTermId = $this->findBackRefLessTermBySlug( $legacySlug, $targetTaxonomy );
             if ( $orphanTermId !== null ) {
                 return $this->adoptTerm( $orphanTermId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $flags );
+            }
+
+            // Residual no-throw guard (CRITICAL #3, defence-in-depth). The up-front
+            // NAME+SLUG orphan probe already adopts a marker-less crash orphan at its
+            // original slug, so this branch is unreachable for that case in current
+            // WordPress. But on a WP build that raises term_exists on a NAME-only
+            // match (no slug match) the deterministic re-insert below could THROW and
+            // wedge the migration. Rather than throw, adopt the colliding back-ref-
+            // less SAME-NAME term as a last resort (stamp the back-ref, never edit
+            // the term). Only fires when no distinct term could be created — strictly
+            // better than a permanent wedge. No spurious slug_collision when the
+            // orphan already sits at the legacy slug.
+            $sameNameOrphanId = $this->findBackRefLessTermByName( $name, $targetTaxonomy );
+            if ( $sameNameOrphanId !== null ) {
+                $orphanSlug    = (string) get_term( $sameNameOrphanId, $targetTaxonomy )->slug;
+                $adoptionFlags = $flags;
+                if ( $orphanSlug === $legacySlug ) {
+                    $adoptionFlags = array_values( array_filter(
+                        $adoptionFlags,
+                        static function ( $flag ): bool {
+                            return $flag !== 'slug_collision';
+                        }
+                    ) );
+                }
+                return $this->adoptTerm( $sameNameOrphanId, $legacyTermId, (int) $legacyTerm->term_taxonomy_id, $legacySlug, $adoptionFlags );
             }
 
             $deterministicSlug = $legacySlug . '-legacy-' . $legacyTermId;
@@ -339,6 +398,77 @@ final class TermWriter {
                 $legacySlug,
                 Crosswalk::LEGACY_TERM_ID,
                 $legacySlug,
+                $targetTaxonomy
+            )
+        );
+
+        $ids = array_values( array_map( 'intval', (array) $ids ) );
+
+        return $ids === array() ? null : $ids[0];
+    }
+
+    /**
+     * Find a back-ref-less term in the target taxonomy matching BOTH the legacy
+     * NAME AND the legacy SLUG — the marker-less crash orphan (CRITICAL #3): a term
+     * that died in the window between wp_insert_term and the LEGACY_SLUG ownership
+     * stamp, so it carries the legacy name + slug but NO markers and is invisible to
+     * the slug-marker-joined orphan probe. Matching on NAME-AND-SLUG (not name
+     * alone) keeps a church's NATIVE term that shares only the slug (DIFFERENT name)
+     * safe — that case still routes to the deterministic-suffix collision branch and
+     * is never adopted. A term carrying the back-ref is excluded (already migrated).
+     * Reads $wpdb directly (cache-safe) so a term inserted moments earlier on this
+     * same run is visible.
+     *
+     * @return int|null The orphan term id to adopt, or null if none.
+     */
+    private function findBackRefLessTermByNameAndSlug( string $name, string $legacySlug, string $targetTaxonomy ): ?int {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT t.term_id FROM {$wpdb->terms} t"
+                . " INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id"
+                . " LEFT JOIN {$wpdb->termmeta} backref"
+                . "   ON backref.term_id = t.term_id AND backref.meta_key = %s"
+                . " WHERE t.name = %s AND t.slug = %s AND tt.taxonomy = %s AND backref.meta_id IS NULL"
+                . " ORDER BY t.term_id ASC",
+                Crosswalk::LEGACY_TERM_ID,
+                $name,
+                $legacySlug,
+                $targetTaxonomy
+            )
+        );
+
+        $ids = array_values( array_map( 'intval', (array) $ids ) );
+
+        return $ids === array() ? null : $ids[0];
+    }
+
+    /**
+     * Find a back-ref-less term in the target taxonomy by NAME alone — the residual
+     * no-throw guard for the EARLIER crash window on a WordPress build that raises
+     * term_exists on a NAME-only match. A term carrying the LEGACY_TERM_ID back-ref
+     * is excluded (already migrated). The top-of-method back-ref probe already
+     * guarantees the legacy term is not yet crosswalked, so a back-ref-less same-
+     * NAME term here is either our crash orphan or — at worst — a native same-name
+     * term we adopt by stamping a back-ref only (never editing it), strictly better
+     * than wedging the migration. Reads $wpdb directly (cache-safe).
+     *
+     * @return int|null The term id to adopt, or null if none.
+     */
+    private function findBackRefLessTermByName( string $name, string $targetTaxonomy ): ?int {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT t.term_id FROM {$wpdb->terms} t"
+                . " INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id"
+                . " LEFT JOIN {$wpdb->termmeta} backref"
+                . "   ON backref.term_id = t.term_id AND backref.meta_key = %s"
+                . " WHERE t.name = %s AND tt.taxonomy = %s AND backref.meta_id IS NULL"
+                . " ORDER BY t.term_id ASC",
+                Crosswalk::LEGACY_TERM_ID,
+                $name,
                 $targetTaxonomy
             )
         );

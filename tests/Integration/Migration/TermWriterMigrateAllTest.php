@@ -173,6 +173,37 @@ final class TermWriterMigrateAllTest extends WP_UnitTestCase {
         $this->assertNotContains( 'slug_collision', $result['flags'] );
     }
 
+    public function test_migrateall_resumes_over_markerless_crash_orphan_no_throw_single_term(): void {
+        // The EARLIER crash window leaves a term with the legacy NAME + SLUG but
+        // NO LEGACY_SLUG marker and NO back-ref. In a non-hierarchical taxonomy a
+        // bare re-insert collides on NAME and throws term_exists — permanently
+        // wedging migrateAll (terms run first in the orchestrator). The residual
+        // term_exists branch must resolve and ADOPT the same-NAME back-ref-less
+        // orphan so the run resumes without throwing and produces exactly one term.
+        $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Justification' );
+        $legacy   = get_term( $legacyId, LegacyIdentifiers::TAX_TOPIC );
+
+        $orphanId = $this->fixture->injectMarkerlessCrashOrphanTerm(
+            Identifiers::TAX_TOPIC,
+            'Justification',
+            $legacy->slug
+        );
+        // Invisible to the marker-joined probe: NO LEGACY_SLUG, NO back-ref.
+        $this->assertSame( '', (string) get_term_meta( $orphanId, Crosswalk::LEGACY_SLUG, true ) );
+        $this->assertSame( '', (string) get_term_meta( $orphanId, Crosswalk::LEGACY_TERM_ID, true ) );
+
+        $countBefore = $this->legacyTermCount( Identifiers::TAX_TOPIC );
+
+        // Must NOT throw the wedge RuntimeException.
+        $result = ( new TermWriter() )->migrateAll();
+
+        // Adopted: the legacy term maps to the orphan, exactly one target term.
+        $this->assertSame( $orphanId, Crosswalk::findNewTermByLegacyId( $legacyId, Identifiers::TAX_TOPIC ) );
+        $this->assertSame( $countBefore, $this->legacyTermCount( Identifiers::TAX_TOPIC ), 'migrateAll duplicated the marker-less crash orphan.' );
+        $this->assertCount( 1, get_term_meta( $orphanId, Crosswalk::LEGACY_TERM_ID, false ) );
+        $this->assertNotContains( 'slug_collision', $result['flags'] );
+    }
+
     public function test_migrateall_uniqueness_guard_counts_backref_less_same_slug_duplicate(): void {
         // The corrupt state: the legacy term is ALREADY crosswalked (a back-ref'd
         // target term exists) AND a second back-ref-less same-slug term lingers

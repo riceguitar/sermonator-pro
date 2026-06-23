@@ -122,42 +122,57 @@ final class TermWriterMigrateTermTest extends WP_UnitTestCase {
         $this->assertCount( 1, get_term_meta( $second, Crosswalk::LEGACY_SLUG, false ) );
     }
 
-    public function test_collision_with_native_term_creates_new_deterministic_term_and_never_adopts(): void {
-        // A church's NATIVE term with the same name+slug already in the target taxonomy.
+    public function test_backref_less_same_name_same_slug_term_is_adopted_not_duplicated(): void {
+        // CRITICAL #3 precedence: a back-ref-less term matching the legacy NAME AND
+        // SLUG is byte-indistinguishable from the writer's own marker-less crash
+        // orphan (a term inserted by an earlier run that died before the LEGACY_SLUG
+        // ownership stamp). Per finding #3/#11 the writer ADOPTS it (stamping the
+        // back-ref + LEGACY_SLUG, never editing the term) rather than minting a
+        // visitor-visible duplicate '-legacy-{id}' term — yielding EXACTLY ONE term.
+        // A native term that shares only the SLUG (DIFFERENT name) is still
+        // protected (see the same-slug/different-name test below).
         $native = wp_insert_term( 'Faith', Identifiers::TAX_TOPIC );
         $this->assertIsArray( $native );
-        $nativeTermId = (int) $native['term_id'];
-        $nativeSnapshot = $this->snapshotTerm( $nativeTermId, Identifiers::TAX_TOPIC );
-        $nativeMetaBefore = get_term_meta( $nativeTermId );
+        $existingTermId = (int) $native['term_id'];
 
         // Legacy term with the same name/slug.
         $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Faith' );
         $legacy   = $this->legacyTerm( LegacyIdentifiers::TAX_TOPIC, $legacyId );
         $this->assertSame( 'faith', $legacy->slug );
 
+        $countBefore = (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) );
+
         $writer = new TermWriter();
         $newId  = $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy );
 
-        // A NEW distinct term — not the native one.
-        $this->assertNotSame( $nativeTermId, $newId );
+        // ADOPTED: the returned id IS the existing back-ref-less term — exactly one.
+        $this->assertSame( $existingTermId, $newId, 'A back-ref-less same-name+same-slug term must be adopted, not duplicated.' );
+        $this->assertSame(
+            $countBefore,
+            (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) ),
+            'Adoption must not create an extra term.'
+        );
+
         $new = get_term( $newId, Identifiers::TAX_TOPIC );
-        $this->assertInstanceOf( WP_Term::class, $new );
         $this->assertSame( 'Faith', $new->name );
-        // Deterministic suffix slug.
-        $this->assertSame( 'faith-legacy-' . $legacy->term_id, $new->slug );
+        // Slug stays the ORIGINAL legacy slug — NOT a '-legacy-{id}' suffix.
+        $this->assertSame( 'faith', $new->slug );
 
-        // slug_collision flag recorded on the new term.
-        $flags = get_term_meta( $newId, Crosswalk::MIGRATION_FLAGS, false );
-        $this->assertContains( 'slug_collision', $this->flattenFlags( $flags ) );
+        // NO spurious slug_collision flag — adopted at its original slug.
+        $this->assertNotContains( 'slug_collision', $this->flattenFlags( get_term_meta( $newId, Crosswalk::MIGRATION_FLAGS, false ) ) );
 
-        // LEGACY_SLUG records the ORIGINAL legacy slug (not the suffixed one).
+        // Back-ref + tt_id + ORIGINAL legacy slug stamped on the adopted term.
+        $this->assertSame( (string) $legacyId, (string) get_term_meta( $newId, Crosswalk::LEGACY_TERM_ID, true ) );
+        $this->assertSame( (string) $legacy->term_taxonomy_id, (string) get_term_meta( $newId, Crosswalk::LEGACY_TERM_TT_ID, true ) );
         $this->assertSame( 'faith', get_term_meta( $newId, Crosswalk::LEGACY_SLUG, true ) );
 
-        // The NATIVE term is byte-for-byte untouched, and carries NO back-ref.
-        $this->assertSame( $nativeSnapshot, $this->snapshotTerm( $nativeTermId, Identifiers::TAX_TOPIC ) );
-        $this->assertSame( $nativeMetaBefore, get_term_meta( $nativeTermId ) );
-        $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_TERM_ID, true ) );
-        $this->assertSame( '', (string) get_term_meta( $nativeTermId, Crosswalk::LEGACY_SLUG, true ) );
+        // Resolves authoritatively and is idempotent.
+        $this->assertSame( $newId, Crosswalk::findNewTermByLegacyId( $legacyId, Identifiers::TAX_TOPIC ) );
+        $this->assertSame( $newId, $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy ) );
+        $this->assertSame(
+            $countBefore,
+            (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) )
+        );
     }
 
     public function test_collision_with_native_term_same_slug_different_name_is_deterministic_and_flagged(): void {
@@ -214,9 +229,14 @@ final class TermWriterMigrateTermTest extends WP_UnitTestCase {
     }
 
     public function test_rerun_after_collision_recomputes_same_deterministic_slug_no_duplicate(): void {
-        wp_insert_term( 'Hope', Identifiers::TAX_TOPIC ); // native collision target.
+        // A NATIVE term sharing only the SLUG (DIFFERENT name) — the realistic
+        // church-collision case that must NEVER be adopted and routes to the
+        // deterministic-suffix branch. (A same-name+same-slug term is instead
+        // adopted; see test_backref_less_same_name_same_slug_term_is_adopted...)
+        wp_insert_term( 'Expectation', Identifiers::TAX_TOPIC, array( 'slug' => 'hope' ) );
         $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Hope' );
         $legacy   = $this->legacyTerm( LegacyIdentifiers::TAX_TOPIC, $legacyId );
+        $this->assertSame( 'hope', $legacy->slug );
 
         $writer = new TermWriter();
         $first  = $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy );
@@ -328,6 +348,66 @@ final class TermWriterMigrateTermTest extends WP_UnitTestCase {
         $this->assertNotContains( 'slug_collision', $this->flattenFlags( get_term_meta( $orphanId, Crosswalk::MIGRATION_FLAGS, false ) ) );
         // Slug is the ORIGINAL legacy slug, NOT a '-legacy-{id}' suffix.
         $this->assertSame( 'redemption', get_term( $orphanId, Identifiers::TAX_TOPIC )->slug );
+
+        // Resolves authoritatively and is idempotent on re-run.
+        $this->assertSame( $orphanId, Crosswalk::findNewTermByLegacyId( $legacyId, Identifiers::TAX_TOPIC ) );
+        $second = $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy );
+        $this->assertSame( $orphanId, $second );
+        $this->assertSame(
+            $countBefore,
+            (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) )
+        );
+        $this->assertCount( 1, get_term_meta( $orphanId, Crosswalk::LEGACY_TERM_ID, false ) );
+        $this->assertCount( 1, get_term_meta( $orphanId, Crosswalk::LEGACY_SLUG, false ) );
+    }
+
+    public function test_markerless_crash_orphan_same_name_is_adopted_not_wedged(): void {
+        // The EARLIER crash window — between wp_insert_term and the LEGACY_SLUG
+        // ownership stamp — leaves a term carrying the legacy NAME + SLUG but NO
+        // LEGACY_SLUG marker and NO back-ref. The LEGACY_SLUG-joined adoption
+        // probe cannot see it, and (non-hierarchical) a re-insert collides on
+        // NAME and throws term_exists, permanently wedging the migration. The
+        // residual term_exists branch must resolve this same-NAME back-ref-less
+        // term and ADOPT it rather than throw — and must NOT stamp a spurious
+        // slug_collision flag when adopting a same-name orphan at its own slug.
+        $legacyId = $this->fixture->createTerm( LegacyIdentifiers::TAX_TOPIC, 'Sanctification' );
+        $legacy   = $this->legacyTerm( LegacyIdentifiers::TAX_TOPIC, $legacyId );
+        $this->assertSame( 'sanctification', $legacy->slug );
+
+        $orphanId = $this->fixture->injectMarkerlessCrashOrphanTerm(
+            Identifiers::TAX_TOPIC,
+            'Sanctification',
+            'sanctification'
+        );
+        // Precondition: orphan exists, has the legacy slug, NO LEGACY_SLUG marker,
+        // NO back-ref — invisible to the marker-joined adoption probe.
+        $this->assertSame( 'sanctification', get_term( $orphanId, Identifiers::TAX_TOPIC )->slug );
+        $this->assertSame( '', (string) get_term_meta( $orphanId, Crosswalk::LEGACY_SLUG, true ) );
+        $this->assertSame( '', (string) get_term_meta( $orphanId, Crosswalk::LEGACY_TERM_ID, true ) );
+
+        $countBefore = (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) );
+
+        $writer = new TermWriter();
+        // Must NOT throw a RuntimeException (the wedge).
+        $newId  = $writer->migrateTerm( LegacyIdentifiers::TAX_TOPIC, $legacy );
+
+        // ADOPTED: the returned id IS the orphan — exactly one term, no duplicate.
+        $this->assertSame( $orphanId, $newId, 'Marker-less crash orphan was not adopted — duplicate or wedge.' );
+        $this->assertSame(
+            $countBefore,
+            (int) wp_count_terms( array( 'taxonomy' => Identifiers::TAX_TOPIC, 'hide_empty' => false ) ),
+            'Adoption must not create an extra term.'
+        );
+
+        // The orphan now carries the back-ref, tt_id, and the ORIGINAL legacy slug.
+        $this->assertSame( (string) $legacyId, (string) get_term_meta( $orphanId, Crosswalk::LEGACY_TERM_ID, true ) );
+        $this->assertSame( (string) $legacy->term_taxonomy_id, (string) get_term_meta( $orphanId, Crosswalk::LEGACY_TERM_TT_ID, true ) );
+        $this->assertSame( 'sanctification', get_term_meta( $orphanId, Crosswalk::LEGACY_SLUG, true ) );
+
+        // NO spurious slug_collision flag — it is OUR orphan at its original slug.
+        $this->assertNotContains( 'slug_collision', $this->flattenFlags( get_term_meta( $orphanId, Crosswalk::MIGRATION_FLAGS, false ) ) );
+        // Slug stays the ORIGINAL legacy slug, NOT a '-legacy-{id}' suffix.
+        $this->assertSame( 'sanctification', get_term( $orphanId, Identifiers::TAX_TOPIC )->slug );
 
         // Resolves authoritatively and is idempotent on re-run.
         $this->assertSame( $orphanId, Crosswalk::findNewTermByLegacyId( $legacyId, Identifiers::TAX_TOPIC ) );

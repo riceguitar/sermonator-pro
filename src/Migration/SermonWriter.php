@@ -121,6 +121,25 @@ final class SermonWriter {
             return new WriteResult( 0, false, array( 'legacy_post_missing:' . $legacyId ) );
         }
 
+        // POST-LEVEL CRASH-ORPHAN RECOVERY. The fresh insert below writes the
+        // LEGACY_POST_ID back-ref ATOMICALLY via meta_input, so the post-then-
+        // back-ref window is closed going forward. But a post left back-ref-less by
+        // an OLDER writer (insert succeeded, the process died before the separate
+        // markLegacy) is invisible to the authoritative back-ref probe above and
+        // would otherwise be DUPLICATED by the fresh insert — a visitor-visible,
+        // rollback-invisible orphan. Before inserting, probe for our own back-ref-
+        // less orphan matching this legacy identity and ADOPT it: stamp the back-ref
+        // and re-enter the spine on it rather than minting a second post.
+        $orphanId = $this->findBackRefLessPostByLegacyIdentity( $legacy );
+        if ( null !== $orphanId ) {
+            Crosswalk::markLegacy( $orphanId, $legacyId );
+            $reconciledForOrphan = $this->reconcileBody( $legacyId, $legacy );
+            $flags = $this->applyPostInsertSpine( $orphanId, $legacyId, $legacy, $reconciledForOrphan, array(), false );
+            $this->markCompleteUnlessCommentFailureOpen( $orphanId, $flags );
+
+            return new WriteResult( $orphanId, false, $flags, true );
+        }
+
         $flags = array();
 
         // Body reconciliation from (post_content, sermon_description, post_content_temp).
@@ -155,6 +174,12 @@ final class SermonWriter {
             'post_password'  => $legacy->post_password,
             'post_parent'    => $newParent,
             'post_content'   => $reconciled['content'],
+            // ATOMIC back-ref: write the LEGACY_POST_ID in the SAME insert call so
+            // post existence and the back-ref are one operation. A crash can no
+            // longer leave a back-ref-less, duplicate-prone orphan (the
+            // insert-then-markLegacy window is gone). markLegacy still runs in the
+            // spine below (unique=true → a no-op here, idempotent on resume).
+            'meta_input'     => array( Crosswalk::LEGACY_POST_ID => $legacyId ),
         );
 
         $newId = $this->insertKsesSafe( $postarr );
@@ -974,6 +999,47 @@ final class SermonWriter {
         }
 
         return (int) $newId;
+    }
+
+    /**
+     * Find OUR post-level crash orphan: a sermonator_sermon post that matches the
+     * legacy source's identity (same GMT date + title) but carries NO
+     * LEGACY_POST_ID back-ref. That signature can only arise from a post WE
+     * inserted under an older writer (insert succeeded, the run died before the
+     * separate markLegacy stamp) — a native admin-authored post is matched only if
+     * it byte-coincides on BOTH identity columns AND lacks the back-ref, which is
+     * vanishingly unlikely and, if it occurred, the adopt simply stamps a back-ref
+     * onto an otherwise-identical post (no content loss). post_name is deliberately
+     * NOT part of the match: WordPress may uniquify the inserted slug, so the
+     * orphan's post_name can diverge from the legacy slug. Reads $wpdb directly
+     * (cache-safe) and is strict (GMT date + title) to avoid mis-adopting a
+     * distinct post.
+     *
+     * @return int|null The orphan post id to adopt, or null if none.
+     */
+    private function findBackRefLessPostByLegacyIdentity( \WP_Post $legacy ): ?int {
+        global $wpdb;
+
+        $ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT p.ID FROM {$wpdb->posts} p"
+                . " LEFT JOIN {$wpdb->postmeta} backref"
+                . "   ON backref.post_id = p.ID AND backref.meta_key = %s"
+                . " WHERE p.post_type = %s"
+                . "   AND p.post_date_gmt = %s"
+                . "   AND p.post_title = %s"
+                . "   AND backref.meta_id IS NULL"
+                . " ORDER BY p.ID ASC",
+                Crosswalk::LEGACY_POST_ID,
+                Identifiers::POST_TYPE_SERMON,
+                $legacy->post_date_gmt,
+                $legacy->post_title
+            )
+        );
+
+        $ids = array_values( array_map( 'intval', (array) $ids ) );
+
+        return $ids === array() ? null : $ids[0];
     }
 
     /** Whether a migrated post has been marked complete. */
