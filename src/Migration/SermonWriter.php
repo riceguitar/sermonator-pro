@@ -79,7 +79,7 @@ final class SermonWriter {
                 // Term repair (self-heal) runs ONLY when there is actually an OPEN
                 // term flag to clear (missing_term_crosswalk:* / term_assign_error:*),
                 // and even then ONLY for the taxonomies that carry that open flag
-                // (see repairTermsOnExisting). A record migrated while a term
+                // (openFlagTargetTaxonomies). A record migrated while a term
                 // crosswalk was missing picks the now-available term up here; but a
                 // completed record with NO open term flag must NOT be touched — a
                 // full wp_set_object_terms REPLACE on every re-run would silently
@@ -89,9 +89,33 @@ final class SermonWriter {
                 // so an admin term added to an unflagged taxonomy survives the heal.
                 // Seed from the persisted flags so no unrelated flag is lost.
                 $persisted = $this->readFlags( $existing );
-                if ( $this->hasOpenTermFlag( $persisted ) ) {
-                    $flags = $this->repairTermsOnExisting( $existing, $legacyId, $persisted );
-                    return new WriteResult( $existing, false, $flags, false );
+
+                $flags    = $persisted;
+                $touched  = false;
+
+                // post_parent self-heal (IMPORTANT #5): a record completed while its
+                // legacy parent was not yet migrated keeps post_parent=0 and an open
+                // post_parent_unresolved flag. Re-translate here so the now-migrated
+                // parent is applied and the flag clears — symmetric with the term
+                // self-heal — instead of leaving the record never-clean forever. Only
+                // runs when the open flag is actually present (no needless update).
+                if ( $this->hasOpenPostParentFlag( $flags ) ) {
+                    $flags   = $this->reconcilePostParent( $existing, $legacyForResume, $flags );
+                    $touched = true;
+                }
+
+                // Term repair (self-heal) runs ONLY when there is actually an OPEN
+                // term flag, scoped via openFlagTargetTaxonomies() to the flagged
+                // taxonomies so an admin-curated unflagged taxonomy is never clobbered
+                // by a full-set REPLACE.
+                if ( $this->hasOpenTermFlag( $flags ) ) {
+                    $flags   = $this->applyTerms( $existing, $legacyId, $flags, $this->openFlagTargetTaxonomies( $flags, $legacyId ) );
+                    $touched = true;
+                }
+
+                if ( $touched ) {
+                    $this->writeFlags( $existing, $flags );
+                    return new WriteResult( $existing, false, array_values( array_unique( $flags ) ), false );
                 }
                 return new WriteResult( $existing, false, $persisted, false );
             }
@@ -145,17 +169,17 @@ final class SermonWriter {
         // Body reconciliation from (post_content, sermon_description, post_content_temp).
         $reconciled = $this->reconcileBody( $legacyId, $legacy );
 
-        // post_parent translation: a non-zero legacy parent is translated through
-        // the crosswalk; an untranslatable parent collapses to 0 + a flag (never a
-        // dangling legacy id).
+        // post_parent translation for the initial insert: a non-zero legacy parent
+        // is translated through the crosswalk; an untranslatable parent collapses to
+        // 0 (never a dangling legacy id). The post_parent_unresolved FLAG and any
+        // later self-heal are owned by reconcilePostParent() inside the spine (which
+        // runs on both fresh and resume), so the flag is derived in exactly one place.
         $newParent = 0;
         $legacyParent = (int) $legacy->post_parent;
         if ( 0 !== $legacyParent ) {
             $translated = Crosswalk::findNewByLegacyId( $legacyParent, Identifiers::POST_TYPE_SERMON );
             if ( null !== $translated ) {
                 $newParent = $translated;
-            } else {
-                $flags[] = 'post_parent_unresolved:' . $legacyParent;
             }
         }
 
@@ -241,6 +265,16 @@ final class SermonWriter {
         // Back-ref FIRST, immediately after insert (unique → idempotent on resume).
         Crosswalk::markLegacy( $newId, $legacyId );
 
+        // post_parent re-translation (IMPORTANT #5): runs on BOTH the fresh-insert
+        // and the resume path so a child migrated BEFORE its parent self-heals once
+        // the parent is later migrated. The prior post_parent_unresolved flag is
+        // stripped and re-derived from scratch (mirroring the term-flag strip), and
+        // the resolved parent is applied via wp_update_post when it newly resolves —
+        // so COMPLETE clears symmetrically rather than staying never-clean forever.
+        // On a fresh insert the parent was already set at insert time, so this is a
+        // no-op update (idempotent) that simply re-confirms the flag state.
+        $flags = $this->reconcilePostParent( $newId, $legacy, $flags );
+
         // Preserve any substantive old body the reconciler routed to backup. The
         // unique=true guard means a resume re-entry never adds a duplicate row;
         // re-derive the flag from the persisted row so a resume reports it too.
@@ -292,6 +326,69 @@ final class SermonWriter {
         $this->writeFlags( $newId, $flags );
 
         return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * Re-translate the legacy post_parent and apply it, self-healing the
+     * post_parent_unresolved flag (IMPORTANT #5). Runs on every spine pass (fresh
+     * insert AND resume), so a child migrated before its parent picks the parent up
+     * once the parent is later migrated:
+     *
+     *  - the prior post_parent_unresolved:* flag is STRIPPED, then re-derived from
+     *    scratch (mirroring the term-flag strip), so a now-resolvable parent clears
+     *    its open flag instead of carrying it forever;
+     *  - a zero legacy parent is a no-op (parent stays 0, no flag);
+     *  - a non-zero legacy parent that resolves is applied via wp_update_post ONLY
+     *    when the current post_parent differs (idempotent — a fresh insert already
+     *    has it, a resume that already healed is a no-op);
+     *  - a non-zero legacy parent that still does NOT resolve re-records the
+     *    post_parent_unresolved:<legacyParent> flag (parent stays 0).
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function reconcilePostParent( int $newId, \WP_Post $legacy, array $flags ): array {
+        $legacyParent = (int) $legacy->post_parent;
+
+        // Strip any prior post_parent_unresolved flag so this pass re-derives it.
+        $flags = array_values( array_filter(
+            $flags,
+            static function ( $flag ): bool {
+                return ! str_starts_with( (string) $flag, 'post_parent_unresolved:' );
+            }
+        ) );
+
+        if ( 0 === $legacyParent ) {
+            return $flags; // no parent — nothing to translate, no flag.
+        }
+
+        $translated = Crosswalk::findNewByLegacyId( $legacyParent, Identifiers::POST_TYPE_SERMON );
+        if ( null === $translated ) {
+            // Still unresolvable — keep parent 0 and re-record the open flag so a
+            // LATER pass (once the parent migrates) can self-heal it.
+            $flags[] = 'post_parent_unresolved:' . $legacyParent;
+            return $flags;
+        }
+
+        // Newly (or already) resolved — apply only when it actually differs so a
+        // fresh insert / already-healed resume is a no-op (idempotent). KSES is
+        // disabled around the update: wp_update_post merges the existing post and
+        // would otherwise re-run KSES over the (KSES-off-inserted) body, stripping
+        // iframes/shortcodes from an already-clean post on a mere parent re-parent.
+        $current = (int) get_post_field( 'post_parent', $newId );
+        if ( $current !== (int) $translated ) {
+            kses_remove_filters();
+            try {
+                wp_update_post( array(
+                    'ID'          => $newId,
+                    'post_parent' => (int) $translated,
+                ) );
+            } finally {
+                kses_init_filters();
+            }
+        }
+
+        return $flags;
     }
 
     /**
@@ -409,7 +506,16 @@ final class SermonWriter {
                 ? $this->dates->normalize( $rawString, wp_timezone() )
                 : DateNormalizer::normalize( $rawString, wp_timezone() );
             if ( null === $normalized ) {
-                continue; // unparseable — raw is the source of truth; still flagged
+                // IMPORTANT #7: positional alignment. Companions are a positional
+                // multiset (delete_post_meta + add_post_meta), so a consumer indexes
+                // META_DATE_NORMALIZED[i] against the i-th NON-NUMERIC raw row. A bare
+                // `continue` here would leave the unparseable row with NO companion,
+                // shortening and MISALIGNING the multiset against the raw set. Write a
+                // sentinel marker instead so EVERY non-numeric row has a companion at
+                // its position; the unparseable case is flagged (raw stays the source
+                // of truth) rather than silently dropped.
+                add_post_meta( $newId, Identifiers::META_DATE_NORMALIZED, wp_slash( Identifiers::META_DATE_UNPARSEABLE ) );
+                continue;
             }
             // wp_slash for consistency with the meta-write discipline (the value is
             // an int here, but add_post_meta() unslashes its input uniformly).
@@ -528,24 +634,20 @@ final class SermonWriter {
     }
 
     /**
-     * Re-run ONLY the term-repair step on an already-COMPLETE post, persisting the
-     * re-derived flags. "Post exists" must never short-circuit term repair: a post
-     * migrated while a term crosswalk was missing picks the now-available term up
-     * here. The post/body/meta/comments are intentionally left untouched.
+     * Whether any OPEN post_parent_unresolved flag is present. Gates the
+     * COMPLETE-branch parent self-heal so a completed record whose parent has since
+     * been migrated re-translates and clears the flag, while a record with no such
+     * open flag is left untouched (no needless wp_update_post).
      *
      * @param list<string> $flags
-     * @return list<string>
      */
-    private function repairTermsOnExisting( int $newId, int $legacyId, array $flags ): array {
-        // Repair ONLY the taxonomies that carry an open flag. A taxonomy with no
-        // open flag is left entirely untouched, so a native term a church admin
-        // manually added to the migrated post (in a DIFFERENT taxonomy than the one
-        // being healed) is never clobbered by a full-set wp_set_object_terms
-        // REPLACE — the data-loss-on-the-NEW-post hole this gate closes.
-        $scope = $this->openFlagTargetTaxonomies( $flags, $legacyId );
-        $flags = $this->applyTerms( $newId, $legacyId, $flags, $scope );
-        $this->writeFlags( $newId, $flags );
-        return array_values( array_unique( $flags ) );
+    private function hasOpenPostParentFlag( array $flags ): bool {
+        foreach ( $flags as $flag ) {
+            if ( str_starts_with( (string) $flag, 'post_parent_unresolved:' ) ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

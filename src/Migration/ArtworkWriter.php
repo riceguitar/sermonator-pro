@@ -64,7 +64,7 @@ final class ArtworkWriter {
             $this->writeOption( Identifiers::OPTION_TERM_IMAGES_SETTINGS, $remappedSettings );
         }
 
-        $this->persistFlags( $remappedImages['dropped'], $remappedImages['conflicts'] );
+        $this->persistFlags( $remappedImages['dropped'], $remappedImages['conflicts'], $remappedImages['conflict_details'] );
 
         return array(
             'written'   => count( $remappedImages['images'] ),
@@ -74,9 +74,11 @@ final class ArtworkWriter {
     }
 
     /**
-     * The dropped/conflicts flags this writer persisted on its last run.
+     * The dropped/conflicts flags this writer persisted on its last run, plus the
+     * per-collision conflict_details (IMPORTANT #8) preserving the LOSING
+     * attachment_id so an admin can recover the dropped artwork.
      *
-     * @return array{dropped: list<int>, conflicts: list<int>}
+     * @return array{dropped: list<int>, conflicts: list<int>, conflict_details: list<array{new_tt_id: int, legacy_tt_id: int, discarded_attachment_id: int, winning_attachment_id: int}>}
      */
     public static function persistedFlags(): array {
         $progress = get_option( Identifiers::OPTION_MIGRATION_PROGRESS );
@@ -84,9 +86,25 @@ final class ArtworkWriter {
             ? $progress[ self::PROGRESS_KEY ]
             : array();
 
+        $details = array();
+        if ( isset( $artwork['conflict_details'] ) && is_array( $artwork['conflict_details'] ) ) {
+            foreach ( $artwork['conflict_details'] as $detail ) {
+                if ( ! is_array( $detail ) ) {
+                    continue;
+                }
+                $details[] = array(
+                    'new_tt_id'               => isset( $detail['new_tt_id'] ) ? (int) $detail['new_tt_id'] : 0,
+                    'legacy_tt_id'            => isset( $detail['legacy_tt_id'] ) ? (int) $detail['legacy_tt_id'] : 0,
+                    'discarded_attachment_id' => isset( $detail['discarded_attachment_id'] ) ? (int) $detail['discarded_attachment_id'] : 0,
+                    'winning_attachment_id'   => isset( $detail['winning_attachment_id'] ) ? (int) $detail['winning_attachment_id'] : 0,
+                );
+            }
+        }
+
         return array(
-            'dropped'   => isset( $artwork['dropped'] ) && is_array( $artwork['dropped'] ) ? array_values( array_map( 'intval', $artwork['dropped'] ) ) : array(),
-            'conflicts' => isset( $artwork['conflicts'] ) && is_array( $artwork['conflicts'] ) ? array_values( array_map( 'intval', $artwork['conflicts'] ) ) : array(),
+            'dropped'          => isset( $artwork['dropped'] ) && is_array( $artwork['dropped'] ) ? array_values( array_map( 'intval', $artwork['dropped'] ) ) : array(),
+            'conflicts'        => isset( $artwork['conflicts'] ) && is_array( $artwork['conflicts'] ) ? array_values( array_map( 'intval', $artwork['conflicts'] ) ) : array(),
+            'conflict_details' => $details,
         );
     }
 
@@ -178,12 +196,16 @@ final class ArtworkWriter {
     }
 
     /**
-     * @param list<int> $dropped
-     * @param list<int> $conflicts
+     * @param list<int>                                                                                                  $dropped
+     * @param list<int>                                                                                                  $conflicts
+     * @param list<array{new_tt_id: int, legacy_tt_id: int, discarded_attachment_id: int, winning_attachment_id: int}>   $conflictDetails
      */
-    private function persistFlags( array $dropped, array $conflicts ): void {
+    private function persistFlags( array $dropped, array $conflicts, array $conflictDetails = array() ): void {
         $this->updateProgress( 'dropped', array_values( array_map( 'intval', $dropped ) ) );
         $this->updateProgress( 'conflicts', array_values( array_map( 'intval', $conflicts ) ) );
+        // IMPORTANT #8: persist the LOSING attachment_id per collision so it is
+        // recoverable from OPTION_MIGRATION_PROGRESS rather than discarded forever.
+        $this->updateProgress( 'conflict_details', array_values( $conflictDetails ) );
     }
 
     private function updateProgress( string $subKey, mixed $value ): void {

@@ -21,4 +21,27 @@ final class DateNormalizerTest extends TestCase {
         $this->assertNull(DateNormalizer::normalize('not a date', new \DateTimeZone('UTC')));
         $this->assertNull(DateNormalizer::normalize('', new \DateTimeZone('UTC')));
     }
+    public function test_digit_bearing_relative_expressions_rejected(): void {
+        // IMPORTANT #6: PHP's DateTimeImmutable accepts digit-bearing RELATIVE
+        // expressions ('+1 day', '2 weeks ago') and resolves them against runtime
+        // 'now' — producing a plausible-but-wrong companion (e.g. the migration
+        // date) presented downstream as authoritative. These are NOT concrete legacy
+        // dates and must be rejected (null), not silently anchored to runtime now.
+        $this->assertNull(DateNormalizer::normalize('+1 day', new \DateTimeZone('UTC')));
+        $this->assertNull(DateNormalizer::normalize('2 weeks ago', new \DateTimeZone('UTC')));
+        $this->assertNull(DateNormalizer::normalize('+2 weeks', new \DateTimeZone('UTC')));
+        $this->assertNull(DateNormalizer::normalize('1 month ago', new \DateTimeZone('UTC')));
+        $this->assertNull(DateNormalizer::normalize('next year', new \DateTimeZone('UTC')));
+    }
+    public function test_overflow_date_rejected(): void {
+        // 2021-02-30 has no Feb 30 — date_parse flags it (error/warning) and PHP
+        // would otherwise roll it over to March. Reject rather than mis-anchor.
+        $this->assertNull(DateNormalizer::normalize('2021-02-30', new \DateTimeZone('UTC')));
+    }
+    public function test_real_concrete_dates_still_parse(): void {
+        // The reject must NOT regress real legacy dates.
+        $this->assertIsInt(DateNormalizer::normalize('2021-01-01', new \DateTimeZone('UTC')));
+        $this->assertIsInt(DateNormalizer::normalize('01/05/2021', new \DateTimeZone('UTC')));
+        $this->assertIsInt(DateNormalizer::normalize('2021-05-01 09:30:00', new \DateTimeZone('UTC')));
+    }
 }

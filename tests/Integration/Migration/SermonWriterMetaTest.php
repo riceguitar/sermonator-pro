@@ -325,6 +325,47 @@ final class SermonWriterMetaTest extends WP_UnitTestCase {
         );
     }
 
+    public function test_mixed_parseable_and_unparseable_nonnumeric_dates_stay_positionally_aligned(): void {
+        // IMPORTANT #7: applyDateNormalization previously wrote a companion ONLY for
+        // non-numeric rows that PARSED — an unparseable non-numeric row hit a bare
+        // `continue` and produced NO companion. With companions stored as a positional
+        // multiset, a multi-row sermon_date mixing a parseable and an UNPARSEABLE value
+        // yielded a companion set SHORTER THAN and positionally MISALIGNED with the raw
+        // set, so a consumer indexing META_DATE_NORMALIZED[i] against META_DATE[i] read
+        // the wrong companion. Every non-numeric row must now get a companion: a real
+        // timestamp when parseable, the UNPARSEABLE sentinel otherwise — so position i
+        // of the companion set always corresponds to position i of the raw set.
+        $legacyId = $this->bareSermon();
+        // Row 0: parseable. Row 1: non-numeric but UNPARSEABLE garbage. Row 2: parseable.
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DATE, '01/05/2021' );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DATE, 'sometime last Easter' );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DATE, '03/14/2022' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        // Raw values preserved verbatim, in order.
+        $this->assertSame(
+            array( '01/05/2021', 'sometime last Easter', '03/14/2022' ),
+            get_post_meta( $result->newId, Identifiers::META_DATE, false )
+        );
+
+        // A companion for EVERY non-numeric row, positionally aligned with the raw set:
+        // parseable → its unix timestamp; unparseable → the UNPARSEABLE sentinel.
+        $normalized = get_post_meta( $result->newId, Identifiers::META_DATE_NORMALIZED, false );
+        $this->assertSame(
+            array(
+                (string) strtotime( '2021-01-05 00:00:00 UTC' ),
+                Identifiers::META_DATE_UNPARSEABLE,
+                (string) strtotime( '2022-03-14 00:00:00 UTC' ),
+            ),
+            $normalized,
+            'every non-numeric row gets a companion (sentinel on parse failure) so positions stay aligned'
+        );
+
+        // Still flagged as a non-numeric-date record.
+        $this->assertContains( 'legacy_nonnumeric_date', $result->flags );
+    }
+
     public function test_reapplying_meta_does_not_duplicate_single_value_or_accumulate_flags(): void {
         $legacyId = $this->bareSermon();
         add_post_meta( $legacyId, LegacyIdentifiers::META_DATE, '01/05/2021' );

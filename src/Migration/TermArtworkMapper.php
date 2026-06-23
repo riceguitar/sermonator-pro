@@ -19,12 +19,18 @@ final class TermArtworkMapper {
      *
      * @param array<int|string, int> $legacyImages Legacy tt_id (int or numeric-string) → attachment_id.
      * @param array<int|string, int> $ttIdCrosswalk Legacy tt_id (int or numeric-string) → new tt_id (int).
-     * @return array{images: array<int, int>, dropped: list<int>, conflicts: list<int>} New tt_id → attachment_id; dropped legacy tt_ids; new tt_ids with collisions.
+     * @return array{images: array<int, int>, dropped: list<int>, conflicts: list<int>, conflict_details: list<array{new_tt_id: int, legacy_tt_id: int, discarded_attachment_id: int, winning_attachment_id: int}>} New tt_id → attachment_id; dropped legacy tt_ids; new tt_ids with collisions; per-collision detail preserving the LOSING attachment_id for admin recovery.
      */
     public static function remapImages( array $legacyImages, array $ttIdCrosswalk ): array {
         $images   = array();
         $dropped  = array();
         $conflicts = array();
+        // IMPORTANT #8: the FIRST-WINS collision branch below would otherwise discard
+        // the losing attachment_id unrecoverably — only the winning new tt_id was
+        // recorded. Capture the full detail (losing legacy tt_id + discarded
+        // attachment_id + the winner that kept the slot) so an admin can recover the
+        // dropped term artwork from the migration progress record.
+        $conflictDetails = array();
 
         foreach ( $legacyImages as $legacyTtId => $attachmentId ) {
             $legacyTtIdInt = (int) $legacyTtId;
@@ -42,6 +48,13 @@ final class TermArtworkMapper {
                 if ( ! in_array( $newTtId, $conflicts, true ) ) {
                     $conflicts[] = $newTtId;
                 }
+                // Preserve the losing association so it is recoverable, not silently lost.
+                $conflictDetails[] = array(
+                    'new_tt_id'               => (int) $newTtId,
+                    'legacy_tt_id'            => $legacyTtIdInt,
+                    'discarded_attachment_id' => (int) $attachmentId,
+                    'winning_attachment_id'   => (int) $images[ $newTtId ],
+                );
                 continue;
             }
 
@@ -49,9 +62,10 @@ final class TermArtworkMapper {
         }
 
         return array(
-            'images'    => $images,
-            'dropped'   => $dropped,
-            'conflicts' => $conflicts,
+            'images'           => $images,
+            'dropped'          => $dropped,
+            'conflicts'        => $conflicts,
+            'conflict_details' => $conflictDetails,
         );
     }
 

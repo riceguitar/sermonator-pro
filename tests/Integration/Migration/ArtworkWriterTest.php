@@ -258,6 +258,22 @@ final class ArtworkWriterTest extends WP_UnitTestCase {
         // Persisted (not just returned) for verification / review.
         $persisted = ArtworkWriter::persistedFlags();
         $this->assertContains( $newTtId, $persisted['conflicts'] );
+
+        // IMPORTANT #8: the LOSING attachment_id (600) must be recoverable from the
+        // progress record — not discarded unrecoverably. The conflict detail records
+        // the losing legacy tt_id AND the discarded attachment_id so an admin can
+        // manually re-assign the dropped artwork.
+        $details = $persisted['conflict_details'];
+        $match = null;
+        foreach ( $details as $detail ) {
+            if ( (int) $detail['new_tt_id'] === $newTtId && (int) $detail['legacy_tt_id'] === $legacyTtSecond ) {
+                $match = $detail;
+                break;
+            }
+        }
+        $this->assertNotNull( $match, 'conflict detail for the colliding new tt_id must be persisted' );
+        $this->assertSame( 600, (int) $match['discarded_attachment_id'], 'the discarded attachment_id must be retrievable from the progress record' );
+        $this->assertSame( 500, (int) $match['winning_attachment_id'] );
     }
 
     /**

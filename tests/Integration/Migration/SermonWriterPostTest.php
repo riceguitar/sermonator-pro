@@ -467,6 +467,82 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertContains( 'post_parent_unresolved:' . $orphanParent, $result->flags );
     }
 
+    public function test_post_parent_unresolved_self_heals_after_parent_migrated(): void {
+        // IMPORTANT #5: post_parent_unresolved must SELF-HEAL. A child migrated
+        // BEFORE its parent collapses to post_parent=0 and records
+        // post_parent_unresolved:<id>. Previously parent translation ran ONLY in the
+        // fresh-insert branch, so after the parent was later migrated, re-writing the
+        // child never re-translated the parent nor cleared the flag — the record stayed
+        // never-clean forever (blocking the Verifier's empty-flags completeness check).
+        // Now re-translation runs in applyPostInsertSpine (both fresh AND resume), and
+        // the COMPLETE branch re-drives it whenever the open flag is present: the prior
+        // flag is stripped, the parent re-derived, and wp_update_post applies the newly
+        // resolved parent so COMPLETE clears symmetrically.
+        $orphanParent = $this->fixture->createSermon();
+
+        $childLegacy = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'  => 'Heal Child',
+            'post_status' => 'publish',
+            'post_parent' => $orphanParent,
+        ) );
+        add_post_meta( $childLegacy, LegacyIdentifiers::META_DESCRIPTION, 'heal child body' );
+
+        // (1) Migrate the child BEFORE the parent: parent collapses to 0 + flag.
+        $writer      = new SermonWriter();
+        $childResult = $writer->write( $childLegacy );
+        $this->assertSame( 0, (int) get_post( $childResult->newId )->post_parent );
+        $this->assertContains( 'post_parent_unresolved:' . $orphanParent, $childResult->flags );
+        // The child is COMPLETE (its only flag is the unresolved parent — no comment
+        // failure), so the self-heal must work from the COMPLETE branch.
+        $this->assertSame( '1', (string) get_post_meta( $childResult->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+
+        // (2) Now migrate the parent.
+        $parentResult = $writer->write( $orphanParent );
+
+        // (3) Re-write the child: the parent now resolves; flag clears.
+        $rewrite = $writer->write( $childLegacy );
+
+        $this->assertSame(
+            $parentResult->newId,
+            (int) get_post( $childResult->newId )->post_parent,
+            'parent must be re-derived and applied on re-write'
+        );
+        $this->assertNotContains( 'post_parent_unresolved:' . $orphanParent, $rewrite->flags, 'unresolved flag must clear' );
+
+        // Persisted flags row no longer carries the unresolved flag.
+        $persisted = get_post_meta( $childResult->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertNotContains( 'post_parent_unresolved:' . $orphanParent, (array) $persisted );
+    }
+
+    public function test_post_parent_self_heals_on_resume_leg(): void {
+        // Same self-heal, but through the RESUME leg (record stamped-but-partial):
+        // the parent-translation block must run in applyPostInsertSpine on resume too.
+        $orphanParent = $this->fixture->createSermon();
+
+        $childLegacy = (int) wp_insert_post( array(
+            'post_type'   => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'  => 'Resume Heal Child',
+            'post_status' => 'publish',
+            'post_parent' => $orphanParent,
+        ) );
+        add_post_meta( $childLegacy, LegacyIdentifiers::META_DESCRIPTION, 'resume heal body' );
+
+        $writer      = new SermonWriter();
+        $childResult = $writer->write( $childLegacy );
+        $this->assertContains( 'post_parent_unresolved:' . $orphanParent, $childResult->flags );
+
+        $parentResult = $writer->write( $orphanParent );
+
+        // Crash-inject a partial so the re-write takes the RESUME leg.
+        delete_post_meta( $childResult->newId, Crosswalk::MIGRATION_COMPLETE );
+        $resume = $writer->write( $childLegacy );
+        $this->assertTrue( $resume->resumed );
+
+        $this->assertSame( $parentResult->newId, (int) get_post( $childResult->newId )->post_parent );
+        $this->assertNotContains( 'post_parent_unresolved:' . $orphanParent, $resume->flags );
+    }
+
     public function test_legacy_post_and_meta_byte_equal_before_and_after(): void {
         $legacyId = (int) wp_insert_post( array(
             'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,

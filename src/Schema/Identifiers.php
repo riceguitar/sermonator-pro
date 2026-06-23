@@ -37,6 +37,15 @@ final class Identifiers {
     public const OPTION_MIGRATION_PROGRESS      = 'sermonator_migration_progress';
     public const META_DATE_NORMALIZED           = 'sermonator_date_normalized';
 
+    /**
+     * Sentinel companion value written for a non-numeric sermon_date row that the
+     * DateNormalizer could NOT parse. Writing a companion for EVERY non-numeric row
+     * (parseable or not) keeps META_DATE_NORMALIZED[i] positionally aligned with
+     * META_DATE[i]; this marker flags the unparseable position so a consumer never
+     * mistakes a missing companion for a numeric row and never mis-indexes.
+     */
+    public const META_DATE_UNPARSEABLE          = 'sermonator_date_unparseable';
+
     /** @return list<string> The five sermon taxonomy slugs, in display order. */
     public static function sermonTaxonomies(): array {
         return array(
