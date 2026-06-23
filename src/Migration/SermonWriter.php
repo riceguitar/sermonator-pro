@@ -265,33 +265,54 @@ final class SermonWriter {
         // Date normalization companions: one per NON-NUMERIC sermon_date row,
         // written alongside the untouched raw (which the loop above already copied
         // verbatim under the new date key). Delete-then-re-add for idempotency.
-        $this->applyDateNormalization( $newId, $legacyId );
+        //
+        // The legacy_nonnumeric_date flag is derived HERE — from the same per-row
+        // scan that drives the companions — so the flag set and the companion set
+        // can never disagree (e.g. a numeric-first / non-numeric-later multiset
+        // gets BOTH the companion for the later row AND the flag). We do not rely
+        // on the mapper's flag for this, though the mapper now agrees.
+        $flags = array_values( $mapped['flags'] );
+        if ( $this->applyDateNormalization( $newId, $legacyId ) ) {
+            $flags[] = 'legacy_nonnumeric_date';
+        }
 
-        return array_values( $mapped['flags'] );
+        return array_values( array_unique( $flags ) );
     }
 
     /**
      * Write a sermonator_date_normalized companion for EVERY non-numeric
      * sermon_date row (raw left untouched), delete-then-re-add for idempotency.
      * Numeric dates produce no companion row.
+     *
+     * Scans EVERY row (not just the first): the flag and the companion set are
+     * both driven from this single pass so they cannot disagree.
+     *
+     * @return bool Whether ANY row (at any position) was non-numeric — the
+     *              authoritative legacy_nonnumeric_date signal. True even when a
+     *              non-numeric row is unparseable (no companion written), because
+     *              the raw is still a non-numeric date that must be flagged.
      */
-    private function applyDateNormalization( int $newId, int $legacyId ): void {
+    private function applyDateNormalization( int $newId, int $legacyId ): bool {
         $rawDates = get_post_meta( $legacyId, LegacyIdentifiers::META_DATE, false );
         $rawDates = is_array( $rawDates ) ? array_values( $rawDates ) : array();
 
         delete_post_meta( $newId, Identifiers::META_DATE_NORMALIZED );
 
+        $sawNonNumeric = false;
         foreach ( $rawDates as $raw ) {
             $rawString = is_string( $raw ) ? $raw : (string) $raw;
             if ( $this->isUnixTimestamp( $rawString ) ) {
-                continue; // numeric date — no companion
+                continue; // numeric date — no companion, no flag
             }
-            $normalized = DateNormalizer::normalize( $rawString );
+            $sawNonNumeric = true;
+            $normalized    = DateNormalizer::normalize( $rawString );
             if ( null === $normalized ) {
-                continue; // unparseable — raw is the source of truth; mapper still flags it
+                continue; // unparseable — raw is the source of truth; still flagged
             }
             add_post_meta( $newId, Identifiers::META_DATE_NORMALIZED, $normalized );
         }
+
+        return $sawNonNumeric;
     }
 
     /** Whether a legacy date value is a (signed) unix timestamp. */

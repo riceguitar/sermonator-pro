@@ -126,15 +126,73 @@ final class SermonWriterMetaTest extends WP_UnitTestCase {
 
     public function test_post_content_temp_is_its_own_canonical_row(): void {
         // post_content_temp is copied verbatim as its own single row AND fed to the
-        // reconciler. The reconciler must not ALSO route it to the backup body
-        // (single canonical home, no double-flag).
-        $legacyId = $this->bareSermon();
+        // reconciler. The reconciler must NOT ALSO route it to the backup body
+        // (single canonical home, no double-flag): the only substantive text here
+        // lives in post_content_temp, so LEGACY_POST_CONTENT must be EMPTY and the
+        // post_content_preserved flag absent.
+        //
+        // Use an EMPTY-post_content sermon so post_content_temp is the SOLE
+        // substantive source — otherwise an independent old post_content blob
+        // would (correctly) be preserved and mask the single-home assertion.
+        $legacyId = (int) wp_insert_post( array(
+            'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
+            'post_title'   => 'TempOnly ' . wp_generate_uuid4(),
+            'post_status'  => 'publish',
+            'post_content' => '',
+        ) );
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DESCRIPTION, '' );
         add_post_meta( $legacyId, LegacyIdentifiers::META_POST_CONTENT_TEMP, 'a temp-only fragment' );
 
         $result = ( new SermonWriter() )->write( $legacyId );
 
+        // Single canonical home: its own meta row, verbatim.
         $rows = get_post_meta( $result->newId, LegacyIdentifiers::META_POST_CONTENT_TEMP, false );
         $this->assertSame( array( 'a temp-only fragment' ), $rows, 'post_content_temp is its own single canonical row' );
+
+        // NOT a second home: the reconciler backup must be empty.
+        $this->assertSame(
+            '',
+            (string) get_post_meta( $result->newId, Crosswalk::LEGACY_POST_CONTENT, true ),
+            'post_content_temp must not ALSO land in the backup body (single home)'
+        );
+
+        // No double-flag: post_content_preserved must be absent.
+        $flags = (array) get_post_meta( $result->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertNotContains( 'post_content_preserved', $flags, 'no double-flag for the single-home temp row' );
+        $this->assertNotContains( 'post_content_preserved', $result->flags );
+    }
+
+    public function test_numeric_first_nonnumeric_later_date_flags_and_companions_the_later_row(): void {
+        // A multi-row sermon_date whose FIRST value is a numeric unix timestamp but
+        // a LATER value is non-numeric must STILL: (a) write a normalized companion
+        // for the later non-numeric row, and (b) record legacy_nonnumeric_date in
+        // both the result flags and the persisted MIGRATION_FLAGS row. First-row-
+        // only inspection would silently disagree with the per-row companion set.
+        $legacyId = $this->bareSermon();
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DATE, '1612137600' ); // numeric first
+        add_post_meta( $legacyId, LegacyIdentifiers::META_DATE, '01/05/2021' ); // non-numeric later
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        // Both raw values preserved verbatim, in order.
+        $this->assertSame(
+            array( '1612137600', '01/05/2021' ),
+            get_post_meta( $result->newId, Identifiers::META_DATE, false )
+        );
+
+        // Exactly ONE companion — for the later non-numeric row only (numeric first
+        // gets none).
+        $normalized = get_post_meta( $result->newId, Identifiers::META_DATE_NORMALIZED, false );
+        $this->assertSame(
+            array( (string) strtotime( '2021-01-05 00:00:00 UTC' ) ),
+            $normalized,
+            'companion written for the later non-numeric row, none for the numeric first row'
+        );
+
+        // Flag present in BOTH the result and the persisted flags row.
+        $this->assertContains( 'legacy_nonnumeric_date', $result->flags );
+        $flags = (array) get_post_meta( $result->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertContains( 'legacy_nonnumeric_date', $flags );
     }
 
     public function test_nonnumeric_date_gets_normalized_companion_plus_flag_raw_untouched(): void {

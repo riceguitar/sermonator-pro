@@ -9,6 +9,13 @@ namespace Sermonator\Migration;
  * sermon_description (→ post_content). The old auto-generated post_content blob
  * is discarded, EXCEPT when it holds substantive text not represented in the
  * description — that text is preserved as a backup and flagged, never dropped.
+ *
+ * post_content_temp has its OWN single canonical home: the writer copies it
+ * verbatim as its own meta row. It is therefore NEVER routed to the backup body
+ * here (that would be a second home + a double-flag). It is fed in only as an
+ * additional "already-represented" corpus, so that an $oldPostContent fragment
+ * whose substantive text is already captured by the temp row is recognised as
+ * preserved and is not redundantly backed up either.
  */
 final class PostContentReconciler {
     /**
@@ -17,25 +24,21 @@ final class PostContentReconciler {
     public static function reconcile( string $oldPostContent, ?string $description, ?string $postContentTemp = null ): array {
         $content = $description ?? '';
 
-        // Gather unique substantive pieces from both $oldPostContent and $postContentTemp.
-        $pieces = array();
-        $seenVisibleTexts = array();
-
-        // Process $oldPostContent if present and unique.
-        if ( self::isUniqueSubstantive( $oldPostContent, (string) $description ) ) {
-            $visibleText = self::visibleText( $oldPostContent );
-            if ( $visibleText !== '' && ! isset( $seenVisibleTexts[ $visibleText ] ) ) {
-                $pieces[] = $oldPostContent;
-                $seenVisibleTexts[ $visibleText ] = true;
-            }
+        // The corpus already preserved elsewhere: the canonical description body
+        // PLUS the post_content_temp row (its own canonical home). $oldPostContent
+        // is backed up only if it is substantive relative to BOTH.
+        $representedCorpus = (string) $description;
+        if ( $postContentTemp !== null && trim( $postContentTemp ) !== '' ) {
+            $representedCorpus .= "\n\n" . $postContentTemp;
         }
 
-        // Process $postContentTemp if present and unique.
-        if ( $postContentTemp !== null && self::isUniqueSubstantive( $postContentTemp, (string) $description ) ) {
-            $visibleText = self::visibleText( $postContentTemp );
-            if ( $visibleText !== '' && ! isset( $seenVisibleTexts[ $visibleText ] ) ) {
-                $pieces[] = $postContentTemp;
-                $seenVisibleTexts[ $visibleText ] = true;
+        // Only $oldPostContent can land in the backup. post_content_temp is never
+        // backed up (single canonical home = its own meta row → no double-flag).
+        $pieces = array();
+        if ( self::isUniqueSubstantive( $oldPostContent, $representedCorpus ) ) {
+            $visibleText = self::visibleText( $oldPostContent );
+            if ( $visibleText !== '' ) {
+                $pieces[] = $oldPostContent;
             }
         }
 
