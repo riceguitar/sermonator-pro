@@ -34,11 +34,13 @@ final class SeoHead {
             'description' => (string) get_the_excerpt( $postId ),
         );
 
-        // JSON-LD.
-        $schema = ( new JsonLd() )->forSermon( $view, $context );
-        $json   = wp_json_encode( $schema, JSON_HEX_TAG | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
-        if ( is_string( $json ) ) {
-            echo "\n" . '<script type="application/ld+json">' . $json . '</script>' . "\n"; // phpcs:ignore WordPress.Security.EscapeOutput — JSON_HEX_TAG neutralises </script>
+        // JSON-LD — opt-out for sites whose SEO plugin already emits sermon structured data.
+        if ( apply_filters( 'sermonator_frontend_emit_json_ld', true, $postId ) ) {
+            $schema = ( new JsonLd() )->forSermon( $view, $context );
+            $json   = wp_json_encode( $schema, JSON_HEX_TAG | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
+            if ( is_string( $json ) ) {
+                echo "\n" . '<script type="application/ld+json">' . $json . '</script>' . "\n"; // phpcs:ignore WordPress.Security.EscapeOutput — JSON_HEX_TAG neutralises </script>
+            }
         }
 
         // Open Graph / Twitter — opt-out for sites whose SEO plugin owns these.

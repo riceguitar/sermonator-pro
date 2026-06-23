@@ -52,6 +52,14 @@ final class SeoHeadTest extends WP_UnitTestCase {
         $this->assertStringNotContainsString( 'og:title', $html, 'OG suppressed by the filter.' );
     }
 
+    public function test_jsonld_can_be_filtered_off(): void {
+        add_filter( 'sermonator_frontend_emit_json_ld', '__return_false' );
+        $html = $this->head( $this->sermon() );
+        remove_filter( 'sermonator_frontend_emit_json_ld', '__return_false' );
+        $this->assertStringNotContainsString( 'application/ld+json', $html );
+        $this->assertStringContainsString( 'og:title', $html, 'OG still emitted.' );
+    }
+
     public function test_jsonld_is_valid_json(): void {
         $html = $this->head( $this->sermon() );
         preg_match( '#<script type="application/ld\+json">(.+?)</script>#s', $html, $m );
