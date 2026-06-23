@@ -74,6 +74,52 @@ final class SermonWriterMetaTest extends WP_UnitTestCase {
         $this->assertSame( $array, $stored, 'serialized array meta must round-trip as an array, not a string' );
     }
 
+    public function test_literal_backslash_meta_roundtrips_byte_exact(): void {
+        // CRITICAL #2: get_post_meta($id,$key,false) returns UNSLASHED values.
+        // Feeding them straight to add_post_meta() lets add_metadata()'s internal
+        // wp_unslash() strip one backslash level (UNC/audio paths, escaped quotes,
+        // serialized inner strings). The writer must wp_slash() before add_*_meta so
+        // the value is byte-exact on the new post.
+        $legacyId = $this->bareSermon();
+
+        $uncPath = 'C\\\\server\\share\\audio.mp3'; // literal backslashes
+        $quoted  = 'He said \\"amen\\" twice';       // escaped quotes with backslashes
+        // Seed via the fixture so the legacy DB row holds the EXACT bytes (wp_slash'd
+        // through add_post_meta's unslash) — mirroring real legacy data.
+        $this->fixture->seedRawMeta( $legacyId, '_audio_unc', $uncPath );
+        $this->fixture->seedRawMeta( $legacyId, '_quoted', $quoted );
+
+        // An ARRAY whose inner strings carry literal backslashes — wp_slash must
+        // recurse so the array round-trips byte-exact.
+        $arrayWithBackslashes = array(
+            'path'  => 'D\\\\vol\\clip.wav',
+            'inner' => array( 'a\\b', 'c\\\\d' ),
+        );
+        $this->fixture->seedRawMeta( $legacyId, '_backslash_array', $arrayWithBackslashes );
+
+        // Sanity: the legacy DB row holds the exact bytes before the writer runs.
+        $this->assertSame( $uncPath, get_post_meta( $legacyId, '_audio_unc', true ), 'fixture seed must be byte-exact' );
+        $this->assertSame( $arrayWithBackslashes, get_post_meta( $legacyId, '_backslash_array', true ), 'fixture array seed must be byte-exact' );
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $this->assertSame(
+            $uncPath,
+            get_post_meta( $result->newId, '_audio_unc', true ),
+            'UNC/backslash scalar meta must be byte-exact (no stripped backslash level)'
+        );
+        $this->assertSame(
+            $quoted,
+            get_post_meta( $result->newId, '_quoted', true ),
+            'escaped-quote meta must be byte-exact'
+        );
+        $this->assertSame(
+            $arrayWithBackslashes,
+            get_post_meta( $result->newId, '_backslash_array', true ),
+            'array meta with backslash inner strings must round-trip byte-exact (wp_slash recurses)'
+        );
+    }
+
     public function test_renamed_known_keys_land_under_new_namespace(): void {
         $legacyId = $this->bareSermon();
         add_post_meta( $legacyId, LegacyIdentifiers::META_BIBLE_PASSAGE, 'Romans 8:28' );
@@ -215,6 +261,33 @@ final class SermonWriterMetaTest extends WP_UnitTestCase {
         $flags = get_post_meta( $result->newId, Crosswalk::MIGRATION_FLAGS, true );
         $this->assertContains( 'legacy_nonnumeric_date', (array) $flags );
         $this->assertContains( 'legacy_nonnumeric_date', $result->flags );
+    }
+
+    public function test_nonnumeric_date_companion_anchored_to_site_timezone_not_utc(): void {
+        // IMPORTANT #9: applyDateNormalization must pass wp_timezone() so a date-only
+        // legacy string is anchored to the SITE timezone, not UTC. Under
+        // America/New_York the companion must equal site-TZ midnight (which is
+        // 05:00 UTC in January / EST), NOT UTC midnight.
+        $originalTz = get_option( 'timezone_string' );
+        update_option( 'timezone_string', 'America/New_York' );
+
+        try {
+            $legacyId = $this->bareSermon();
+            add_post_meta( $legacyId, LegacyIdentifiers::META_DATE, '01/05/2021' );
+
+            $result = ( new SermonWriter() )->write( $legacyId );
+
+            $normalized = (int) get_post_meta( $result->newId, Identifiers::META_DATE_NORMALIZED, true );
+
+            $siteMidnight = ( new \DateTimeImmutable( '2021-01-05 00:00:00', new \DateTimeZone( 'America/New_York' ) ) )->getTimestamp();
+            $utcMidnight  = strtotime( '2021-01-05 00:00:00 UTC' );
+
+            $this->assertNotSame( $utcMidnight, $siteMidnight, 'fixture sanity: site-TZ and UTC midnight must differ' );
+            $this->assertSame( $siteMidnight, $normalized, 'companion must be site-TZ midnight (TZ-anchored), not UTC midnight' );
+            $this->assertNotSame( $utcMidnight, $normalized, 'companion must NOT be UTC midnight' );
+        } finally {
+            update_option( 'timezone_string', $originalTz );
+        }
     }
 
     public function test_numeric_date_gets_no_normalized_row(): void {

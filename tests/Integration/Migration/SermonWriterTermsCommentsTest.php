@@ -455,6 +455,57 @@ final class SermonWriterTermsCommentsTest extends WP_UnitTestCase {
         $this->assertContains( (int) $adminTermId, $after, 'admin-added native term must survive a second write' );
     }
 
+    public function test_resume_empty_legacy_read_does_not_clobber_existing_assignment(): void {
+        // IMPORTANT #10: a transient EMPTY (non-WP_Error) legacy term read on a RESUME
+        // pass must NOT REPLACE-clobber a correct prior assignment already on the new
+        // post. Empty-legacy is treated as a NO-OP (not authoritative-empty) when the
+        // new post already carries a non-empty assignment for that taxonomy.
+        $legacyTermId = $this->fixture->createTerm( LegacyIdentifiers::TAX_PREACHER, 'Pastor Grace' );
+        $legacyId     = $this->bareSermon();
+        wp_set_object_terms( $legacyId, array( $legacyTermId ), LegacyIdentifiers::TAX_PREACHER );
+        ( new TermWriter() )->migrateAll();
+        $newTermId = (int) Crosswalk::findNewTermByLegacyId( $legacyTermId, Identifiers::TAX_PREACHER );
+
+        $writer = new SermonWriter();
+        $first  = $writer->write( $legacyId );
+        $this->assertSame(
+            array( $newTermId ),
+            array_map( 'intval', wp_get_object_terms( $first->newId, Identifiers::TAX_PREACHER, array( 'fields' => 'ids' ) ) ),
+            'precondition: term assigned on the new post after the fresh migration'
+        );
+
+        // Crash-inject a partial so the next write re-enters the RESUME leg, and make
+        // the legacy read transiently EMPTY for this taxonomy (a non-WP_Error empty).
+        delete_post_meta( $first->newId, Crosswalk::MIGRATION_COMPLETE );
+        wp_set_object_terms( $legacyId, array(), LegacyIdentifiers::TAX_PREACHER );
+
+        $second = $writer->write( $legacyId );
+        $this->assertTrue( $second->resumed );
+
+        // The empty legacy read must NOT have wiped the correct prior assignment.
+        $this->assertSame(
+            array( $newTermId ),
+            array_map( 'intval', wp_get_object_terms( $first->newId, Identifiers::TAX_PREACHER, array( 'fields' => 'ids' ) ) ),
+            'transient empty legacy read must not clobber an existing assignment on resume'
+        );
+    }
+
+    public function test_fresh_insert_empty_legacy_leaves_taxonomy_empty(): void {
+        // The fresh-insert counterpart of #10: with NO legacy term assignment, a
+        // freshly inserted post must have an EMPTY taxonomy (the empty read is
+        // authoritative on the fresh path — nothing to protect).
+        $legacyId = $this->bareSermon();
+        // No wpfc_preacher assignment at all.
+
+        $result = ( new SermonWriter() )->write( $legacyId );
+
+        $this->assertSame(
+            array(),
+            array_map( 'intval', wp_get_object_terms( $result->newId, Identifiers::TAX_PREACHER, array( 'fields' => 'ids' ) ) ),
+            'fresh insert with empty legacy assignment yields an empty taxonomy'
+        );
+    }
+
     public function test_open_flag_in_one_taxonomy_does_not_clobber_admin_term_in_another(): void {
         // The multi-taxonomy edge: a COMPLETE record carries an OPEN
         // missing_term_crosswalk flag in taxonomy A (series). A church admin has

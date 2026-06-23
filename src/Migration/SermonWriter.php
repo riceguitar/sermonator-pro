@@ -45,10 +45,11 @@ final class SermonWriter {
     private ?DateNormalizer $dates;
 
     public function __construct( ?DateNormalizer $dates = null ) {
-        // DateNormalizer is a pure static helper (non-instantiable); the optional
-        // instance is accepted for dependency-injection symmetry per the
-        // documented interface and is unused while normalize() is called
-        // statically (Task 13 wires the date companion rows).
+        // DateNormalizer is a pure (normally non-instantiable) helper; the optional
+        // instance is accepted for dependency-injection symmetry. When provided it is
+        // used for date-companion normalization (applyDateNormalization), otherwise
+        // the static DateNormalizer::normalize() is called. Either way the site
+        // timezone (wp_timezone()) is passed so date-only strings TZ-anchor correctly.
         $this->dates = $dates;
     }
 
@@ -104,7 +105,7 @@ final class SermonWriter {
             // never drops a prior flag (e.g. post_parent_unresolved) that this
             // resume pass does not re-derive.
             $reconciledForResume = $this->reconcileBody( $legacyId, $legacyForResume );
-            $flags               = $this->applyPostInsertSpine( $existing, $legacyId, $legacyForResume, $reconciledForResume, $this->readFlags( $existing ) );
+            $flags               = $this->applyPostInsertSpine( $existing, $legacyId, $legacyForResume, $reconciledForResume, $this->readFlags( $existing ), false );
             // COMPLETE is withheld while a comment copy is still outstanding so the
             // record stays in this resume leg and copyComments() re-runs on the next
             // write (never skip-forever on irreplaceable parishioner-authored data).
@@ -162,7 +163,7 @@ final class SermonWriter {
         }
 
         // --- Crash-safety spine: back-ref FIRST, then idempotent self-healing. ---
-        $flags = $this->applyPostInsertSpine( $newId, $legacyId, $legacy, $reconciled, $flags );
+        $flags = $this->applyPostInsertSpine( $newId, $legacyId, $legacy, $reconciled, $flags, true );
 
         // MIGRATION_COMPLETE is written LAST — after meta, terms, and comments —
         // so an abort anywhere before this point leaves a stamped-but-partial post
@@ -208,9 +209,10 @@ final class SermonWriter {
      *
      * @param array{content: string, backup: ?string, flag: bool} $reconciled
      * @param list<string>                                         $flags
+     * @param bool                                                 $fresh Whether $newId was just inserted (no prior/admin term assignment) — gates the empty-legacy term REPLACE no-op on resume.
      * @return list<string>
      */
-    private function applyPostInsertSpine( int $newId, int $legacyId, \WP_Post $legacy, array $reconciled, array $flags = array() ): array {
+    private function applyPostInsertSpine( int $newId, int $legacyId, \WP_Post $legacy, array $reconciled, array $flags = array(), bool $fresh = false ): array {
         // Back-ref FIRST, immediately after insert (unique → idempotent on resume).
         Crosswalk::markLegacy( $newId, $legacyId );
 
@@ -246,7 +248,7 @@ final class SermonWriter {
         // WP_Error records a flag (never a crash). The previously-recorded term
         // flags are dropped before re-derivation so a now-resolved term clears its
         // open missing_term_crosswalk flag on this pass.
-        $flags = $this->applyTerms( $newId, $legacyId, $flags );
+        $flags = $this->applyTerms( $newId, $legacyId, $flags, null, $fresh );
 
         // Comment copy (Task 14) — depth-first, new ids, remapped parents, stamped
         // with LEGACY_COMMENT_ID so already-copied comments are skipped (idempotent
@@ -285,7 +287,7 @@ final class SermonWriter {
      *    resume re-run produces zero duplicate / accumulated rows while preserving
      *    multi-value ordering and arity exactly;
      *  - for EVERY non-numeric sermon_date row a sermonator_date_normalized
-     *    companion (DateNormalizer::normalize, UTC-anchored) is written ALONGSIDE
+     *    companion (DateNormalizer::normalize, anchored to wp_timezone()) is written ALONGSIDE
      *    the untouched verbatim raw; numeric dates get no companion. The companion
      *    set is also delete-then-re-added (idempotent).
      *
@@ -321,7 +323,12 @@ final class SermonWriter {
             // multi-value ordering/arity, replaces single-value rows.
             delete_post_meta( $newId, $newKey );
             foreach ( $values as $value ) {
-                add_post_meta( $newId, $newKey, $value );
+                // get_post_meta(...,false) values are UNSLASHED; add_post_meta()'s
+                // add_metadata() wp_unslash()es its input, so we MUST wp_slash()
+                // here or a backslash level is stripped (UNC/audio paths, escaped
+                // quotes, serialized inner strings). wp_slash() recurses into arrays
+                // so array meta round-trips byte-exact.
+                add_post_meta( $newId, $newKey, wp_slash( $value ) );
             }
         }
 
@@ -368,11 +375,20 @@ final class SermonWriter {
                 continue; // numeric date — no companion, no flag
             }
             $sawNonNumeric = true;
-            $normalized    = DateNormalizer::normalize( $rawString );
+            // Anchor date-only strings to the SITE timezone (wp_timezone()), not the
+            // DateNormalizer UTC default — otherwise TZ-anchoring is defeated and the
+            // companion lands on UTC midnight. Honour the injected DateNormalizer
+            // instance when one was provided (DI symmetry); fall back to the static
+            // helper otherwise.
+            $normalized = null !== $this->dates
+                ? $this->dates->normalize( $rawString, wp_timezone() )
+                : DateNormalizer::normalize( $rawString, wp_timezone() );
             if ( null === $normalized ) {
                 continue; // unparseable — raw is the source of truth; still flagged
             }
-            add_post_meta( $newId, Identifiers::META_DATE_NORMALIZED, $normalized );
+            // wp_slash for consistency with the meta-write discipline (the value is
+            // an int here, but add_post_meta() unslashes its input uniformly).
+            add_post_meta( $newId, Identifiers::META_DATE_NORMALIZED, wp_slash( $normalized ) );
         }
 
         return $sawNonNumeric;
@@ -413,11 +429,19 @@ final class SermonWriter {
      * are stripped ONLY for the taxonomies being re-processed, so an open flag for a
      * taxonomy outside the scope is preserved verbatim rather than silently dropped.
      *
+     * Empty-legacy-read guard (IMPORTANT #10): on a NON-fresh pass (resume / repair)
+     * a transient empty (non-WP_Error) legacy read must NOT REPLACE-clobber a correct
+     * prior/admin assignment already on the new post. An empty legacy read is treated
+     * as a NO-OP (not authoritative-empty) whenever the new post already carries a
+     * non-empty assignment for that target taxonomy. On a FRESH insert the post has no
+     * prior assignment, so an empty read correctly leaves the taxonomy empty.
+     *
      * @param list<string>      $flags
      * @param list<string>|null  $onlyTargetTaxonomies Restrict REPLACE to these target taxonomies; null = all.
+     * @param bool               $fresh Whether $newId was just inserted (no prior/admin assignment to protect).
      * @return list<string>
      */
-    private function applyTerms( int $newId, int $legacyId, array $flags, ?array $onlyTargetTaxonomies = null ): array {
+    private function applyTerms( int $newId, int $legacyId, array $flags, ?array $onlyTargetTaxonomies = null, bool $fresh = false ): array {
         foreach ( MappingContract::taxonomyMap() as $legacyTax => $targetTax ) {
             if ( null !== $onlyTargetTaxonomies && ! in_array( $targetTax, $onlyTargetTaxonomies, true ) ) {
                 // Out of scope (no open flag) — leave its (possibly admin-curated)
@@ -431,6 +455,23 @@ final class SermonWriter {
                 continue;
             }
             $legacyTermIds = array_map( 'intval', (array) $legacyTermIds );
+
+            // IMPORTANT #10: empty-legacy-read NO-OP on a non-fresh pass. A transient
+            // empty (non-WP_Error) legacy read must not REPLACE-clobber a correct
+            // prior/admin assignment already on the new post. If the legacy read is
+            // empty AND this is NOT a fresh insert AND the new post already carries a
+            // non-empty assignment for this taxonomy, treat the empty read as a no-op
+            // (not authoritative-empty) and leave the existing assignment intact. On a
+            // fresh insert the post has no prior assignment, so an empty read correctly
+            // results in an empty taxonomy.
+            if ( array() === $legacyTermIds && ! $fresh ) {
+                $existingAssigned = wp_get_object_terms( $newId, $targetTax, array( 'fields' => 'ids' ) );
+                if ( ! is_wp_error( $existingAssigned ) && array() !== array_map( 'intval', (array) $existingAssigned ) ) {
+                    // Existing assignment present — do not clobber it with an empty
+                    // REPLACE. Leave any flags for this taxonomy untouched as well.
+                    continue;
+                }
+            }
 
             // Drop this taxonomy's stale term flags so this pass re-derives them
             // from scratch — a term that has since been migrated must clear its open
