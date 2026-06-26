@@ -44,6 +44,7 @@ final class Plugin {
         ( new \Sermonator\Model\Capabilities() )->grant();
         ( new \Sermonator\Admin\Authoring\AuthoringServiceProvider() )->hook();
         ( new \Sermonator\Admin\SettingsRegistrar() )->hook();
+        ( new \Sermonator\Admin\DisplaySettingsRegistrar() )->hook();
         // Bible parse-coverage ground-truth audit. All-contexts on purpose: the daily
         // recompute cron (EVENT_HOOK) and the on-save recompute (save_post_<sermon>)
         // must fire outside admin, and the site_status_tests filter is a harmless pure

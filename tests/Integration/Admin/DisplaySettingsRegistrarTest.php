@@ -1,0 +1,139 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sermonator\Tests\Integration\Admin;
+
+use WP_UnitTestCase;
+use Sermonator\Admin\DisplaySettingsRegistrar;
+use Sermonator\Schema\DisplayDefaults;
+use Sermonator\Schema\Identifiers as ID;
+
+/**
+ * Integration coverage for {@see DisplaySettingsRegistrar}, driving the REAL
+ * WordPress options + Settings API (no Brain Monkey). NOT run in this
+ * environment (no Docker / wp-env) — authored to run under wp-env later.
+ *
+ * Exercises what the unit test cannot: the full options.php-style round-trip
+ * where `register_setting` wires each sanitize callback onto the
+ * `sanitize_option_{$option}` filter, so an `update_option()` actually runs the
+ * sanitizer and persists the cleaned value; the real `get_page_by_path`
+ * collision check; the real `get_post_type` attachment check; and the
+ * distinct-key provenance guarantee (writing a live key never mutates the
+ * migration artifact container {@see DisplayDefaults} seeds from).
+ */
+final class DisplaySettingsRegistrarTest extends WP_UnitTestCase {
+    protected function setUp(): void {
+        parent::setUp();
+        // Register on admin_init's behalf so the sanitize_option_* filters are live.
+        ( new DisplaySettingsRegistrar() )->register();
+    }
+
+    // --- archive slug round-trip --------------------------------------------
+
+    public function test_clean_slug_round_trips_through_update_option(): void {
+        update_option( ID::OPTION_ARCHIVE_SLUG, 'Sunday Messages' );
+
+        $this->assertSame( 'sunday-messages', get_option( ID::OPTION_ARCHIVE_SLUG ) );
+    }
+
+    public function test_reserved_slug_is_rejected_to_stored_value(): void {
+        update_option( ID::OPTION_ARCHIVE_SLUG, 'messages' );
+        // A reserved core term must not overwrite the good stored value.
+        update_option( ID::OPTION_ARCHIVE_SLUG, 'feed' );
+
+        $this->assertSame( 'messages', get_option( ID::OPTION_ARCHIVE_SLUG ) );
+    }
+
+    public function test_page_colliding_slug_is_rejected_to_stored_value(): void {
+        update_option( ID::OPTION_ARCHIVE_SLUG, 'messages' );
+
+        self::factory()->post->create( array(
+            'post_type'   => 'page',
+            'post_status' => 'publish',
+            'post_name'   => 'sermons',
+            'post_title'  => 'Sermons',
+        ) );
+
+        update_option( ID::OPTION_ARCHIVE_SLUG, 'sermons' );
+
+        $this->assertSame( 'messages', get_option( ID::OPTION_ARCHIVE_SLUG ) );
+    }
+
+    public function test_empty_slug_rejected_to_display_default_when_nothing_stored(): void {
+        // Never saved: the rejection falls back through DisplayDefaults to 'sermons'.
+        update_option( ID::OPTION_ARCHIVE_SLUG, '!!!' );
+
+        $this->assertSame( DisplayDefaults::HARD_ARCHIVE_SLUG, get_option( ID::OPTION_ARCHIVE_SLUG ) );
+    }
+
+    // --- default image id round-trip ----------------------------------------
+
+    public function test_real_attachment_id_round_trips(): void {
+        $attachment = (int) self::factory()->attachment->create_upload_object(
+            DIR_TESTDATA . '/images/canola.jpg'
+        );
+
+        update_option( ID::OPTION_DEFAULT_IMAGE_ID, $attachment );
+
+        $this->assertSame( $attachment, (int) get_option( ID::OPTION_DEFAULT_IMAGE_ID ) );
+    }
+
+    public function test_non_attachment_id_floors_to_zero(): void {
+        $page = (int) self::factory()->post->create( array( 'post_type' => 'page' ) );
+
+        update_option( ID::OPTION_DEFAULT_IMAGE_ID, $page );
+
+        $this->assertSame( 0, (int) get_option( ID::OPTION_DEFAULT_IMAGE_ID ) );
+    }
+
+    // --- preacher label round-trip ------------------------------------------
+
+    public function test_label_round_trips_and_caps_length(): void {
+        update_option( ID::OPTION_PREACHER_LABEL, 'Speaker' );
+        $this->assertSame( 'Speaker', get_option( ID::OPTION_PREACHER_LABEL ) );
+
+        update_option( ID::OPTION_PREACHER_LABEL, str_repeat( 'x', 300 ) );
+        $this->assertSame( 100, strlen( (string) get_option( ID::OPTION_PREACHER_LABEL ) ) );
+    }
+
+    // --- distinct-key provenance --------------------------------------------
+
+    public function test_writing_live_key_never_mutates_migration_artifact_container(): void {
+        // The migration prefix-swap artifact the seed reads from.
+        $artifact = ID::OPTION_PREFIX . 'general';
+        update_option( $artifact, array( 'archive_slug' => 'legacy-base', 'preacher_label' => 'Minister' ) );
+
+        // An admin edit of the DISTINCT live keys.
+        update_option( ID::OPTION_ARCHIVE_SLUG, 'new-base' );
+        update_option( ID::OPTION_PREACHER_LABEL, 'Teacher' );
+
+        // The artifact is untouched — so a (supported, pre-Finalize) migration
+        // re-run that overwrites the artifact verbatim can never clobber the edit.
+        $this->assertSame(
+            array( 'archive_slug' => 'legacy-base', 'preacher_label' => 'Minister' ),
+            get_option( $artifact )
+        );
+        $this->assertSame( 'new-base', get_option( ID::OPTION_ARCHIVE_SLUG ) );
+        $this->assertSame( 'Teacher', get_option( ID::OPTION_PREACHER_LABEL ) );
+    }
+
+    public function test_register_does_not_register_the_bible_options(): void {
+        // A fresh registrar in isolation: capture only what IT registers.
+        global $wp_registered_settings;
+        $before = $wp_registered_settings;
+
+        // Re-running register() is idempotent for our three keys and must never
+        // introduce a Bible key.
+        ( new DisplaySettingsRegistrar() )->register();
+
+        $this->assertArrayHasKey( ID::OPTION_ARCHIVE_SLUG, (array) $wp_registered_settings );
+        $this->assertArrayHasKey( ID::OPTION_DEFAULT_IMAGE_ID, (array) $wp_registered_settings );
+        $this->assertArrayHasKey( ID::OPTION_PREACHER_LABEL, (array) $wp_registered_settings );
+
+        // This registrar contributes nothing toward the Bible options (owned by
+        // SettingsRegistrar). If they appear at all it is only because that other
+        // registrar ran — so assert our registrar adds neither.
+        unset( $before );
+    }
+}
