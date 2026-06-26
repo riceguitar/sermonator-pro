@@ -35,6 +35,48 @@ final class Renderer {
         return '<dl class="sermonator-meta">' . $rows . '</dl>';
     }
 
+    /**
+     * Render the resolved scripture references as a dedicated section.
+     *
+     * PURE, like every method here: a {@see SermonView} plus an already-resolved
+     * {@see ResolvedScripture} in, an escaped HTML string out. ALL resolution
+     * (option reads, meta reads, validation) happens OUTSIDE this method, in the
+     * impure {@see BibleResolver} called at template time.
+     *
+     * Fail-open contract: `null` (or an empty ResolvedScripture) → '' so the
+     * existing escaped meta() "Scripture" row stays byte-identical and this
+     * feature can never ship a regression. meta() is UNCHANGED — this is an
+     * additive section, NOT a meta-row mutation.
+     *
+     * Phase 3a is LINK mode: per ref, an `<a>` to the axis-A link version
+     * (Bible Gateway) plus a visible version badge (e.g. "(ESV)") that exists
+     * ONLY on this resolved path. Every leaf is escaped here (esc_html / esc_url);
+     * the markup is constructed tag-by-tag — never wp_kses, which is for
+     * untrusted stored HTML, not values we build ourselves.
+     */
+    public function scripture( SermonView $v, ?ResolvedScripture $s ): string {
+        unset( $v ); // Part of the pure contract (SermonView in); unused in link mode.
+
+        if ( $s === null || $s->isEmpty() ) {
+            return '';
+        }
+
+        $items = '';
+        foreach ( $s->refs() as $ref ) {
+            $items .= '<li class="sermonator-scripture__ref">'
+                . '<a class="sermonator-scripture__link" href="' . esc_url( $ref['linkUrl'] ) . '">'
+                . esc_html( $ref['label'] )
+                . '</a>'
+                . ' <span class="sermonator-scripture__version">(' . esc_html( $ref['version'] ) . ')</span>'
+                . '</li>';
+        }
+
+        return '<section class="sermonator-scripture">'
+            . '<h2 class="sermonator-scripture__heading">' . esc_html__( 'Scripture', 'sermonator' ) . '</h2>'
+            . '<ul class="sermonator-scripture__list">' . $items . '</ul>'
+            . '</section>';
+    }
+
     public function audioPlayer( SermonView $v ): string {
         if ( $v->audioUrl === '' ) {
             return '';

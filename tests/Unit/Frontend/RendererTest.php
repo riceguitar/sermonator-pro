@@ -8,6 +8,7 @@ use PHPUnit\Framework\TestCase;
 use Brain\Monkey;
 use Brain\Monkey\Functions;
 use Sermonator\Frontend\Renderer;
+use Sermonator\Frontend\ResolvedScripture;
 use Sermonator\Frontend\SermonView;
 
 final class RendererTest extends TestCase {
@@ -180,5 +181,75 @@ final class RendererTest extends TestCase {
         $this->assertStringContainsString( 'http://x/notes.pdf', $html );
         $this->assertStringContainsString( 'Download sermon notes', $html );
         $this->assertStringContainsString( 'download', $html );
+    }
+
+    public function test_scripture_null_renders_nothing(): void {
+        // Fail-open: null leaves today's escaped meta row byte-identical.
+        $this->assertSame( '', ( new Renderer() )->scripture( $this->view(), null ) );
+    }
+
+    public function test_scripture_empty_resolution_renders_nothing(): void {
+        $this->assertSame( '', ( new Renderer() )->scripture( $this->view(), new ResolvedScripture( array() ) ) );
+    }
+
+    public function test_scripture_renders_link_label_and_version_badge(): void {
+        $resolved = new ResolvedScripture( array(
+            array(
+                'label'          => 'John 3:16',
+                'linkUrl'        => 'https://www.biblegateway.com/passage/?search=John%203%3A16&version=ESV',
+                'version'        => 'ESV',
+                'inlineEligible' => false,
+            ),
+        ) );
+
+        $html = ( new Renderer() )->scripture( $this->view(), $resolved );
+
+        $this->assertStringContainsString( 'sermonator-scripture', $html );
+        $this->assertStringContainsString(
+            '<a class="sermonator-scripture__link" href="https://www.biblegateway.com/passage/?search=John%203%3A16&version=ESV">John 3:16</a>',
+            $html
+        );
+        // The version badge exists ONLY on the resolved path.
+        $this->assertStringContainsString( '<span class="sermonator-scripture__version">(ESV)</span>', $html );
+    }
+
+    public function test_scripture_renders_one_item_per_ref(): void {
+        $resolved = new ResolvedScripture( array(
+            array( 'label' => 'John 3:16', 'linkUrl' => 'http://x/a', 'version' => 'ESV', 'inlineEligible' => false ),
+            array( 'label' => 'Matthew 5:1-7:29', 'linkUrl' => 'http://x/b', 'version' => 'ESV', 'inlineEligible' => false ),
+        ) );
+
+        $html = ( new Renderer() )->scripture( $this->view(), $resolved );
+
+        $this->assertSame( 2, substr_count( $html, 'sermonator-scripture__ref' ) );
+        $this->assertStringContainsString( 'Matthew 5:1-7:29', $html );
+    }
+
+    public function test_scripture_escapes_label_url_and_badge(): void {
+        // Real escaping (not returnArg) so we can prove nothing reaches output raw.
+        Functions\when( 'esc_html' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+        Functions\when( 'esc_url' )->alias(
+            static fn( $s ) => str_replace( array( '"', '<', '>' ), array( '%22', '%3C', '%3E' ), (string) $s )
+        );
+        Functions\when( 'esc_html__' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+
+        $resolved = new ResolvedScripture( array(
+            array(
+                'label'          => 'Evil <script>alert(1)</script>',
+                'linkUrl'        => 'http://x/"><script>',
+                'version'        => '<b>ESV</b>',
+                'inlineEligible' => false,
+            ),
+        ) );
+
+        $html = ( new Renderer() )->scripture( $this->view(), $resolved );
+
+        // No raw unescaped markup from any dynamic value reached the output.
+        $this->assertStringNotContainsString( '<script>', $html );
+        $this->assertStringNotContainsString( '"><script>', $html );
+        $this->assertStringNotContainsString( '<b>ESV</b>', $html );
+        // The escaped forms are present.
+        $this->assertStringContainsString( '&lt;script&gt;', $html );
+        $this->assertStringContainsString( '&lt;b&gt;ESV&lt;/b&gt;', $html );
     }
 }

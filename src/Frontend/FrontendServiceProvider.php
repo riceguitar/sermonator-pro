@@ -14,6 +14,7 @@ use Sermonator\Frontend\Blocks\SermonCardBlock;
 use Sermonator\Frontend\Blocks\SermonGridBlock;
 use Sermonator\Frontend\Blocks\TaxonomyFilterBlock;
 use Sermonator\Frontend\Blocks\PodcastSubscribeBlock;
+use Sermonator\Frontend\Bible\ScriptureRenderHook;
 use Sermonator\Frontend\Feed\PodcastFeed;
 use Sermonator\Frontend\Feed\LegacyFeedRouter;
 use Sermonator\Frontend\Compat\LegacyShortcodes;
@@ -35,6 +36,7 @@ final class FrontendServiceProvider {
     public function hook(): void {
         add_action( 'init', array( $this, 'onInit' ) );
         ( new ClassicTemplates() )->hook();
+        ( new ScriptureRenderHook() )->hook();
         ( new ArchiveOrdering() )->hook();
         ( new Shortcode() )->hook();
         ( new LegacyShortcodes() )->hook();
