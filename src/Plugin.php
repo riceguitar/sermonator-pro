@@ -43,6 +43,13 @@ final class Plugin {
         ( new \Sermonator\Model\Registrar() )->hook();
         ( new \Sermonator\Model\Capabilities() )->grant();
         ( new \Sermonator\Admin\Authoring\AuthoringServiceProvider() )->hook();
+        ( new \Sermonator\Admin\SettingsRegistrar() )->hook();
+        // Bible parse-coverage ground-truth audit. All-contexts on purpose: the daily
+        // recompute cron (EVENT_HOOK) and the on-save recompute (save_post_<sermon>)
+        // must fire outside admin, and the site_status_tests filter is a harmless pure
+        // reader everywhere. Without this wiring OPTION_BIBLE_STATS is never computed
+        // and the Site Health test never appears.
+        ( new \Sermonator\Bible\CoverageAudit() )->hook();
 
         self::registerAdmin();
         self::registerFrontend();
@@ -90,5 +97,6 @@ final class Plugin {
         }
         \WP_CLI::add_command( 'sermonator migration', \Sermonator\Cli\MigrationCommand::class );
         \WP_CLI::add_command( 'sermonator audio', \Sermonator\Cli\AudioCommand::class );
+        \WP_CLI::add_command( 'sermonator bible', \Sermonator\Cli\BibleCommand::class );
     }
 }

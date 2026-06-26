@@ -12,6 +12,7 @@ final class AuthoringServiceProvider {
 	private SermonMetaRegistrar $metaRegistrar;
 	private AudioMetaController $audioController;
 	private SermonDateNormalizer $dateNormalizer;
+	private SermonRefsCapture $refsCapture;
 	private SermonMetaRestSanitizer $metaRestSanitizer;
 	private SermonMetaBox $metaBox;
 
@@ -20,11 +21,13 @@ final class AuthoringServiceProvider {
 		?AudioMetaController $audioController = null,
 		?SermonDateNormalizer $dateNormalizer = null,
 		?SermonMetaRestSanitizer $metaRestSanitizer = null,
-		?SermonMetaBox $metaBox = null
+		?SermonMetaBox $metaBox = null,
+		?SermonRefsCapture $refsCapture = null
 	) {
 		$this->metaRegistrar     = $metaRegistrar ?? new SermonMetaRegistrar();
 		$this->audioController   = $audioController ?? new AudioMetaController();
 		$this->dateNormalizer    = $dateNormalizer ?? new SermonDateNormalizer();
+		$this->refsCapture       = $refsCapture ?? new SermonRefsCapture();
 		$this->metaRestSanitizer = $metaRestSanitizer ?? new SermonMetaRestSanitizer();
 		$this->metaBox           = $metaBox ?? new SermonMetaBox();
 	}
@@ -47,6 +50,7 @@ final class AuthoringServiceProvider {
 
 		$this->metaRestSanitizer->hook();
 		$this->dateNormalizer->hook();
+		$this->refsCapture->hook();
 		$this->metaBox->hook();
 	}
 }
