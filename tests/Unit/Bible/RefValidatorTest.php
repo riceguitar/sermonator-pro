@@ -6,6 +6,7 @@ namespace Sermonator\Tests\Unit\Bible;
 
 use PHPUnit\Framework\TestCase;
 use Sermonator\Bible\RefValidator;
+use Sermonator\Schema\BibleBookMap;
 
 /**
  * RefValidator is pure: it gates a parsed Ref to render-readiness. inlineEligible
@@ -68,6 +69,59 @@ final class RefValidatorTest extends TestCase {
         $this->assertFalse( $result['inlineEligible'] );
     }
 
+    public function test_cross_chapter_range_with_descending_end_verse_is_structurally_valid(): void {
+        // John 7:53-8:11 (pericope adulterae): verseEnd (11) belongs to chapterEnd
+        // (8), a DIFFERENT chapter than verseStart (53, in chapter 7). Verse numbers
+        // reset each chapter, so 11 < 53 is legitimate, NOT descending. The
+        // cross-chapter case is first-class lossless (§3), so it must stay valid.
+        $result = RefValidator::validate(
+            $this->ref(
+                array(
+                    'bookUSFM'     => 'JHN',
+                    'chapterStart' => 7,
+                    'verseStart'   => 53,
+                    'verseEnd'     => 11,
+                    'chapterEnd'   => 8,
+                )
+            )
+        );
+        $this->assertTrue( $result['structurallyValid'] );
+        // Still link-only (cross-chapter is never inline-eligible), but not dropped.
+        $this->assertFalse( $result['inlineEligible'] );
+    }
+
+    public function test_descending_chapter_end_is_structurally_invalid(): void {
+        // chapterEnd < chapterStart remains a real descending range -> invalid.
+        $result = RefValidator::validate(
+            $this->ref(
+                array(
+                    'bookUSFM'     => 'MAT',
+                    'chapterStart' => 7,
+                    'verseStart'   => 1,
+                    'verseEnd'     => 29,
+                    'chapterEnd'   => 5,
+                )
+            )
+        );
+        $this->assertFalse( $result['structurallyValid'] );
+    }
+
+    public function test_verse_end_without_verse_start_is_structurally_invalid(): void {
+        // A dangling end-verse with no start (even cross-chapter) is malformed.
+        $result = RefValidator::validate(
+            $this->ref(
+                array(
+                    'bookUSFM'     => 'JHN',
+                    'chapterStart' => 7,
+                    'verseStart'   => null,
+                    'verseEnd'     => 11,
+                    'chapterEnd'   => 8,
+                )
+            )
+        );
+        $this->assertFalse( $result['structurallyValid'] );
+    }
+
     public function test_psalm_9_is_not_inline_eligible_versification_divergent(): void {
         $result = RefValidator::validate(
             $this->ref(
@@ -123,6 +177,22 @@ final class RefValidatorTest extends TestCase {
         $this->assertContains( 12, $zones['REV'] );
         $this->assertContains( 13, $zones['REV'] );
         $this->assertArrayHasKey( 'ACT', $zones );
+    }
+
+    public function test_every_divergent_zone_key_is_a_canonical_usfm_code(): void {
+        // Drift guard: a typo'd zone key (e.g. 'PSM' for 'PSA') would silently make
+        // isVersificationDivergent() never match, re-enabling inline rendering in a
+        // zone the #1 standard says must be suppressed. Every key MUST be a real
+        // USFM code, mirroring BibleBookMap's own drift-guard discipline.
+        $canonical = array_values( BibleBookMap::usfm() );
+
+        foreach ( array_keys( RefValidator::divergentZones() ) as $book ) {
+            $this->assertContains(
+                $book,
+                $canonical,
+                "Divergent-zone key '{$book}' is not a canonical USFM code"
+            );
+        }
     }
 
     public function test_is_versification_divergent_helper(): void {

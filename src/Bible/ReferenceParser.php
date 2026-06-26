@@ -78,7 +78,13 @@ final class ReferenceParser {
                 if ( null === $ref ) {
                     // Book matched but no usable chapter (e.g. a bare book name): we
                     // cannot form a linkable reference, so it survives as plain text.
-                    $segments[] = self::fallbackSegment( $segmentRaw );
+                    // Still adopt it as the new carry-over context — the author named
+                    // this book, so a following bare number must resolve under IT, not
+                    // be silently mis-attributed to the prior book (never-fail-wrong).
+                    $currentBook     = $book;
+                    $currentChapter  = null;
+                    $lastRefHadVerse = false;
+                    $segments[]      = self::fallbackSegment( $segmentRaw );
                     continue;
                 }
 

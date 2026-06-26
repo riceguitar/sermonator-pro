@@ -151,6 +151,29 @@ final class ReferenceParserTest extends TestCase {
         $this->assertSame( array(), $result['segments'][1]['refs'] );
     }
 
+    public function test_bare_book_name_resets_carry_over_context(): void {
+        // 'Ps 23, John, 3:16': the bare 'John' segment matches a book head but has
+        // no numeric tail. It MUST become the new carry-over context so the trailing
+        // '3:16' resolves under JHN, never silently mis-attributed to the prior PSA.
+        $result = ReferenceParser::parse( 'Ps 23, John, 3:16' );
+
+        $this->assertCount( 3, $result['segments'] );
+
+        // Ps 23 -> PSA 23.
+        $this->assertSame( 'matched', $result['segments'][0]['status'] );
+        $this->assertSame( 'PSA', $result['segments'][0]['refs'][0]['bookUSFM'] );
+
+        // Bare 'John' -> fallback (no linkable chapter yet), but resets context.
+        $this->assertSame( 'fallback', $result['segments'][1]['status'] );
+        $this->assertSame( 'John', $result['segments'][1]['raw'] );
+
+        // 3:16 -> resolves under JHN, NOT PSA.
+        $this->assertSame( 'matched', $result['segments'][2]['status'] );
+        $this->assertSame( 'JHN', $result['segments'][2]['refs'][0]['bookUSFM'] );
+        $this->assertSame( 3, $result['segments'][2]['refs'][0]['chapterStart'] );
+        $this->assertSame( 16, $result['segments'][2]['refs'][0]['verseStart'] );
+    }
+
     public function test_matched_segment_preserves_its_raw_text(): void {
         $result = ReferenceParser::parse( 'John 3:16' );
 

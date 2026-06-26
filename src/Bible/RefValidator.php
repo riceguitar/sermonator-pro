@@ -132,10 +132,18 @@ final class RefValidator {
             return false;
         }
 
-        if ( null !== $verseEnd ) {
-            if ( null === $verseStart || $verseEnd < $verseStart ) {
-                return false;
-            }
+        // An end-verse with no start-verse is always malformed.
+        if ( null !== $verseEnd && null === $verseStart ) {
+            return false;
+        }
+
+        // The verseEnd < verseStart guard only applies WITHIN a single chapter.
+        // For a cross-chapter range (chapterEnd set), verseEnd belongs to chapterEnd
+        // — a different chapter — and verse numbers reset each chapter, so a smaller
+        // end-verse (e.g. John 7:53-8:11) is legitimate. Cross-chapter ordering is
+        // covered by the chapterEnd < chapterStart check below.
+        if ( null !== $verseEnd && null === $chapterEnd && $verseEnd < $verseStart ) {
+            return false;
         }
 
         if ( null !== $chapterEnd && $chapterEnd < $chapterStart ) {
