@@ -43,12 +43,12 @@ use Sermonator\Frontend\Feed\ItunesCategory;
  * reversible (it only ever narrows/cleans values; it never drops a key or invents data), and gated
  * behind `manage_options`.
  *
- * @todo TRACKING (Bundle 4 Task 7/8): {@see self::register()} is NOT yet hooked anywhere in
- *       production — the admin write surface (PodcastIdentityController / SettingsPage) that boots
- *       this bundle MUST call it on `init` (front end + admin, mirroring
- *       {@see \Sermonator\Admin\Authoring\SermonMetaRegistrar} via AuthoringServiceProvider), or
- *       the auth/sanitize governance stays inert. Wiring is deliberately deferred to those tasks
- *       so it lands with the phase-gated controller, not split across commits.
+ * WIRING (Bundle 4 Task 7): {@see self::register()} is hooked on `init` UNCONDITIONALLY in
+ * {@see \Sermonator\Plugin::boot()} (NOT the admin-only registerAdmin()), mirroring
+ * {@see \Sermonator\Admin\Authoring\SermonMetaRegistrar} via AuthoringServiceProvider. It must run
+ * in front-end + cron + admin contexts because the governance guards the feed read path and the
+ * migration's own add_post_meta() — neither runs under is_admin() — so the admin-only SettingsPage
+ * (add_submenu_page-scoped) cannot host it.
  */
 final class PodcastMetaSchema {
     /** A free-text single-line value (sanitize_text_field). */

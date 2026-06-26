@@ -52,6 +52,14 @@ final class Plugin {
         // never pays the flush. The live key is DISTINCT from the migration
         // prefix-swap artifact, so a verbatim migration re-run never fires it.
         ( new \Sermonator\Frontend\SlugRewriteFlusher() )->hook();
+        // Podcast-settings post-meta governance (auth_callback manage_options +
+        // sanitize-at-write allowlist). Registered on init in ALL contexts — NOT in
+        // the admin-only registerAdmin() — because the governance must guard the
+        // front-end/cron feed read path and the migration's own add_post_meta()
+        // writes, neither of which run under is_admin(). SettingsPage (Task 8) is
+        // add_submenu_page-scoped and cannot host this. show_in_rest=false closes
+        // the REST vector; register_post_meta is idempotent (a second call overwrites).
+        add_action( 'init', static fn() => \Sermonator\Schema\PodcastMetaSchema::register() );
         // Bible parse-coverage ground-truth audit. All-contexts on purpose: the daily
         // recompute cron (EVENT_HOOK) and the on-save recompute (save_post_<sermon>)
         // must fire outside admin, and the site_status_tests filter is a harmless pure
