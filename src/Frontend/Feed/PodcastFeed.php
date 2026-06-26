@@ -79,6 +79,7 @@ final class PodcastFeed {
     private function items(): array {
         $result   = ( new SermonQuery() )->run( array( 'perPage' => self::MAX_ITEMS ) );
         $resolver = new EnclosureResolver();
+        $snapshot = new \Sermonator\Migration\LegacyFeedSnapshot();
 
         if ( $result->total > self::MAX_ITEMS ) {
             // Observable, not silent: older episodes beyond the cap are not in the feed.
@@ -94,7 +95,7 @@ final class PodcastFeed {
             $items[] = new FeedItem(
                 title:        $view->title,
                 link:         $view->permalink,
-                guid:         'sermonator-' . $view->id,
+                guid:         $snapshot->guidFor( $view->id ) ?? ( 'sermonator-' . $view->id ),
                 description:  $this->description( $view->id ),
                 pubTimestamp: $view->preachedTimestamp ?? (int) get_post_time( 'U', true, $view->id ),
                 audioUrl:     $enc['url'],
