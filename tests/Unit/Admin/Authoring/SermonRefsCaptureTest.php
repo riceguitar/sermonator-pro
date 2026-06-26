@@ -63,6 +63,10 @@ namespace Sermonator\Tests\Unit\Admin\Authoring {
                 $this->meta[ (int) $id ][ $key ] = $value;
                 return true;
             } );
+            Functions\when( 'delete_post_meta' )->alias( function ( $id, $key ) {
+                unset( $this->meta[ (int) $id ][ $key ] );
+                return true;
+            } );
             Functions\when( 'wp_get_object_terms' )->justReturn( array() );
             Functions\when( 'wp_set_object_terms' )->justReturn( array() );
         }
@@ -131,6 +135,31 @@ namespace Sermonator\Tests\Unit\Admin\Authoring {
             ( new SermonRefsCapture() )->capture( $this->postId, $post );
 
             $this->assertArrayNotHasKey( ID::META_BIBLE_REFS, $this->meta[ $this->postId ] );
+        }
+
+        /**
+         * Fix 2 regression: on the EDITABLE authoring surface a previously stamped
+         * UNPARSEABLE sentinel must not become a permanent trap. After an author
+         * corrects a typo'd passage to a valid reference and re-saves, the stale
+         * sentinel is cleared so the producer re-evaluates the current passage and
+         * finally writes the structured envelope (the backfill's frozen-data
+         * idempotency is unaffected — it never clears the sentinel first).
+         */
+        public function test_corrected_passage_clears_stale_sentinel_and_captures(): void {
+            // Author first saved a passage that parsed to zero refs -> sentinel stamped.
+            $this->meta[ $this->postId ][ ID::META_BIBLE_REFS_UNPARSEABLE ] = '1';
+            // ...then corrected the passage to a valid reference (seeded 'John 3:16').
+
+            ( new SermonRefsCapture() )->capture( $this->postId, $this->post() );
+
+            $this->assertArrayNotHasKey(
+                ID::META_BIBLE_REFS_UNPARSEABLE,
+                $this->meta[ $this->postId ],
+                'Stale sentinel is cleared on an authoring re-save.'
+            );
+            $envelope = $this->envelope();
+            $this->assertNotEmpty( $envelope, 'Corrected passage now produces a structured envelope.' );
+            $this->assertSame( 'JHN', $envelope['refs'][0]['bookUSFM'] );
         }
     }
 }

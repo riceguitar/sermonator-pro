@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Sermonator\Tests\Integration\Admin\Authoring;
 
 use WP_UnitTestCase;
+use Sermonator\Admin\Authoring\SermonMetaBox;
 use Sermonator\Schema\Identifiers as ID;
 
 /**
@@ -58,6 +59,27 @@ final class SermonRefsCaptureTest extends WP_UnitTestCase {
         return $id;
     }
 
+    /**
+     * Drive a passage through the CLASSIC full-page metabox POST flow: the passage is
+     * NOT pre-seeded as meta — it is submitted in the metabox JSON blob and persisted
+     * by SermonMetaBox::save() during the SAME save_post pass that SermonRefsCapture
+     * runs in. This is the Fix 1 path: SermonMetaBox::save() binds save_post at
+     * priority 10 and SermonRefsCapture::capture() at priority 20, so the just-saved
+     * passage is visible to the capture on the first save (no second save required).
+     */
+    private function authorViaMetaBox( int $id, string $passage ): void {
+        $_POST['sermonator_meta_box_nonce'] = wp_create_nonce( SermonMetaBox::NONCE_ACTION );
+        $_POST['sermonator_meta_json']      = wp_slash( (string) wp_json_encode( array(
+            ID::META_BIBLE_PASSAGE => $passage,
+        ) ) );
+
+        // wp_update_post fires save_post_sermonator_sermon -> metaBox::save (p10)
+        // persists the submitted passage -> refsCapture::capture (p20) reads it.
+        wp_update_post( array( 'ID' => $id, 'post_title' => 'Authored via metabox' ) );
+
+        unset( $_POST['sermonator_meta_box_nonce'], $_POST['sermonator_meta_json'] );
+    }
+
     public function test_authoring_save_fills_refs_and_book_terms(): void {
         $id = $this->authorSermon( 'John 3:16; Romans 8:28' );
 
@@ -97,5 +119,60 @@ final class SermonRefsCaptureTest extends WP_UnitTestCase {
 
         $refs = $this->refs( $id );
         $this->assertSame( 'JHN', $refs[0]['bookUSFM'], 'First-captured envelope is preserved.' );
+    }
+
+    /**
+     * Fix 1 regression: the structured envelope must appear on the SAME save that
+     * submits the passage through the classic metabox form — NOT only on a second
+     * save. The earlier authorSermon() helper pre-seeds the passage meta before
+     * wp_update_post, which CANNOT catch the priority-ordering bug; this helper
+     * submits the passage in the metabox blob so SermonMetaBox::save (p10) must run
+     * before SermonRefsCapture::capture (p20) within one save_post pass.
+     */
+    public function test_metabox_save_fills_refs_on_same_save(): void {
+        $id = (int) self::factory()->post->create( array(
+            'post_type'   => ID::POST_TYPE_SERMON,
+            'post_status' => 'publish',
+        ) );
+        // No passage meta exists yet — it arrives only via the metabox POST blob.
+        $this->assertSame( '', get_post_meta( $id, ID::META_BIBLE_PASSAGE, true ) );
+
+        $this->authorViaMetaBox( $id, 'John 3:16; Romans 8:28' );
+
+        // The passage was persisted by the metabox AND captured into the envelope on
+        // the one save (priority 20 sees the priority-10 write).
+        $this->assertSame( 'John 3:16; Romans 8:28', get_post_meta( $id, ID::META_BIBLE_PASSAGE, true ) );
+        $refs = $this->refs( $id );
+        $this->assertCount( 2, $refs, 'Envelope captured on the first metabox save.' );
+        $this->assertSame( 'authoring', $refs[0]['source'] );
+        $this->assertEqualsCanonicalizing( array( 'John', 'Romans' ), $this->bookTermNames( $id ) );
+    }
+
+    /**
+     * Fix 2 regression: a stamped UNPARSEABLE sentinel must not permanently trap an
+     * EDITABLE passage. An author first saves a passage that parses to zero refs
+     * (sentinel stamped, envelope empty); after correcting it to a valid reference and
+     * re-saving, the stale sentinel is cleared and the structured envelope is finally
+     * produced. (The frozen-data backfill path keeps its in-producer idempotency — it
+     * never clears the sentinel first.)
+     */
+    public function test_corrected_passage_recovers_from_sentinel(): void {
+        $id = (int) self::factory()->post->create( array(
+            'post_type'   => ID::POST_TYPE_SERMON,
+            'post_status' => 'publish',
+        ) );
+
+        // First save: a non-parseable passage stamps the sentinel, no envelope.
+        $this->authorViaMetaBox( $id, 'see bulletin' );
+        $this->assertSame( '1', get_post_meta( $id, ID::META_BIBLE_REFS_UNPARSEABLE, true ) );
+        $this->assertSame( '', get_post_meta( $id, ID::META_BIBLE_REFS, true ) );
+
+        // Correction re-save: sentinel cleared, structured envelope produced.
+        $this->authorViaMetaBox( $id, 'John 3:16' );
+        $this->assertSame( '', get_post_meta( $id, ID::META_BIBLE_REFS_UNPARSEABLE, true ), 'Stale sentinel cleared.' );
+        $refs = $this->refs( $id );
+        $this->assertCount( 1, $refs, 'Corrected passage now captures structured refs.' );
+        $this->assertSame( 'JHN', $refs[0]['bookUSFM'] );
+        $this->assertEqualsCanonicalizing( array( 'John' ), $this->bookTermNames( $id ) );
     }
 }

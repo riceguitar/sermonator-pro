@@ -44,10 +44,20 @@ final class SermonRefsCapture {
     }
 
     public function hook(): void {
+        // Priority 20 — AFTER SermonMetaBox::save() (priority 10) on the classic
+        // full-page POST path. The submitted passage is one of the metabox's
+        // editableMetaKeys, so it is only persisted once SermonMetaBox::save() runs;
+        // capturing at the same priority (and registered earlier) would read a stale
+        // passage and noop, forcing a second save before the envelope appears. Unlike
+        // SermonDateNormalizer (whose input, the publish date, already exists on the
+        // WP_Post before any save_post handler), refsCapture's input is written by a
+        // sibling handler — so it must run after it. The rest_after_insert path needs
+        // no ordering fix: META_BIBLE_PASSAGE is REST-registered and already persisted
+        // by the time rest_after_insert fires.
         add_action(
             'save_post_' . Identifiers::POST_TYPE_SERMON,
             array( $this, 'capture' ),
-            10,
+            20,
             2
         );
         add_action(
@@ -79,6 +89,20 @@ final class SermonRefsCapture {
         if ( ! current_user_can( 'edit_post', $post_id ) ) {
             return;
         }
+
+        // The UNPARSEABLE sentinel was designed for the one-shot backfill over FROZEN
+        // legacy passages, where the input never changes, so an in-producer sentinel
+        // check is correctly eternal-idempotent. On the live authoring surface the
+        // passage is EDITABLE: if an author first saves a passage that parses to zero
+        // refs (a typo, "see bulletin") the producer stamps the sentinel, and without
+        // this clear the producer's sentinel short-circuit would permanently trap the
+        // post — a later correction to a valid reference would never produce structured
+        // refs / TAX_BOOK terms / the inline LINK. Clearing it here re-evaluates the
+        // CURRENT passage on every authoring save while leaving the backfill's
+        // idempotency over frozen data untouched (it never deletes the sentinel first).
+        // Net effect for a still-unparseable passage is unchanged: the producer simply
+        // re-stamps it. NEVER touches META_BIBLE_PASSAGE or an existing REFS envelope.
+        delete_post_meta( $post_id, Identifiers::META_BIBLE_REFS_UNPARSEABLE );
 
         $this->capture->captureForPost( $post_id, 'authoring' );
     }
