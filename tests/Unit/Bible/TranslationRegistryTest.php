@@ -47,6 +47,15 @@ final class TranslationRegistryTest extends TestCase {
         $this->assertSame( 'ENGWEBP', TranslationRegistry::current()->inlineTranslation() );
     }
 
+    public function test_reads_non_default_curated_inline_translation(): void {
+        // ENGKJV != DEFAULT_INLINE (ENGWEBP), so this proves resolveInline()
+        // reads its own option rather than collapsing to the fallback.
+        $this->stubOptions(
+            array( Identifiers::OPTION_BIBLE_INLINE_TRANSLATION => 'ENGKJV' )
+        );
+        $this->assertSame( 'ENGKJV', TranslationRegistry::current()->inlineTranslation() );
+    }
+
     public function test_falls_back_to_engwebp_on_unknown_inline_translation(): void {
         $this->stubOptions(
             array( Identifiers::OPTION_BIBLE_INLINE_TRANSLATION => 'NOT_A_REAL_SLUG' )
