@@ -37,27 +37,57 @@ final class PodcastMetaSchemaTest extends TestCase {
     public function test_keys_catalog_exposes_the_known_identity_keys(): void {
         $keys = PodcastMetaSchema::keys();
 
-        // The exact set the factory reads, plus the channel companions.
+        // The exact set the factory reads, the channel companions, plus the subscribe-link URLs
+        // the PodcastSubscribeBlock reads from this same blob.
         $expected = array(
             'title', 'summary', 'description', 'author', 'owner_name', 'owner_email',
             'image', 'category', 'subcategory', 'explicit', 'copyright', 'language', 'link',
+            'apple_url', 'spotify_url',
         );
         $this->assertSame( $expected, $keys );
         $this->assertContains( 'owner_email', $keys );
     }
 
-    // --- allowlist drop ------------------------------------------------------
+    // --- preservation of non-identity keys -----------------------------------
 
-    public function test_sanitize_drops_unknown_keys(): void {
+    /**
+     * The canonical blob is NOT identity-only: migration stores per-taxonomy term-filter SCOPE
+     * keys (which sermons the feed serves) and subscribe URLs inside it. Because this sanitizer is
+     * the register_post_meta sanitize_callback (fires on EVERY write, incl. migration's
+     * add_post_meta), dropping unrecognized keys would clobber that data. They must SURVIVE.
+     */
+    public function test_sanitize_preserves_term_filter_scope_keys(): void {
         $clean = PodcastMetaSchema::sanitize( array(
-            'title'                  => 'Sunday Sermons',
-            'evil_script'            => '<script>alert(1)</script>',
-            'sermonator_injection'   => 'malicious',
+            'title'               => 'Sunday Sermons',
+            // Migration term-filter scope: taxonomy slug => new term id (int) or list of ids.
+            'sermonator_preacher' => 7,
+            'sermonator_series'   => array( 11, 12 ),
         ) );
 
         $this->assertArrayHasKey( 'title', $clean );
-        $this->assertArrayNotHasKey( 'evil_script', $clean );
-        $this->assertArrayNotHasKey( 'sermonator_injection', $clean );
+        // Int term ids pass through verbatim (lossless) — feed scope preserved.
+        $this->assertSame( 7, $clean['sermonator_preacher'] );
+        $this->assertSame( array( 11, 12 ), $clean['sermonator_series'] );
+    }
+
+    public function test_sanitize_hardens_unknown_string_values(): void {
+        // An unrecognized key is preserved, but its scalar string value is still run through
+        // sanitize_text_field (stubbed here as trim) so nothing raw is persisted.
+        $clean = PodcastMetaSchema::sanitize( array( 'mystery_key' => '  raw value  ' ) );
+
+        $this->assertArrayHasKey( 'mystery_key', $clean );
+        $this->assertSame( 'raw value', $clean['mystery_key'] );
+    }
+
+    public function test_subscribe_urls_sanitized_as_url(): void {
+        $clean = PodcastMetaSchema::sanitize( array(
+            'apple_url'   => 'https://podcasts.apple.com/show/123',
+            'spotify_url' => 'https://open.spotify.com/show/abc',
+        ) );
+
+        // esc_url_raw is stubbed as 'URL:' . trimmed input — proves the URL sanitizer ran.
+        $this->assertSame( 'URL:https://podcasts.apple.com/show/123', $clean['apple_url'] );
+        $this->assertSame( 'URL:https://open.spotify.com/show/abc', $clean['spotify_url'] );
     }
 
     public function test_sanitize_omits_absent_known_keys(): void {
@@ -137,10 +167,26 @@ final class PodcastMetaSchemaTest extends TestCase {
         );
     }
 
-    public function test_category_normalizes_against_apple_taxonomy(): void {
-        // ItunesCategory::normalize maps a faith term onto the fixed Apple category.
+    public function test_category_persists_most_specific_valid_term(): void {
+        // 'Christianity' is a valid Apple SUBcategory under 'Religion & Spirituality'. The
+        // sanitizer must persist the subcategory verbatim (not collapse it to the top-level
+        // category) so the read-path factory can reconstruct the nested <itunes:category>
+        // subcategory by re-normalizing the stored string. Collapsing it would be a feed-fidelity
+        // regression for the dominant sermon-feed case.
         $clean = PodcastMetaSchema::sanitize( array( 'category' => 'Christianity' ) );
+        $this->assertSame( 'Christianity', $clean['category'] );
+    }
+
+    public function test_category_pins_unrecognized_input_to_default_top_level(): void {
+        // An input with no category/subcategory match collapses to the default top-level category
+        // (valid taxonomy, never feed-rejected) — the only lossy case, and only for junk input.
+        $clean = PodcastMetaSchema::sanitize( array( 'category' => 'Quantum Mechanics' ) );
         $this->assertSame( 'Religion & Spirituality', $clean['category'] );
+    }
+
+    public function test_category_keeps_top_level_category_when_no_subcategory(): void {
+        $clean = PodcastMetaSchema::sanitize( array( 'category' => 'Education' ) );
+        $this->assertSame( 'Education', $clean['category'] );
     }
 
     public function test_category_preserves_blank(): void {
@@ -169,9 +215,10 @@ final class PodcastMetaSchemaTest extends TestCase {
         $this->assertIsCallable( $captured['args']['sanitize_callback'] );
         $this->assertIsCallable( $captured['args']['auth_callback'] );
 
-        // sanitize_callback funnels through self::sanitize (drops unknown keys).
+        // sanitize_callback funnels through self::sanitize: identity keys typed, non-identity keys
+        // PRESERVED (hardened) — never dropped, so migration scope keys survive a registered write.
         $sanitized = ( $captured['args']['sanitize_callback'] )( array( 'title' => 'X', 'bogus' => 'Y' ) );
-        $this->assertSame( array( 'title' => 'X' ), $sanitized );
+        $this->assertSame( array( 'title' => 'X', 'bogus' => 'Y' ), $sanitized );
     }
 
     public function test_auth_callback_requires_manage_options(): void {

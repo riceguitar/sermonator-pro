@@ -18,18 +18,37 @@ use Sermonator\Frontend\Feed\ItunesCategory;
  *   1. {@see self::register()} calls `register_post_meta()` on the podcast CPT with an
  *      `auth_callback` of `current_user_can('manage_options')` and a `sanitize_callback`
  *      wired to {@see self::sanitize()}, so even a direct `update_post_meta()` is hardened.
- *   2. {@see self::keys()} is the ONE typed allowlist of the ~13 known podcast-identity keys.
- *      It is shared: the factory (reader) intersects raw stored meta against it, and the
- *      admin Form-2 writer ({@see \Sermonator\Admin\PodcastIdentityController}) sanitizes
- *      through {@see self::sanitize()} — so reader and writer can never drift.
- *   3. {@see self::sanitize()} sanitizes per key by type (email→sanitize_email,
- *      explicit→bool, url/image→esc_url_raw, category→Apple-taxonomy-normalized,
- *      text→sanitize_text_field, multiline→sanitize_textarea_field) and DROPS any key not in
- *      the allowlist — so an unknown / injected key never reaches the feed.
+ *   2. {@see self::keys()} is the ONE typed allowlist of the known podcast-identity keys
+ *      (channel identity PLUS the subscribe-link URLs the
+ *      {@see \Sermonator\Frontend\Blocks\PodcastSubscribeBlock} reads). It is shared: the
+ *      factory (reader) intersects raw stored meta against it, and the admin Form-2 writer
+ *      ({@see \Sermonator\Admin\PodcastIdentityController}) sanitizes through
+ *      {@see self::sanitize()} — so reader and writer can never drift.
+ *   3. {@see self::sanitize()} sanitizes recognized keys per type (email→sanitize_email,
+ *      explicit→bool, url/image→esc_url_raw, category→Apple-taxonomy-normalized to the MOST
+ *      SPECIFIC valid term, text→sanitize_text_field, multiline→sanitize_textarea_field).
+ *
+ * CRITICAL — this blob is NOT identity-only. Migration stores per-taxonomy term-filter SCOPE
+ * keys inside it ({@see \Sermonator\Migration\PodcastWriter::remapSettingsTerms()} writes
+ * `sermonator_preacher`/`series`/`topic`/`book`/`service_type` => term id(s)) that decide WHICH
+ * sermons the feed carries. Because the `sanitize_callback` fires on EVERY write — including the
+ * migration's own `add_post_meta()` — DROPPING unrecognized keys here would silently wipe the
+ * feed's term-scoping and the subscribe URLs on every (supported) migration re-run: a #1-standard
+ * data-preservation clobber. So {@see self::sanitize()} PRESERVES unrecognized keys (hardening
+ * them recursively, never dropping). Feed *injection* of an unknown key is independently blocked
+ * at READ: {@see \Sermonator\Frontend\Feed\PodcastConfigFactory} intersects stored meta against
+ * {@see self::keys()} before emitting, so an unrecognized key can never reach the public channel.
  *
  * This clears the §5.D audio-backfill bar for the podcast-settings write path: sanitize-at-write,
- * reversible (it only ever narrows/cleans known keys; it never invents data), and gated behind
- * `manage_options`.
+ * reversible (it only ever narrows/cleans values; it never drops a key or invents data), and gated
+ * behind `manage_options`.
+ *
+ * @todo TRACKING (Bundle 4 Task 7/8): {@see self::register()} is NOT yet hooked anywhere in
+ *       production — the admin write surface (PodcastIdentityController / SettingsPage) that boots
+ *       this bundle MUST call it on `init` (front end + admin, mirroring
+ *       {@see \Sermonator\Admin\Authoring\SermonMetaRegistrar} via AuthoringServiceProvider), or
+ *       the auth/sanitize governance stays inert. Wiring is deliberately deferred to those tasks
+ *       so it lands with the phase-gated controller, not split across commits.
  */
 final class PodcastMetaSchema {
     /** A free-text single-line value (sanitize_text_field). */
@@ -54,8 +73,11 @@ final class PodcastMetaSchema {
      * The typed allowlist of every known podcast-identity key. The key names are EXACTLY the
      * ones {@see \Sermonator\Frontend\Feed\PodcastConfigFactory::fromPost()} reads (`title`,
      * `summary`, `author`, `owner_name`, `owner_email`, `image`, `category`, `explicit`,
-     * `copyright`, `language`) plus the channel-level companions the factory derives or a feed
-     * may carry (`description`, `subcategory`, `link`). Any key NOT here is dropped at write.
+     * `copyright`, `language`), the channel-level companions the factory derives or a feed may
+     * carry (`description`, `subcategory`, `link`), and the subscribe-link URLs
+     * {@see \Sermonator\Frontend\Blocks\PodcastSubscribeBlock} reads from this same blob
+     * (`apple_url`, `spotify_url`). Recognized keys are sanitized per type; any OTHER key
+     * (e.g. a migration term-filter scope key) is preserved verbatim-but-hardened, never dropped.
      *
      * @var array<string,self::T_*>
      */
@@ -73,12 +95,16 @@ final class PodcastMetaSchema {
         'copyright'   => self::T_TEXT,
         'language'    => self::T_TEXT,
         'link'        => self::T_URL,
+        'apple_url'   => self::T_URL,
+        'spotify_url' => self::T_URL,
     );
 
     /**
      * The shared key catalog — the SINGLE source of truth for which podcast-identity keys are
-     * recognized. Consumed by both the reader (factory) and the writer (admin controller) so a
-     * key added here is honored everywhere, and a key absent here is dropped everywhere.
+     * recognized. Consumed by both the reader (factory, which intersects stored meta against it)
+     * and the writer (admin controller) so a key added here is honored everywhere. A key NOT here
+     * is not "identity" — the factory never emits it, but the write path preserves it (see
+     * {@see self::sanitize()}).
      *
      * @return list<string>
      */
@@ -88,7 +114,8 @@ final class PodcastMetaSchema {
 
     /**
      * Register the podcast-settings post meta with auth + sanitize governance. Intended to be
-     * hooked on `init` (mirroring the sermon meta registration). Idempotent: WordPress treats a
+     * hooked on `init` (mirroring the sermon meta registration) — see the class-level @todo: this
+     * is not yet wired in production; Bundle 4 Task 7/8 owns that. Idempotent: WordPress treats a
      * second registration of the same key as an overwrite.
      */
     public static function register(): void {
@@ -108,13 +135,17 @@ final class PodcastMetaSchema {
     }
 
     /**
-     * Sanitize a podcast-settings array per the typed allowlist, DROPPING any unknown key.
+     * Sanitize a podcast-settings array: recognized keys are cleaned per their declared type;
+     * UNRECOGNIZED keys are PRESERVED (recursively hardened, never dropped) because this same blob
+     * carries migration term-filter scope keys that decide which sermons the feed serves —
+     * dropping them on a write would be a #1-standard data clobber. See the class docblock for why
+     * preservation here does not open a feed-injection hole (the factory intersects on read).
      *
      * A non-array input (the meta was never set, or was corrupted) sanitizes to an empty array
      * rather than throwing — the factory's own fallbacks then produce a valid empty channel.
      *
      * @param mixed $value
-     * @return array<string,string|bool>
+     * @return array<array-key,mixed>
      */
     public static function sanitize( $value ): array {
         if ( ! is_array( $value ) ) {
@@ -122,14 +153,43 @@ final class PodcastMetaSchema {
         }
 
         $clean = array();
-        foreach ( self::KEYS as $key => $type ) {
-            if ( ! array_key_exists( $key, $value ) ) {
+        foreach ( $value as $key => $raw ) {
+            if ( is_string( $key ) && isset( self::KEYS[ $key ] ) ) {
+                $clean[ $key ] = self::sanitizeValue( self::KEYS[ $key ], $raw );
                 continue;
             }
-            $clean[ $key ] = self::sanitizeValue( $type, $value[ $key ] );
+            // Not an identity key (e.g. a migration term-filter scope key): preserve, hardened.
+            $clean[ $key ] = self::sanitizeUnknown( $raw );
         }
 
         return $clean;
+    }
+
+    /**
+     * Recursively harden a preserved-but-unrecognized value WITHOUT altering its shape. Integer /
+     * float term ids (the migration's term-filter scope values) and booleans pass through
+     * verbatim; strings run through `sanitize_text_field` (idempotent for the slug/id values these
+     * keys actually hold); arrays recurse. A non-scalar leaf (object/resource) is dropped to null.
+     *
+     * @param mixed $raw
+     * @return mixed
+     */
+    private static function sanitizeUnknown( $raw ) {
+        if ( is_array( $raw ) ) {
+            $out = array();
+            foreach ( $raw as $key => $value ) {
+                $cleanKey         = is_string( $key ) ? sanitize_text_field( $key ) : $key;
+                $out[ $cleanKey ] = self::sanitizeUnknown( $value );
+            }
+            return $out;
+        }
+        if ( is_bool( $raw ) || is_int( $raw ) || is_float( $raw ) ) {
+            return $raw;
+        }
+        if ( is_string( $raw ) ) {
+            return sanitize_text_field( $raw );
+        }
+        return null;
     }
 
     /**
@@ -154,12 +214,20 @@ final class PodcastMetaSchema {
             case self::T_CATEGORY:
                 $value = trim( self::toScalarString( $raw ) );
                 // Preserve "left blank" (the factory defaults it); otherwise pin to a valid
-                // Apple category so the feed is never rejected.
+                // Apple taxonomy term so the feed is never rejected.
                 if ( '' === $value ) {
                     return '';
                 }
                 $normalized = ItunesCategory::normalize( $value );
-                return $normalized['category'];
+                // Persist the MOST SPECIFIC valid term. PodcastConfigFactory stores identity in a
+                // single `category` string and RE-RUNS ItunesCategory::normalize() on it to derive
+                // the nested <itunes:category> subcategory; a subcategory term is itself a valid
+                // normalize() input that recovers its parent category, so persisting it round-trips
+                // both levels losslessly. Returning only the top-level category (as before) would
+                // drop the subcategory — the dominant 'Christianity' case for a sermon feed — a
+                // feed-fidelity regression. Only an unrecognized input collapses to the default
+                // top-level category.
+                return $normalized['subcategory'] ?? $normalized['category'];
 
             case self::T_TEXT:
             default:

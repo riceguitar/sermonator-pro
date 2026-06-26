@@ -36,19 +36,6 @@ final class PodcastMetaSchemaTest extends WP_UnitTestCase {
 
     // --- sanitize-at-write through the real meta API -------------------------
 
-    public function test_update_post_meta_drops_unknown_keys(): void {
-        update_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, array(
-            'title'       => 'Sunday Sermons',
-            'evil_script' => '<script>alert(1)</script>',
-        ) );
-
-        $stored = get_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, true );
-
-        $this->assertIsArray( $stored );
-        $this->assertSame( 'Sunday Sermons', $stored['title'] );
-        $this->assertArrayNotHasKey( 'evil_script', $stored );
-    }
-
     public function test_update_post_meta_sanitizes_per_key(): void {
         update_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, array(
             'owner_email' => 'pod cast@example.com',
@@ -63,8 +50,74 @@ final class PodcastMetaSchemaTest extends WP_UnitTestCase {
         $this->assertSame( 'podcast@example.com', $stored['owner_email'] );
         $this->assertSame( 'http://example.com/art.jpg', $stored['image'] );
         $this->assertTrue( $stored['explicit'] );
-        $this->assertSame( 'Religion & Spirituality', $stored['category'] );
+        // The subcategory 'Christianity' survives the sanitized write (most-specific valid term),
+        // NOT collapsed to its top-level 'Religion & Spirituality' parent.
+        $this->assertSame( 'Christianity', $stored['category'] );
         $this->assertSame( 'Trimmed Title', $stored['title'] );
+    }
+
+    /**
+     * The stored category must round-trip through the read path so the feed still emits the nested
+     * <itunes:category> subcategory. Proves the §2/§3/§4 fidelity fix end-to-end: a sanitized
+     * 'Christianity' write yields category='Religion & Spirituality' AND subcategory='Christianity'
+     * back out of the factory the feed consumes.
+     */
+    public function test_sanitized_category_round_trips_subcategory_through_factory(): void {
+        update_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, array(
+            'category' => 'Christianity',
+        ) );
+
+        $config = ( new PodcastConfigFactory() )->fromPost( $this->podcastId, 'http://example.com/feed/' );
+
+        $this->assertSame( 'Religion & Spirituality', $config->category );
+        $this->assertSame( 'Christianity', $config->subcategory );
+    }
+
+    /**
+     * REGRESSION (§1): the canonical blob is NOT identity-only. The PodcastSubscribeBlock reads
+     * apple_url/spotify_url from it, and migration stores per-taxonomy term-filter SCOPE keys in it
+     * that decide which sermons the feed serves. Because the sanitize_callback fires on EVERY write
+     * (incl. migration's add_post_meta), those keys MUST survive a registered write — dropping them
+     * would be a #1-standard data-preservation clobber of the feed's scope + subscribe links.
+     */
+    public function test_update_post_meta_preserves_subscribe_urls_and_term_filter_scope(): void {
+        update_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, array(
+            'title'               => 'Sunday Sermons',
+            'apple_url'           => 'https://podcasts.apple.com/us/podcast/id123',
+            'spotify_url'         => 'https://open.spotify.com/show/abc123',
+            // Migration term-filter scope: taxonomy slug => new term id(s).
+            'sermonator_preacher' => 7,
+            'sermonator_series'   => array( 11, 12 ),
+        ) );
+
+        $stored = get_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, true );
+
+        $this->assertIsArray( $stored );
+        $this->assertSame( 'Sunday Sermons', $stored['title'] );
+        // Subscribe URLs survive (now catalog keys, URL-sanitized but valid → unchanged).
+        $this->assertSame( 'https://podcasts.apple.com/us/podcast/id123', $stored['apple_url'] );
+        $this->assertSame( 'https://open.spotify.com/show/abc123', $stored['spotify_url'] );
+        // Feed term-scoping survives, ints intact (lossless) — feed serves the right sermons.
+        $this->assertSame( 7, $stored['sermonator_preacher'] );
+        $this->assertSame( array( 11, 12 ), $stored['sermonator_series'] );
+    }
+
+    /**
+     * A genuinely injected unknown SCALAR key is preserved (not dropped) but hardened: the value is
+     * run through sanitize_text_field so no raw markup persists. Feed injection is independently
+     * blocked at read by the factory's catalog intersect (covered below), so preservation here is
+     * safe.
+     */
+    public function test_update_post_meta_preserves_but_hardens_unknown_scalar(): void {
+        update_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, array(
+            'mystery_key' => '<b>raw</b> value',
+        ) );
+
+        $stored = get_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, true );
+
+        $this->assertArrayHasKey( 'mystery_key', $stored );
+        // sanitize_text_field strips tags; the key itself is preserved.
+        $this->assertSame( 'raw value', $stored['mystery_key'] );
     }
 
     // --- auth gate -----------------------------------------------------------
