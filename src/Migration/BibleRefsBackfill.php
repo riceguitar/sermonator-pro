@@ -5,10 +5,7 @@ declare(strict_types=1);
 namespace Sermonator\Migration;
 
 use Sermonator\Admin\Authoring\MigrationGuard;
-use Sermonator\Bible\ReferenceParser;
-use Sermonator\Bible\RefValidator;
-use Sermonator\Bible\TranslationRegistry;
-use Sermonator\Schema\BibleBookMap;
+use Sermonator\Bible\RefsCapture;
 use Sermonator\Schema\Identifiers as ID;
 
 /**
@@ -47,23 +44,28 @@ use Sermonator\Schema\Identifiers as ID;
  * @phpstan-type LogEntry array{refs:bool,sentinel:bool,terms:list<int>}
  */
 final class BibleRefsBackfill {
-    /** Schema version stamped on every written envelope (mirrors the authoring producer). */
-    public const ENVELOPE_VERSION = 1;
-
-    /** Sentinel value stamped when a non-empty passage parses to zero refs. */
-    private const UNPARSEABLE_SENTINEL = '1';
-
     /**
-     * Resolves the candidate sermon ids. Injected so the parse/envelope/reversibility
-     * logic is unit-testable without a live WP_Query; defaults to the real query.
+     * Resolves the candidate sermon ids. Injected so the reversibility logic is
+     * unit-testable without a live WP_Query; defaults to the real query.
      *
      * @var callable(int):list<int>
      */
     private $candidatesProvider;
 
-    /** @param callable(int):list<int>|null $candidatesProvider Resolve a limit to candidate post ids. */
-    public function __construct( ?callable $candidatesProvider = null ) {
+    /**
+     * The single shared producer that turns a passage into the envelope/sentinel/terms.
+     * The backfill owns only the candidate scan, dry-run/MigrationGuard gating, and the
+     * exact-reverse log around it (one schema, multiple producers — design §3).
+     */
+    private RefsCapture $capture;
+
+    /**
+     * @param callable(int):list<int>|null $candidatesProvider Resolve a limit to candidate post ids.
+     * @param RefsCapture|null              $capture            Override the shared producer (tests).
+     */
+    public function __construct( ?callable $candidatesProvider = null, ?RefsCapture $capture = null ) {
         $this->candidatesProvider = $candidatesProvider ?? array( $this, 'queryCandidates' );
+        $this->capture            = $capture ?? new RefsCapture();
     }
 
     /**
@@ -94,53 +96,40 @@ final class BibleRefsBackfill {
         $unparseable = 0;
         $touchedIds  = array();
 
-        // Resolve the church's source versification once: it tags every ref so the
-        // 3b inline-eligibility gate can detect ESV-vs-WEB divergence later. Computed
-        // here (a write/resolution path), never in the pure Renderer.
-        $srcVersification = TranslationRegistry::current()->linkVersion();
-
         foreach ( $ids as $id ) {
             $id = (int) $id;
 
-            $passage = (string) get_post_meta( $id, ID::META_BIBLE_PASSAGE, true );
-            if ( '' === trim( $passage ) ) {
-                continue;
-            }
+            if ( $dryRun ) {
+                // Read-only report: ask the shared producer what it WOULD do (it owns
+                // the fill-missing skip checks + parse) and count it, writing nothing.
+                $plan = $this->capture->plan( $id, 'backfill' );
 
-            // Race/idempotency guard: re-read immediately before writing so an envelope
-            // written since the query (a concurrent run, or an author save) is never
-            // overwritten — authoring data is sacrosanct (#1 data preservation).
-            if ( '' !== (string) get_post_meta( $id, ID::META_BIBLE_REFS, true ) ) {
-                continue;
-            }
-
-            // Already stamped unparseable on a prior pass: leave it alone so a re-run
-            // (even one fed a stale id list) neither double-counts nor re-touches it.
-            if ( '' !== (string) get_post_meta( $id, ID::META_BIBLE_REFS_UNPARSEABLE, true ) ) {
-                continue;
-            }
-
-            $refs = $this->buildRefs( $passage, $srcVersification );
-
-            if ( array() === $refs ) {
-                // Parsed a non-empty passage to zero refs: stamp the measurable
-                // per-post fail-open sentinel rather than silently doing nothing.
-                if ( ! $dryRun ) {
-                    update_post_meta( $id, ID::META_BIBLE_REFS_UNPARSEABLE, self::UNPARSEABLE_SENTINEL );
-                    $this->logEntry( $id, false, true, array() );
+                if ( 'refs' === $plan['outcome'] ) {
+                    ++$written;
+                    $touchedIds[] = $id;
+                } elseif ( 'sentinel' === $plan['outcome'] ) {
+                    ++$unparseable;
+                    $touchedIds[] = $id;
                 }
+
+                continue;
+            }
+
+            // Real write: delegate the per-post envelope/sentinel/term production to the
+            // single shared producer (source:'backfill'), then log exactly what it wrote
+            // so reverse() can undo precisely it. The producer enforces fill-missing /
+            // never-overwrite-authoring / never-mutate-passage; the gating above is ours.
+            $result = $this->capture->captureForPost( $id, 'backfill' );
+
+            if ( $result['refs'] ) {
+                $this->logEntry( $id, true, false, $result['terms'] );
+                ++$written;
+                $touchedIds[] = $id;
+            } elseif ( $result['sentinel'] ) {
+                $this->logEntry( $id, false, true, array() );
                 ++$unparseable;
                 $touchedIds[] = $id;
-                continue;
             }
-
-            if ( ! $dryRun ) {
-                update_post_meta( $id, ID::META_BIBLE_REFS, $this->envelope( $refs ) );
-                $addedTermIds = $this->assignBookTerms( $id, $refs );
-                $this->logEntry( $id, true, false, $addedTermIds );
-            }
-            ++$written;
-            $touchedIds[] = $id;
         }
 
         return array(
@@ -206,112 +195,6 @@ final class BibleRefsBackfill {
         delete_option( ID::OPTION_BIBLE_REFS_BACKFILL_LOG );
 
         return array( 'reversed' => $reversed, 'ids' => $ids, 'gated' => false );
-    }
-
-    /**
-     * Parse a raw passage into a list of enriched Ref rows (source/confidence/
-     * srcVersification stamped). In-canon, structurally-valid refs only — anything
-     * the validator rejects is dropped (never fail-*wrong*).
-     *
-     * @return list<array<string,mixed>>
-     */
-    private function buildRefs( string $passage, string $srcVersification ): array {
-        $parsed = ReferenceParser::parse( $passage );
-        $refs   = array();
-
-        foreach ( $parsed['segments'] as $segment ) {
-            foreach ( $segment['refs'] as $ref ) {
-                if ( ! is_array( $ref ) ) {
-                    continue;
-                }
-
-                $flags = RefValidator::validate( $ref );
-                if ( ! $flags['inCanon'] || ! $flags['structurallyValid'] ) {
-                    continue;
-                }
-
-                $ref['source']           = 'backfill';
-                $ref['confidence']       = $this->confidence( $flags );
-                $ref['srcVersification'] = $srcVersification;
-                $refs[]                  = $ref;
-            }
-        }
-
-        return $refs;
-    }
-
-    /**
-     * Backfill confidence is honest about its provenance: a heuristic parse of legacy
-     * free text is at best `probable` — never `exact` (which is reserved for an author
-     * who confirmed the structured chips). A ref the validator could not fully clear
-     * is `ambiguous`.
-     *
-     * @param array{inCanon:bool,structurallyValid:bool,inlineEligible:bool} $flags
-     */
-    private function confidence( array $flags ): string {
-        return ( $flags['inCanon'] && $flags['structurallyValid'] ) ? 'probable' : 'ambiguous';
-    }
-
-    /**
-     * Serialize the versioned envelope written to META_BIBLE_REFS.
-     *
-     * @param list<array<string,mixed>> $refs
-     */
-    private function envelope( array $refs ): string {
-        return (string) wp_json_encode( array( 'v' => self::ENVELOPE_VERSION, 'refs' => $refs ) );
-    }
-
-    /**
-     * Append-assign the TAX_BOOK terms named by the refs and return the ids that were
-     * NEWLY added by this call (so reverse() can detach exactly those, leaving any term
-     * the post already carried untouched). Idempotent: re-adding a present term is a no-op.
-     *
-     * @param list<array<string,mixed>> $refs
-     *
-     * @return list<int>
-     */
-    private function assignBookTerms( int $id, array $refs ): array {
-        $names = $this->bookNames( $refs );
-        if ( array() === $names ) {
-            return array();
-        }
-
-        $before = $this->bookTermIds( $id );
-        wp_set_object_terms( $id, $names, ID::TAX_BOOK, true );
-        $after = $this->bookTermIds( $id );
-
-        return array_values( array_diff( $after, $before ) );
-    }
-
-    /**
-     * Unique canonical book display names for the refs (USFM -> BibleCanon name).
-     *
-     * @param list<array<string,mixed>> $refs
-     *
-     * @return list<string>
-     */
-    private function bookNames( array $refs ): array {
-        $byCode = array_flip( BibleBookMap::usfm() );
-        $names  = array();
-
-        foreach ( $refs as $ref ) {
-            $usfm = isset( $ref['bookUSFM'] ) && is_string( $ref['bookUSFM'] ) ? $ref['bookUSFM'] : '';
-            if ( isset( $byCode[ $usfm ] ) && ! in_array( $byCode[ $usfm ], $names, true ) ) {
-                $names[] = $byCode[ $usfm ];
-            }
-        }
-
-        return $names;
-    }
-
-    /** @return list<int> The TAX_BOOK term ids currently attached to the post. */
-    private function bookTermIds( int $id ): array {
-        $terms = wp_get_object_terms( $id, ID::TAX_BOOK, array( 'fields' => 'ids' ) );
-        if ( ! is_array( $terms ) ) {
-            return array();
-        }
-
-        return array_values( array_map( 'intval', $terms ) );
     }
 
     /**
