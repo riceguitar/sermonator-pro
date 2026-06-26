@@ -122,6 +122,16 @@ final class Orchestrator {
         $manifest = $this->detector->detect();
         $this->state->setManifest( $manifest );
 
+        // Capture the legacy feed's per-episode GUIDs at the SAME detect baseline as the
+        // manifest, so the rewritten podcast feed can replay them post-switch and already-
+        // subscribed apps do not re-download the back catalogue (rollback story 1, the
+        // HARD REQUIREMENT). Idempotent: the first detect baselines; legacy data is
+        // immutable until Finalize, so an existing snapshot is never re-captured.
+        $snapshot = new LegacyFeedSnapshot();
+        if ( $snapshot->isEmpty() ) {
+            $snapshot->store( ( new LegacyFeedGuidCapturer() )->capture() );
+        }
+
         // none → detected. Re-detect from 'detected' is an idempotent no-op.
         if ( $phase === 'none' ) {
             $this->state->set( 'detected' );

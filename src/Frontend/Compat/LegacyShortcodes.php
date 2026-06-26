@@ -46,9 +46,28 @@ final class LegacyShortcodes {
 
     public function register(): void {
         foreach ( self::SERMON_TAGS as $tag ) {
-            add_shortcode( $tag, array( $this, 'render' ) );
+            $this->registerTag( $tag, array( $this, 'render' ) );
         }
-        add_shortcode( self::PODCAST_TAG, array( $this, 'renderPodcasts' ) );
+        $this->registerTag( self::PODCAST_TAG, array( $this, 'renderPodcasts' ) );
+    }
+
+    /**
+     * Register a shim ONLY when the tag is not already taken. During the migration
+     * coexistence / rollback window the legacy Sermon Manager plugin stays active (its data
+     * is byte-immutable until Finalize) and still owns these GLOBAL shortcode tags. Both
+     * plugins register on init@10 and add_shortcode is last-writer-wins, so an unguarded
+     * shim could clobber SM's live, attribute-faithful [sermons]/[list_podcasts] and show
+     * visitors a silently-different sermon set — the exact fail-wrong the Contract forbids.
+     * With this guard SM always wins while active (the shim skips, or SM's later registration
+     * overrides); once SM is deactivated the tag is free and the shim registers next request.
+     *
+     * @param callable $callback
+     */
+    private function registerTag( string $tag, $callback ): void {
+        if ( shortcode_exists( $tag ) ) {
+            return;
+        }
+        add_shortcode( $tag, $callback );
     }
 
     /**

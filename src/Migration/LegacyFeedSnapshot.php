@@ -48,4 +48,10 @@ final class LegacyFeedSnapshot {
         $guid = $map[ $legacyPostId ] ?? null;
         return is_string( $guid ) && $guid !== '' ? $guid : null;
     }
+
+    /** True when no snapshot has been captured yet — used to baseline exactly once at detect. */
+    public function isEmpty(): bool {
+        $map = get_option( self::OPTION, array() );
+        return ! is_array( $map ) || $map === array();
+    }
 }

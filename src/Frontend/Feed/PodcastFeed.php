@@ -72,7 +72,28 @@ final class PodcastFeed {
 
         $config = $factory->fromPost( $podcastId, $feedUrl );
         $items  = $this->items();
+
+        // Fail-visible (rollback story 1 + the Legacy Compatibility Contract): per-podcast
+        // item filtering is an explicit Tier B deferral, so on a MULTI-podcast site this feed
+        // carries the resolved podcast's channel identity but the full site-wide sermon set
+        // (over-inclusion). Surface that discrepancy — exactly like sermonator_feed_truncated —
+        // so it is observable to the admin/migration report, never silently-different content.
+        if ( $this->publishedPodcastCount() > 1 ) {
+            do_action( 'sermonator_feed_unscoped_multipodcast', $podcastId, count( $items ) );
+        }
+
         echo ( new FeedBuilder() )->build( $config, $items ); // phpcs:ignore WordPress.Security.EscapeOutput
+    }
+
+    /** Number of published podcasts (capped at 2 — callers only need to know if >1). */
+    private function publishedPodcastCount(): int {
+        $ids = get_posts( array(
+            'post_type'      => ID::POST_TYPE_PODCAST,
+            'post_status'    => 'publish',
+            'posts_per_page' => 2,
+            'fields'         => 'ids',
+        ) );
+        return count( $ids );
     }
 
     /** @return list<FeedItem> */

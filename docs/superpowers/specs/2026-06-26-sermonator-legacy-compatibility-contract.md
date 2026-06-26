@@ -26,6 +26,8 @@ A migrated page that shows a *different* sermon set than it did under Sermon Man
 - Every legacy feed URL a migrated church published resolves **200**, not 404.
 - Each item's `<guid>` equals the GUID the **legacy** feed emitted for that episode (captured in the pre-migration snapshot, `Sermonator\Migration\LegacyFeedSnapshot`). Subscribers' apps must not re-download or drop episodes.
 - The item set and order are preserved, or the discrepancy is surfaced (fail-visible) — never silently changed.
+- **Known Tier-A limitation (multi-podcast over-inclusion):** per-podcast item *filtering* is a Tier-B deferral, so on a site with 2+ podcasts a legacy `?id=<podcast>` feed carries that podcast's channel identity but the full site-wide sermon set. This is **fail-visible**, not silent — `PodcastFeed::render()` fires `do_action( 'sermonator_feed_unscoped_multipodcast', $podcastId, $itemCount )` whenever more than one published podcast exists, so the discrepancy is observable (and surfaced in the migration/admin report) until Bundle 2 adds faithful per-podcast filtering.
+- **GUID capture is wired (not just the read side):** `Orchestrator::detect()` captures each legacy sermon's `the_guid()` via `LegacyFeedGuidCapturer` into `LegacyFeedSnapshot` at the detect baseline, and the Finalizer stamps it durably (`META_LEGACY_GUID`) before stripping the back-ref — proven end-to-end by `tests/Integration/Migration/LegacyFeedSnapshotTest.php` (drives the real `detect()`, never hand-seeds).
 - **Lost podcast subscribers cannot be reclaimed**, so the snapshot + GUID stability must exist *before any church is told to switch*.
 
 ## Anti-drift rule
