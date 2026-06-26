@@ -27,6 +27,22 @@ final class Identifiers {
     public const META_BULLETIN       = 'sermonator_bulletin';
     public const META_VIEWS          = 'sermonator_views';
 
+    /**
+     * Versioned JSON envelope of structured Bible references
+     * `{"v":1,"refs":[Ref,…]}` written by BOTH authoring-capture and
+     * backfill/import (one schema, multiple producers). META_BIBLE_PASSAGE
+     * is NEVER mutated and remains the preserved human display label / parser
+     * input; this key is the structured companion, not a replacement.
+     */
+    public const META_BIBLE_REFS             = 'sermonator_bible_refs';
+
+    /**
+     * Sentinel companion (mirrors META_DATE_UNPARSEABLE) stamped when backfill
+     * parses a non-empty passage to zero refs, so a per-post fail-open is
+     * measurable rather than silently indistinguishable from "no passage".
+     */
+    public const META_BIBLE_REFS_UNPARSEABLE = 'sermonator_bible_refs_unparseable';
+
     public const OPTION_PREFIX                  = 'sermonator_';
     public const META_PODCAST_SETTINGS          = 'sermonator_podcast_settings';
     public const OPTION_DEFAULT_PODCAST         = 'sermonator_default_podcast';
@@ -36,6 +52,19 @@ final class Identifiers {
     public const OPTION_PRE_MIGRATION_BACKUP    = 'sermonator_pre_migration_backup';
     public const OPTION_MIGRATION_PROGRESS      = 'sermonator_migration_progress';
     public const OPTION_LEGACY_FEED_SNAPSHOT    = 'sermonator_legacy_feed_snapshot';
+
+    /** Axis A: bible-link version; default mirrors legacy verse_bible_version (e.g. ESV). */
+    public const OPTION_BIBLE_LINK_VERSION      = 'sermonator_bible_link_version';
+    /** Axis B: inline-translation id; default ENGWEBP. */
+    public const OPTION_BIBLE_INLINE_TRANSLATION = 'sermonator_bible_translation';
+    /** Shared settings group (neither Bundle 3 nor 4 hardcodes it). */
+    public const OPTION_GROUP_SETTINGS          = 'sermonator_settings';
+    /** Int cache-buster for the warmed/normalized chapter cache. */
+    public const OPTION_BIBLE_CACHE_GEN         = 'sermonator_bible_cache_gen';
+    /** Precomputed corpus-audit rollup written by CoverageAudit. */
+    public const OPTION_BIBLE_STATS             = 'sermonator_bible_stats';
+    /** Exact-reverse id log for BibleRefsBackfill (the reversibility mechanism). */
+    public const OPTION_BIBLE_REFS_BACKFILL_LOG = 'sermonator_bible_refs_backfill_log';
 
     /**
      * Durable legacy-podcast-id -> new-podcast-id map, the post-Finalize-safe
@@ -86,12 +115,20 @@ final class Identifiers {
         );
     }
 
-    /** @return list<string> Every sermonator_* meta key stored on a sermon. */
+    /**
+     * @return list<string> Every sermonator_* meta key stored on a sermon.
+     *
+     * NOTE: metaKeys() membership is a catalog (cosmetic / test-only) — it is
+     * NOT a reversibility mechanism. Backfill reversibility is hand-wired via a
+     * LOG_OPTION + reverse method (the AudioSizeBackfill pattern), never inferred
+     * from this list. See spec §3.
+     */
     public static function metaKeys(): array {
         return array(
             self::META_DATE,
             self::META_DATE_AUTO,
             self::META_BIBLE_PASSAGE,
+            self::META_BIBLE_REFS,
             self::META_AUDIO,
             self::META_AUDIO_ID,
             self::META_AUDIO_DURATION,

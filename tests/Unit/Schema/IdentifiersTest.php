@@ -52,4 +52,22 @@ final class IdentifiersTest extends TestCase {
             $this->assertContains( $expected, $keys );
         }
     }
+
+    public function test_bundle3_bible_meta_constants(): void {
+        $this->assertSame( 'sermonator_bible_refs', Identifiers::META_BIBLE_REFS );
+        $this->assertSame( 'sermonator_bible_refs_unparseable', Identifiers::META_BIBLE_REFS_UNPARSEABLE );
+    }
+
+    public function test_bundle3_bible_option_constants(): void {
+        $this->assertSame( 'sermonator_bible_link_version', Identifiers::OPTION_BIBLE_LINK_VERSION );
+        $this->assertSame( 'sermonator_bible_translation', Identifiers::OPTION_BIBLE_INLINE_TRANSLATION );
+        $this->assertSame( 'sermonator_settings', Identifiers::OPTION_GROUP_SETTINGS );
+        $this->assertSame( 'sermonator_bible_cache_gen', Identifiers::OPTION_BIBLE_CACHE_GEN );
+        $this->assertSame( 'sermonator_bible_stats', Identifiers::OPTION_BIBLE_STATS );
+        $this->assertSame( 'sermonator_bible_refs_backfill_log', Identifiers::OPTION_BIBLE_REFS_BACKFILL_LOG );
+    }
+
+    public function test_meta_keys_include_bible_refs(): void {
+        $this->assertContains( Identifiers::META_BIBLE_REFS, Identifiers::metaKeys() );
+    }
 }
