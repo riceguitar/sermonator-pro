@@ -13,9 +13,52 @@ final class BibleBookMapTest extends TestCase {
         $this->assertCount( 66, BibleBookMap::usfm() );
     }
 
+    public function test_usfm_maps_every_book_to_its_correct_code(): void {
+        // Real alignment guard. usfm() pairs BibleCanon::defaultBooks() against
+        // USFM_ORDER positionally, so a same-count reorder of defaultBooks (e.g.
+        // swapping two adjacent minor prophets) would silently re-pair names to
+        // the wrong code. This expected map is hardcoded independently of that
+        // construction, so any such reorder breaks this test. assertSame also
+        // checks ordering, so a transposition that preserves every pairing but
+        // not the sequence is caught too.
+        $expected = array(
+            'Genesis' => 'GEN', 'Exodus' => 'EXO', 'Leviticus' => 'LEV',
+            'Numbers' => 'NUM', 'Deuteronomy' => 'DEU',
+            'Joshua' => 'JOS', 'Judges' => 'JDG', 'Ruth' => 'RUT',
+            '1 Samuel' => '1SA', '2 Samuel' => '2SA',
+            '1 Kings' => '1KI', '2 Kings' => '2KI',
+            '1 Chronicles' => '1CH', '2 Chronicles' => '2CH', 'Ezra' => 'EZR',
+            'Nehemiah' => 'NEH', 'Esther' => 'EST', 'Job' => 'JOB',
+            'Psalms' => 'PSA', 'Proverbs' => 'PRO',
+            'Ecclesiastes' => 'ECC', 'Song of Solomon' => 'SNG', 'Isaiah' => 'ISA',
+            'Jeremiah' => 'JER', 'Lamentations' => 'LAM',
+            'Ezekiel' => 'EZK', 'Daniel' => 'DAN', 'Hosea' => 'HOS',
+            'Joel' => 'JOL', 'Amos' => 'AMO',
+            'Obadiah' => 'OBA', 'Jonah' => 'JON', 'Micah' => 'MIC',
+            'Nahum' => 'NAM', 'Habakkuk' => 'HAB',
+            'Zephaniah' => 'ZEP', 'Haggai' => 'HAG', 'Zechariah' => 'ZEC',
+            'Malachi' => 'MAL',
+            'Matthew' => 'MAT', 'Mark' => 'MRK', 'Luke' => 'LUK',
+            'John' => 'JHN', 'Acts' => 'ACT',
+            'Romans' => 'ROM', '1 Corinthians' => '1CO', '2 Corinthians' => '2CO',
+            'Galatians' => 'GAL', 'Ephesians' => 'EPH',
+            'Philippians' => 'PHP', 'Colossians' => 'COL', '1 Thessalonians' => '1TH',
+            '2 Thessalonians' => '2TH', '1 Timothy' => '1TI',
+            '2 Timothy' => '2TI', 'Titus' => 'TIT', 'Philemon' => 'PHM',
+            'Hebrews' => 'HEB', 'James' => 'JAS',
+            '1 Peter' => '1PE', '2 Peter' => '2PE', '1 John' => '1JN',
+            '2 John' => '2JN', '3 John' => '3JN',
+            'Jude' => 'JUD', 'Revelation' => 'REV',
+        );
+
+        $this->assertSame( $expected, BibleBookMap::usfm() );
+    }
+
     public function test_usfm_keys_match_default_books_exactly(): void {
-        // Drift guard: the display names MUST be derived from BibleCanon,
-        // in the same order, so the two can never diverge.
+        // Secondary structural assertion: the display names are derived from
+        // BibleCanon, in the same order. The pairing-correctness guard lives in
+        // test_usfm_maps_every_book_to_its_correct_code; this only pins that the
+        // key set and order track BibleCanon::defaultBooks().
         $this->assertSame(
             BibleCanon::defaultBooks(),
             array_keys( BibleBookMap::usfm() )
