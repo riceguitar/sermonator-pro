@@ -164,6 +164,24 @@ final class CoverageAuditTest extends TestCase {
         $this->assertSame( 0.0, $stats['parse_coverage'] );
     }
 
+    public function test_hook_wires_site_health_cron_init_and_on_save(): void {
+        Functions\expect( 'add_filter' )
+            ->once()
+            ->with( 'site_status_tests', \Mockery::type( 'array' ) );
+        Functions\expect( 'add_action' )
+            ->once()
+            ->with( CoverageAudit::EVENT_HOOK, \Mockery::type( 'array' ) );
+        Functions\expect( 'add_action' )
+            ->once()
+            ->with( 'init', \Mockery::type( 'array' ) );
+        Functions\expect( 'add_action' )
+            ->once()
+            ->with( 'save_post_' . ID::POST_TYPE_SERMON, \Mockery::type( 'array' ), 99, 1 );
+
+        ( new CoverageAudit() )->hook();
+        $this->addToAssertionCount( 1 );
+    }
+
     public function test_register_site_health_test_adds_a_direct_test(): void {
         $audit = $this->auditOver( array() );
 

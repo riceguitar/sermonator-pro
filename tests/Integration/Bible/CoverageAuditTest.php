@@ -70,6 +70,28 @@ final class CoverageAuditTest extends WP_UnitTestCase {
         $this->assertSame( $stats, CoverageAudit::stats() );
     }
 
+    /**
+     * Production-wiring guard: the previous test calls `$audit->hook()` itself, so it
+     * stays green even if NOTHING in production instantiates CoverageAudit. This test
+     * asserts the LIVE filter — registered by `Plugin::boot()` during plugin load (see
+     * tests/bootstrap-integration.php), with no manual `hook()` here — so a regression
+     * that drops the wiring from Plugin::boot() (the Task-13 "ships dark" failure) fails
+     * loudly. Booting is idempotent (static guard), so the wiring is already in place.
+     */
+    public function test_plugin_boot_registers_the_site_health_test_in_production(): void {
+        // No $audit->hook() here on purpose — this must be wired by Plugin::boot().
+        \Sermonator\Plugin::boot();
+
+        $tests = apply_filters( 'site_status_tests', array( 'direct' => array(), 'async' => array() ) );
+
+        $this->assertArrayHasKey(
+            CoverageAudit::SITE_HEALTH_TEST,
+            $tests['direct'],
+            'Plugin::boot() must wire CoverageAudit so the Site Health test is registered in production.'
+        );
+        $this->assertIsCallable( $tests['direct'][ CoverageAudit::SITE_HEALTH_TEST ]['test'] );
+    }
+
     public function test_site_health_filter_registers_a_reader_that_uses_persisted_stats(): void {
         $audit = new CoverageAudit();
         $audit->hook();
