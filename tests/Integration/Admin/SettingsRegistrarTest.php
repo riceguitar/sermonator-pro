@@ -24,8 +24,12 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         delete_option( 'sermonmanager_verse_bible_version' );
         delete_option( Identifiers::OPTION_PREFIX . 'verse_bible_version' );
 
-        ( new SettingsRegistrar() )->hook();
-        do_action( 'admin_init' );
+        // The plugin's boot() already wired SettingsRegistrar->hook() (the add_option_/
+        // update_option_ cache-gen listeners + the admin_init/rest_api_init register hooks).
+        // Do NOT call hook() again — a second instance would DUPLICATE those listeners and
+        // double-bump the cache generation. admin_init/rest_api_init don't fire in this CLI
+        // harness, so call register() directly to populate register_setting/allowed_options.
+        ( new SettingsRegistrar() )->register();
     }
 
     protected function tearDown(): void {
