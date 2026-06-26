@@ -42,6 +42,7 @@ final class Plugin {
 
         ( new \Sermonator\Model\Registrar() )->hook();
         ( new \Sermonator\Model\Capabilities() )->grant();
+        ( new \Sermonator\Admin\Authoring\AuthoringServiceProvider() )->hook();
 
         self::registerAdmin();
         self::registerFrontend();

@@ -1,0 +1,22 @@
+{
+  "name": "sermonator-pro",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sermonator — sermon authoring panel build toolchain",
+  "license": "GPL-2.0-or-later",
+  "scripts": {
+    "build": "npm run build:sermon-details && npm run build:meta-box",
+    "build:sermon-details": "wp-scripts build src/editor/sermon-details/index.js --output-path=build/sermon-details",
+    "build:meta-box": "wp-scripts build src/editor/meta-box/index.js --output-path=build/meta-box",
+    "start": "wp-scripts start src/editor/sermon-details/index.js --output-path=build/sermon-details",
+    "start:meta-box": "wp-scripts start src/editor/meta-box/index.js --output-path=build/meta-box",
+    "lint:js": "wp-scripts lint-js src/editor",
+    "format:js": "wp-scripts format src/editor"
+  },
+  "devDependencies": {
+    "@wordpress/scripts": "^32.0.0"
+  },
+  "browserslist": [
+    "extends @wordpress/browserslist-config"
+  ]
+}

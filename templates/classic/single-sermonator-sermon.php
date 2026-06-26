@@ -25,12 +25,15 @@ while ( have_posts() ) {
 
     echo '<article class="sermonator-single">';
     echo '<h1 class="sermonator-single__title">' . esc_html( get_the_title() ) . '</h1>';
+    echo $r->featuredImage( $view ); // phpcs:ignore WordPress.Security.EscapeOutput — escaped in Renderer
     echo $r->meta( $view );        // phpcs:ignore WordPress.Security.EscapeOutput — escaped in Renderer
     echo $r->audioPlayer( $view ); // phpcs:ignore WordPress.Security.EscapeOutput — escaped in Renderer
     echo $r->video( $view );       // phpcs:ignore WordPress.Security.EscapeOutput — escaped in Renderer
+    echo $r->bulletin( $view );      // phpcs:ignore WordPress.Security.EscapeOutput — escaped in Renderer
     echo '<div class="sermonator-single__body">';
     the_content();
     echo '</div>';
+    echo $r->notes( $view );         // phpcs:ignore WordPress.Security.EscapeOutput — escaped in Renderer
     echo '</article>';
 }
 

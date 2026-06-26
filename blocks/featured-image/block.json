@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/featured-image",
+  "title": "Sermon Featured Image",
+  "category": "widgets",
+  "icon": "format-image",
+  "description": "The featured image for a sermon.",
+  "textdomain": "sermonator",
+  "usesContext": [ "postId" ],
+  "attributes": {
+    "postId": { "type": "number" }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}

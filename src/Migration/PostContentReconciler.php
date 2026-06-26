@@ -32,6 +32,21 @@ final class PostContentReconciler {
             $representedCorpus .= "\n\n" . $postContentTemp;
         }
 
+        // Promotion: if description carries no substantive body but the legacy
+        // post_content does (and that body is not already captured by
+        // post_content_temp), make the legacy body the canonical content. Without
+        // this, sermons whose real body lived in post_content rather than
+        // sermon_description end up with an empty post_content and their text hidden
+        // away in a backup meta row.
+        if ( self::isEmptyAsBody( $content )
+            && self::isUniqueSubstantive( $oldPostContent, $representedCorpus ) ) {
+            return array(
+                'content' => $oldPostContent,
+                'backup'  => null,
+                'flag'    => true,
+            );
+        }
+
         // Only $oldPostContent can land in the backup. post_content_temp is never
         // backed up (single canonical home = its own meta row → no double-flag).
         $pieces = array();
@@ -69,6 +84,15 @@ final class PostContentReconciler {
             return true;
         }
         return ! str_contains( self::visibleText( $description ), self::visibleText( $blob ) );
+    }
+
+    /**
+     * True if a string has no visible text and no structural/shortcode payload —
+     * i.e. it cannot serve as a canonical sermon body on its own.
+     */
+    private static function isEmptyAsBody( ?string $text ): bool {
+        $text = $text ?? '';
+        return trim( $text ) === '' && ! self::hasStructuralPayload( $text, '' );
     }
 
     /**

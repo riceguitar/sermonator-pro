@@ -46,6 +46,9 @@ final class RendererTest extends TestCase {
             videoEmbed: $over['embed'] ?? '',
             videoUrl: $over['vurl'] ?? '',
             views: 0,
+            imageId: $over['imageId'] ?? 0,
+            bulletinUrl: $over['bulletinUrl'] ?? '',
+            notes: $over['notes'] ?? '',
             preachers: $over['preachers'] ?? array( array( 'name' => 'Pastor John', 'url' => 'http://x/p' ) ),
         );
     }
@@ -142,5 +145,40 @@ final class RendererTest extends TestCase {
         $without = ( new Renderer() )->taxonomyLinks( $terms, 'Topics', false );
         $this->assertStringContainsString( 'sermonator-termlist__count', $with );
         $this->assertStringNotContainsString( 'sermonator-termlist__count', $without );
+    }
+
+    public function test_featured_image_empty_when_no_image(): void {
+        $this->assertSame( '', ( new Renderer() )->featuredImage( $this->view() ) );
+    }
+
+    public function test_featured_image_renders_thumbnail(): void {
+        Functions\when( 'get_the_post_thumbnail' )->justReturn( '<img src="http://x/img.jpg" alt="">' );
+        $html = ( new Renderer() )->featuredImage( $this->view( array( 'imageId' => 42 ) ) );
+        $this->assertStringContainsString( 'sermonator-single__media', $html );
+        $this->assertStringContainsString( '<img src="http://x/img.jpg" alt="">', $html );
+    }
+
+    public function test_bulletin_empty_when_no_url(): void {
+        $this->assertSame( '', ( new Renderer() )->bulletin( $this->view() ) );
+    }
+
+    public function test_bulletin_renders_download_link(): void {
+        $html = ( new Renderer() )->bulletin( $this->view( array( 'bulletinUrl' => 'http://x/bulletin.pdf' ) ) );
+        $this->assertStringContainsString( 'sermonator-bulletin', $html );
+        $this->assertStringContainsString( 'http://x/bulletin.pdf', $html );
+        $this->assertStringContainsString( 'Download bulletin', $html );
+        $this->assertStringContainsString( 'download', $html );
+    }
+
+    public function test_notes_empty_when_no_notes(): void {
+        $this->assertSame( '', ( new Renderer() )->notes( $this->view() ) );
+    }
+
+    public function test_notes_renders_download_link(): void {
+        $html = ( new Renderer() )->notes( $this->view( array( 'notes' => 'http://x/notes.pdf' ) ) );
+        $this->assertStringContainsString( 'sermonator-notes', $html );
+        $this->assertStringContainsString( 'http://x/notes.pdf', $html );
+        $this->assertStringContainsString( 'Download sermon notes', $html );
+        $this->assertStringContainsString( 'download', $html );
     }
 }

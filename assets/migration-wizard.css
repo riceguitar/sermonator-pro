@@ -61,6 +61,7 @@
 	margin-top: 1em;
 	min-height: 1.4em;
 	color: #50575e;
+	white-space: pre-wrap;
 }
 
 .sermonator-migrate-log.is-error {

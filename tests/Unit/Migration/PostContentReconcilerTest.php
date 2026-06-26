@@ -27,11 +27,11 @@ final class PostContentReconcilerTest extends TestCase {
         $this->assertFalse( $out['flag'] );
     }
 
-    public function test_preserves_and_flags_unique_blob_content(): void {
-        // Rare case: real content lived only in the editor (post_content), not in the description.
+    public function test_promotes_unique_blob_to_content_when_description_empty(): void {
+        // Real content lived only in the editor (post_content), not in the description.
         $out = PostContentReconciler::reconcile( 'Unique content only here', null );
-        $this->assertSame( '', $out['content'] ); // description is the canonical body going forward...
-        $this->assertSame( 'Unique content only here', $out['backup'] ); // ...but unique text is never dropped
+        $this->assertSame( 'Unique content only here', $out['content'] );
+        $this->assertNull( $out['backup'] );
         $this->assertTrue( $out['flag'] );
     }
 
@@ -58,31 +58,42 @@ final class PostContentReconcilerTest extends TestCase {
         $this->assertFalse( $out['flag'] );
     }
 
-    public function test_iframe_only_blob_with_empty_description_is_preserved(): void {
+    public function test_blob_already_in_temp_is_not_promoted_to_content(): void {
+        // post_content_temp already captures the body; it has its own canonical home.
+        $out = PostContentReconciler::reconcile( 'Shared body', null, 'Shared body' );
+        $this->assertSame( '', $out['content'] );
+        $this->assertNull( $out['backup'] );
+        $this->assertFalse( $out['flag'] );
+    }
+
+    public function test_iframe_only_blob_with_empty_description_is_promoted(): void {
         // MUST-FIX #1: a media-only blob has NO visible text after strip_tags, but
-        // hasStructuralPayload() is true — the embed must be backed up and flagged,
+        // hasStructuralPayload() is true — the embed must become canonical content,
         // never dropped to nowhere.
         $out = PostContentReconciler::reconcile( '<iframe src="https://player.example/embed/1"></iframe>', null );
-        $this->assertNotNull( $out['backup'], 'iframe-only blob must be backed up' );
-        $this->assertSame( '<iframe src="https://player.example/embed/1"></iframe>', $out['backup'] );
+        $this->assertSame( '<iframe src="https://player.example/embed/1"></iframe>', $out['content'] );
+        $this->assertNull( $out['backup'] );
         $this->assertTrue( $out['flag'] );
     }
 
-    public function test_audio_only_blob_with_empty_description_is_preserved(): void {
+    public function test_audio_only_blob_with_empty_description_is_promoted(): void {
         $out = PostContentReconciler::reconcile( '<audio src="https://media.example/s.mp3"></audio>', '' );
-        $this->assertNotNull( $out['backup'], 'audio-only blob must be backed up' );
+        $this->assertSame( '<audio src="https://media.example/s.mp3"></audio>', $out['content'] );
+        $this->assertNull( $out['backup'] );
         $this->assertTrue( $out['flag'] );
     }
 
-    public function test_video_only_blob_with_empty_description_is_preserved(): void {
+    public function test_video_only_blob_with_empty_description_is_promoted(): void {
         $out = PostContentReconciler::reconcile( '<video><source src="https://media.example/s.mp4"></video>', null );
-        $this->assertNotNull( $out['backup'], 'video-only blob must be backed up' );
+        $this->assertSame( '<video><source src="https://media.example/s.mp4"></video>', $out['content'] );
+        $this->assertNull( $out['backup'] );
         $this->assertTrue( $out['flag'] );
     }
 
-    public function test_embed_only_blob_with_empty_description_is_preserved(): void {
+    public function test_embed_only_blob_with_empty_description_is_promoted(): void {
         $out = PostContentReconciler::reconcile( '<embed src="https://media.example/s.swf">', null );
-        $this->assertNotNull( $out['backup'], 'embed-only blob must be backed up' );
+        $this->assertSame( '<embed src="https://media.example/s.swf">', $out['content'] );
+        $this->assertNull( $out['backup'] );
         $this->assertTrue( $out['flag'] );
     }
 

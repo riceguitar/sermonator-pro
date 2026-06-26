@@ -25,17 +25,21 @@ use Sermonator\Schema\Identifiers as ID;
 final class AudioSizeBackfill {
     public const LOG_OPTION = 'sermonator_enclosure_backfill_log';
 
-    /** Reject an absurd Content-Length (> 4 GB) — a sermon audio file is never this large,
-     *  and a bogus huge size would advertise a broken enclosure AND be unrepairable (the
-     *  candidate query would never re-select a "real" positive size). */
-    private const MAX_SIZE_BYTES = 4_294_967_296;
+    /**
+     * Kept for backward compatibility with existing tests. The canonical limit lives in
+     * {@see AudioHeadProbe::MAX_SIZE_BYTES}.
+     */
+    public const MAX_SIZE_BYTES = AudioHeadProbe::MAX_SIZE_BYTES;
 
     /** @var callable(string):?int */
     private $sizeFetcher;
 
     /** @param callable(string):?int|null $sizeFetcher Resolve a URL to a byte size (null = unresolved). */
     public function __construct( ?callable $sizeFetcher = null ) {
-        $this->sizeFetcher = $sizeFetcher ?? array( $this, 'fetchViaHead' );
+        $this->sizeFetcher = $sizeFetcher ?? static function ( string $url ): ?int {
+            $probed = AudioHeadProbe::probe( $url );
+            return $probed['size'];
+        };
     }
 
     /**
@@ -58,7 +62,7 @@ final class AudioSizeBackfill {
                 continue;
             }
             $size = ( $this->sizeFetcher )( $url );
-            if ( ! is_int( $size ) || $size <= 0 || $size > self::MAX_SIZE_BYTES ) {
+            if ( ! is_int( $size ) || $size <= 0 || $size > AudioHeadProbe::MAX_SIZE_BYTES ) {
                 ++$failed;
                 continue;
             }
@@ -137,29 +141,5 @@ final class AudioSizeBackfill {
             $log[] = $id;
             update_option( self::LOG_OPTION, $log, false );
         }
-    }
-
-    private function fetchViaHead( string $url ): ?int {
-        // Only fetch http(s); reject_unsafe_urls engages core's internal-host/redirect guard
-        // (SSRF defence — the audio URL is admin-entered but not fully trusted on a migrated
-        // multi-author site).
-        $scheme = strtolower( (string) wp_parse_url( $url, PHP_URL_SCHEME ) );
-        if ( $scheme !== 'http' && $scheme !== 'https' ) {
-            return null;
-        }
-        $response = wp_remote_head( $url, array(
-            'timeout'            => 10,
-            'redirection'        => 3,
-            'reject_unsafe_urls' => true,
-        ) );
-        if ( is_wp_error( $response ) ) {
-            return null;
-        }
-        $length = wp_remote_retrieve_header( $response, 'content-length' );
-        if ( is_array( $length ) ) {
-            $length = end( $length );
-        }
-        $length = (int) $length;
-        return ( $length > 0 && $length <= self::MAX_SIZE_BYTES ) ? $length : null;
     }
 }
