@@ -119,21 +119,35 @@ final class DisplaySettingsRegistrarTest extends WP_UnitTestCase {
     }
 
     public function test_register_does_not_register_the_bible_options(): void {
-        // A fresh registrar in isolation: capture only what IT registers.
+        // Baseline: only DisplaySettingsRegistrar has run (setUp); SettingsRegistrar
+        // — the sole owner of the two Bible options — has NOT run in this test.
         global $wp_registered_settings;
-        $before = $wp_registered_settings;
+        $before = array_keys( (array) $wp_registered_settings );
 
         // Re-running register() is idempotent for our three keys and must never
         // introduce a Bible key.
         ( new DisplaySettingsRegistrar() )->register();
 
+        $after = array_keys( (array) $wp_registered_settings );
+
+        // The registrar owns exactly the three Display keys.
         $this->assertArrayHasKey( ID::OPTION_ARCHIVE_SLUG, (array) $wp_registered_settings );
         $this->assertArrayHasKey( ID::OPTION_DEFAULT_IMAGE_ID, (array) $wp_registered_settings );
         $this->assertArrayHasKey( ID::OPTION_PREACHER_LABEL, (array) $wp_registered_settings );
 
-        // This registrar contributes nothing toward the Bible options (owned by
-        // SettingsRegistrar). If they appear at all it is only because that other
-        // registrar ran — so assert our registrar adds neither.
-        unset( $before );
+        // The headline Bundle-4 invariant: this registrar must NEVER re-register
+        // the two Bible options (which SettingsRegistrar owns). They are absent
+        // because SettingsRegistrar has not run — so if DisplaySettingsRegistrar
+        // touched them they would appear here. Assert directly that it does not.
+        $this->assertArrayNotHasKey( ID::OPTION_BIBLE_LINK_VERSION, (array) $wp_registered_settings );
+        $this->assertArrayNotHasKey( ID::OPTION_BIBLE_INLINE_TRANSLATION, (array) $wp_registered_settings );
+
+        // And the delta a re-run introduces is empty — it adds neither Bible key
+        // nor anything else (idempotent), so the registered set is unchanged.
+        $this->assertSame(
+            array(),
+            array_values( array_diff( $after, $before ) ),
+            'Re-running register() must introduce no new registered settings (no Bible keys, no churn).'
+        );
     }
 }
