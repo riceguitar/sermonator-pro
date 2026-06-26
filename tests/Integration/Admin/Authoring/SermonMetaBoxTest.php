@@ -29,7 +29,7 @@ final class SermonMetaBoxTest extends WP_UnitTestCase {
 		global $wp_meta_boxes;
 
 		// Force meta-box registration on the current screen.
-		add_meta_boxes( Identifiers::POST_TYPE_SERMON, get_post( self::factory()->post->create( array(
+		do_action( 'add_meta_boxes', Identifiers::POST_TYPE_SERMON, get_post( self::factory()->post->create( array(
 			'post_type' => Identifiers::POST_TYPE_SERMON,
 		) ) ) );
 
@@ -40,7 +40,7 @@ final class SermonMetaBoxTest extends WP_UnitTestCase {
 		$post_id = self::factory()->post->create( array( 'post_type' => Identifiers::POST_TYPE_SERMON ) );
 
 		$_POST['sermonator_meta_box_nonce'] = wp_create_nonce( SermonMetaBox::NONCE_ACTION );
-		$_POST['sermonator_meta_json']      = wp_json_encode( array(
+		$_POST['sermonator_meta_json']      = wp_slash( wp_json_encode( array(
 			Identifiers::META_BIBLE_PASSAGE => 'John 3:16',
 			Identifiers::META_AUDIO         => 'https://example.com/audio.mp3',
 			Identifiers::META_AUDIO_ID      => 42,
@@ -49,7 +49,7 @@ final class SermonMetaBoxTest extends WP_UnitTestCase {
 			Identifiers::META_DATE_AUTO     => 1,
 			Identifiers::META_VIDEO_EMBED   => '<iframe src="https://example.com/embed"></iframe>',
 			Identifiers::META_VIEWS         => 9999,
-		) );
+		) ) );
 
 		( new SermonMetaBox() )->save( $post_id );
 

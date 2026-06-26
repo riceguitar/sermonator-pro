@@ -341,16 +341,6 @@ final class SermonWriter {
             $flags[] = 'post_content_preserved';
         }
 
-        // Fix 5: PostContentReconciler::reconcile() returns flag=true with backup=null
-        // when it PROMOTED the legacy post_content to be the canonical body (i.e. the
-        // description was empty but post_content held substantive text). Previously
-        // SermonWriter never read the flag in this branch, so the promotion was silent.
-        // Surface it so verifiers and operators can see which sermons had their body
-        // sourced from post_content rather than sermon_description.
-        if ( $reconciled['flag'] && null === $reconciled['backup'] ) {
-            $flags[] = 'post_content_promoted';
-        }
-
         // Slug drift: WP may uniquify post_name on insert. Record the original
         // legacy slug and flag the change.
         $insertedSlug = (string) get_post_field( 'post_name', $newId );
