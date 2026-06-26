@@ -21,9 +21,20 @@ use Sermonator\Schema\Identifiers as ID;
  * all run the post body through `the_content`, hooking here renders the section
  * once on every surface from one place.
  *
- * Guards mirror {@see \Sermonator\Frontend\ClassicTemplates::maybeAppendMeta()}:
- * is_singular( sermon ) + in_the_loop() + is_main_query(), so it never fires on
- * archives, secondary loops, or the_content uses outside the main sermon body.
+ * Guard is a queried-object IDENTITY check — is_singular( sermon ) +
+ * is_main_query() + the post being filtered IS the queried object — NOT
+ * in_the_loop(). in_the_loop() is set only by the singular main loop's
+ * the_post(), which WordPress runs solely when the active template id starts
+ * with the active theme's stylesheet slug (see get_the_block_template_html in
+ * wp-includes/block-template.php). Our own registered single template id is
+ * `sermonator//single-…` (never `<stylesheet>//…`), so on the DEFAULT
+ * block-theme surface core takes the `else` branch and runs do_blocks()
+ * WITHOUT the_post() → in_the_loop() is false when core/post-content fires
+ * the_content, which would silently ship scripture dark there (spec §5,
+ * Risk #4). The identity guard holds on all three surfaces — classic
+ * the_post() loop, block core/post-content, theme override — while still
+ * excluding archives, secondary loops/excerpts (their post id differs from
+ * the queried object), and nested the_content.
  *
  * Resolution is impure and happens HERE, at template time
  * ({@see BibleResolver::resolve()} reads meta + options), keeping the
@@ -37,7 +48,9 @@ final class ScriptureRenderHook {
     }
 
     public function appendScripture( string $content ): string {
-        if ( ! is_singular( ID::POST_TYPE_SERMON ) || ! in_the_loop() || ! is_main_query() ) {
+        if ( ! is_singular( ID::POST_TYPE_SERMON )
+            || ! is_main_query()
+            || (int) get_the_ID() !== (int) get_queried_object_id() ) {
             return $content;
         }
 
