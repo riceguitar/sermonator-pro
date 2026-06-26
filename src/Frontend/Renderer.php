@@ -17,7 +17,8 @@ final class Renderer {
         if ( $v->biblePassage !== '' ) {
             $rows .= $this->row( 'passage', __( 'Scripture', 'sermonator' ), esc_html( $v->biblePassage ) );
         }
-        $rows .= $this->termRow( 'preacher', __( 'Preacher', 'sermonator' ), $v->preachers );
+        $preacherLabel = $v->preacherLabel !== '' ? $v->preacherLabel : __( 'Preacher', 'sermonator' );
+        $rows         .= $this->termRow( 'preacher', $preacherLabel, $v->preachers );
         $rows .= $this->termRow( 'series', __( 'Series', 'sermonator' ), $v->series );
 
         $date = $this->dateLabel( $v );

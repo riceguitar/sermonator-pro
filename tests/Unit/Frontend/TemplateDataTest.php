@@ -15,6 +15,13 @@ final class TemplateDataTest extends TestCase {
         parent::setUp();
         Monkey\setUp();
         Functions\when( 'is_wp_error' )->justReturn( false );
+        // TemplateData resolves the preacher-row label via get_option (with an
+        // explicit DisplayDefaults fallback); the seed resolver also reads the
+        // legacy/migrated containers. Returning the caller's default keeps these
+        // term/meta-focused tests independent of the label wiring.
+        Functions\when( 'get_option' )->alias(
+            static fn( string $name, $default = false ) => $default
+        );
     }
 
     protected function tearDown(): void {

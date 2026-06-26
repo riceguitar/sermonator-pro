@@ -51,7 +51,20 @@ final class RendererTest extends TestCase {
             bulletinUrl: $over['bulletinUrl'] ?? '',
             notes: $over['notes'] ?? '',
             preachers: $over['preachers'] ?? array( array( 'name' => 'Pastor John', 'url' => 'http://x/p' ) ),
+            preacherLabel: $over['preacherLabel'] ?? '',
         );
+    }
+
+    public function test_meta_uses_threaded_preacher_label(): void {
+        $html = ( new Renderer() )->meta( $this->view( array( 'preacherLabel' => 'Speaker' ) ) );
+        $this->assertStringContainsString( '<dt>Speaker</dt>', $html );
+        $this->assertStringNotContainsString( '<dt>Preacher</dt>', $html );
+    }
+
+    public function test_meta_falls_back_to_preacher_when_label_empty(): void {
+        // Empty threaded label (the SermonView default) → the hardcoded 'Preacher' fallback.
+        $html = ( new Renderer() )->meta( $this->view( array( 'preacherLabel' => '' ) ) );
+        $this->assertStringContainsString( '<dt>Preacher</dt>', $html );
     }
 
     public function test_meta_includes_passage_and_preacher(): void {

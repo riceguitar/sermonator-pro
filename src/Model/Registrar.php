@@ -66,6 +66,25 @@ final class Registrar {
         );
     }
 
+    /**
+     * The singular preacher taxonomy label, read at `init@5` from the live
+     * {@see Identifiers::OPTION_PREACHER_LABEL} option. The plural is derived as
+     * value.'s' (TAX_PREACHER is a flat, lowercase-named taxonomy; a simple suffix
+     * matches the pre-existing "Preachers"/"Preacher" pairing).
+     *
+     * Mirrors {@see archiveSlug()}: `register_setting()`'s registered default is
+     * absent at `init@5`, so the EXPLICIT {@see DisplayDefaults::preacherLabel()}
+     * fallback is the only thing that seeds the value on this path. The identical
+     * read+fallback runs in {@see \Sermonator\Frontend\TemplateData::preacherLabel()}
+     * so the taxonomy label and the single-sermon meta row can never disagree.
+     */
+    private function preacherLabel(): string {
+        return (string) get_option(
+            Identifiers::OPTION_PREACHER_LABEL,
+            DisplayDefaults::preacherLabel()
+        );
+    }
+
     private function registerPodcastPostType(): void {
         register_post_type(
             Identifiers::POST_TYPE_PODCAST,
@@ -84,8 +103,10 @@ final class Registrar {
     }
 
     private function registerTaxonomies(): void {
+        $preacher = $this->preacherLabel();
+
         $labels = array(
-            Identifiers::TAX_PREACHER     => array( __( 'Preachers', 'sermonator' ), __( 'Preacher', 'sermonator' ) ),
+            Identifiers::TAX_PREACHER     => array( $preacher . 's', $preacher ),
             Identifiers::TAX_SERIES       => array( __( 'Series', 'sermonator' ), __( 'Series', 'sermonator' ) ),
             Identifiers::TAX_TOPIC        => array( __( 'Topics', 'sermonator' ), __( 'Topic', 'sermonator' ) ),
             Identifiers::TAX_BOOK         => array( __( 'Books', 'sermonator' ), __( 'Book', 'sermonator' ) ),

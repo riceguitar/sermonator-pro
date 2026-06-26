@@ -36,6 +36,7 @@ final class SermonView {
         public readonly array $series = array(),
         public readonly array $topics = array(),
         public readonly array $books = array(),
-        public readonly array $serviceTypes = array()
+        public readonly array $serviceTypes = array(),
+        public readonly string $preacherLabel = ''
     ) {}
 }

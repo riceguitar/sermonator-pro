@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Sermonator\Frontend;
 
+use Sermonator\Schema\DisplayDefaults;
 use Sermonator\Schema\Identifiers as ID;
 
 /**
@@ -37,6 +38,22 @@ final class TemplateData {
             topics:            $this->terms( $postId, ID::TAX_TOPIC ),
             books:             $this->terms( $postId, ID::TAX_BOOK ),
             serviceTypes:      $this->terms( $postId, ID::TAX_SERVICE_TYPE ),
+            preacherLabel:     $this->preacherLabel(),
+        );
+    }
+
+    /**
+     * Resolve the singular preacher meta-row label, read here (impurely) so the
+     * pure {@see Renderer} never touches `get_option`. Mirrors {@see \Sermonator\Model\Registrar}:
+     * the live {@see ID::OPTION_PREACHER_LABEL} option with an EXPLICIT
+     * {@see DisplayDefaults::preacherLabel()} fallback — `register_setting()`'s
+     * registered default is absent on the front end, so the explicit fallback is
+     * the only thing that seeds the value on this path.
+     */
+    private function preacherLabel(): string {
+        return (string) get_option(
+            ID::OPTION_PREACHER_LABEL,
+            DisplayDefaults::preacherLabel()
         );
     }
 
