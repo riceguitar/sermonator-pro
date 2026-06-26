@@ -371,6 +371,19 @@ final class SettingsPage {
 
         if ( 'checkbox' === $type ) {
             $checked = ! empty( $value ) ? ' checked' : '';
+            // An unchecked HTML checkbox submits NO key, and PodcastIdentityController::writeThrough
+            // collects by array_key_exists + array_merge — so without this companion an unchecked box
+            // would leave the stored value untouched, making `explicit` (the only T_BOOL field, emitted
+            // as <itunes:explicit> to Apple/Spotify) a one-way latch that can be turned ON but never
+            // OFF through the UI. The standard WP hidden-companion guarantees the key is ALWAYS present:
+            // checked posts "1", unchecked posts the hidden "0" (last value wins), and
+            // PodcastMetaSchema::toBool('0') resolves to false so the merge can clear the flag.
+            //
+            // Suppressed when read-only (the checkbox is disabled and the controller refuses the write
+            // regardless): no companion means a mid-migration save can't even appear to submit a value.
+            if ( ! $this->podcastReadOnly ) {
+                echo '<input type="hidden" name="' . esc_attr( $key ) . '" value="0">';
+            }
             echo '<label><input type="checkbox" id="' . esc_attr( $id ) . '" name="' . esc_attr( $key ) . '" value="1"' . $checked . $disabled . '> ' . esc_html__( 'Yes', 'sermonator' ) . '</label>';
             return;
         }

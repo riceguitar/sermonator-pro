@@ -221,6 +221,51 @@ final class SettingsPageTest extends WP_UnitTestCase {
         $this->assertStringContainsString( 'value="pastor@example.com"', $html );
     }
 
+    /**
+     * The 'explicit' checkbox (the only T_BOOL field, emitted as <itunes:explicit> to Apple/Spotify)
+     * MUST render a hidden companion input value="0" immediately before it, so an unchecked box still
+     * submits the key. Without it, PodcastIdentityController::writeThrough (merge-by-presence) could
+     * never clear a stored explicit=true through the UI — a one-way latch. The companion is the
+     * standard WP pattern: checked posts "1", unchecked posts the hidden "0" (last value wins).
+     */
+    public function test_explicit_checkbox_emits_hidden_companion_when_editable(): void {
+        // No legacy data → editable (not read-only).
+        ( new SettingsPage() )->registerSections();
+        $html = $this->renderToString( new SettingsPage() );
+
+        // The hidden companion precedes the visible checkbox, both named "explicit".
+        $this->assertStringContainsString(
+            '<input type="hidden" name="explicit" value="0">',
+            $html,
+            'Editable explicit checkbox must have a hidden value="0" companion so unchecking clears the flag.'
+        );
+        // And the visible checkbox posts "1".
+        $this->assertMatchesRegularExpression(
+            '/name="explicit" value="0">.*type="checkbox"[^>]*name="explicit" value="1"/s',
+            $html,
+            'The hidden companion must come BEFORE the checkbox (last value wins).'
+        );
+    }
+
+    /**
+     * In the read-only podcast section (migration mid-flight) the checkbox is disabled and the
+     * controller refuses the write regardless, so the hidden companion is suppressed — a mid-migration
+     * save must not even appear to submit a value.
+     */
+    public function test_explicit_checkbox_suppresses_hidden_companion_when_read_only(): void {
+        $this->fixture->createSermon();              // legacy data present
+        ( new MigrationState() )->set( 'detected' ); // phase != finalized
+
+        ( new SettingsPage() )->registerSections();
+        $html = $this->renderToString( new SettingsPage() );
+
+        $this->assertStringNotContainsString(
+            '<input type="hidden" name="explicit" value="0">',
+            $html,
+            'Read-only podcast section must NOT emit the explicit hidden companion.'
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Settings-save round-trip (Form 1 / options.php sanitize path)
     // -------------------------------------------------------------------------

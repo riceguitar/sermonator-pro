@@ -169,6 +169,33 @@ final class PodcastIdentityControllerTest extends WP_UnitTestCase {
         $this->assertSame( array( 12, 13 ), $settings['sermonator_series'] );
     }
 
+    // --- explicit checkbox toggle (hidden-companion round-trip) -------------
+
+    /**
+     * The 'explicit' flag is the only T_BOOL/checkbox field, and it is the value the feed emits as
+     * <itunes:explicit> to Apple/Spotify. An unchecked HTML checkbox submits NO key; the SettingsPage
+     * hidden companion (value="0") guarantees the key is ALWAYS present so writeThrough collects it.
+     * This proves the controller side: once explicit=true is stored, a save carrying explicit='0'
+     * (what the unchecked box posts) clears it back to false — the true→false transition the old
+     * merge-by-presence design could never express.
+     */
+    public function test_explicit_can_be_toggled_off_via_hidden_companion_zero(): void {
+        $controller = new PodcastIdentityController();
+
+        // First save: church marks the feed explicit (checked box posts '1').
+        $controller->handle( $this->request( array( 'title' => 'Grace Sermons', 'explicit' => '1' ) ) );
+        $podcastId = (int) get_option( Identifiers::OPTION_DEFAULT_PODCAST, 0 );
+        $stored    = get_post_meta( $podcastId, Identifiers::META_PODCAST_SETTINGS, true );
+        $this->assertTrue( $stored['explicit'], 'explicit must store true when the box is checked.' );
+
+        // Second save: box unchecked → the hidden companion posts '0' (key present).
+        $controller->handle( $this->request( array( 'title' => 'Grace Sermons', 'explicit' => '0' ) ) );
+        $stored = get_post_meta( $podcastId, Identifiers::META_PODCAST_SETTINGS, true );
+
+        // PodcastMetaSchema::toBool('0') → false, and the merge overwrites the prior true.
+        $this->assertFalse( $stored['explicit'], 'An unchecked box (hidden 0) must clear explicit back to false.' );
+    }
+
     // --- sanitize-at-write (feed-injection hardening) -----------------------
 
     public function test_owner_email_is_sanitized_on_write(): void {
