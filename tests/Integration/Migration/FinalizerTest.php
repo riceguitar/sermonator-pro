@@ -46,6 +46,7 @@ final class FinalizerTest extends WP_UnitTestCase {
         delete_option( Identifiers::OPTION_MIGRATION_PROGRESS );
         delete_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
         delete_option( Orchestrator::OPTION_LOCK );
+        delete_option( Identifiers::OPTION_LEGACY_PODCAST_MAP );
     }
 
     protected function tearDown(): void {
@@ -53,6 +54,7 @@ final class FinalizerTest extends WP_UnitTestCase {
         delete_option( Identifiers::OPTION_MIGRATION_PROGRESS );
         delete_option( Identifiers::OPTION_PRE_MIGRATION_BACKUP );
         delete_option( Orchestrator::OPTION_LOCK );
+        delete_option( Identifiers::OPTION_LEGACY_PODCAST_MAP );
         parent::tearDown();
     }
 
@@ -640,5 +642,61 @@ final class FinalizerTest extends WP_UnitTestCase {
         $this->assertSame( array(), $second['deleted']['options'] );
         $this->assertSame( 0, $second['stripped'] );
         $this->assertSame( 'finalized', ( new MigrationState() )->phase() );
+    }
+
+    // -------------------------------------------------------------------------
+    // Durable legacy podcast map: populated at migrate time, survives Finalize,
+    // and hard-guards a multi-podcast finalize against silent mapping loss.
+    // -------------------------------------------------------------------------
+
+    public function test_durable_podcast_map_populated_at_migrate_and_survives_finalize(): void {
+        $data    = $this->seedDataset();
+        $legacy  = (int) $data['podcast'];
+        $this->migrateAndVerify();
+
+        $newPodcast = Crosswalk::findNewByLegacyId( $legacy, Identifiers::POST_TYPE_PODCAST );
+        $this->assertIsInt( $newPodcast );
+
+        // Map is populated BEFORE Finalize, while the back-ref still exists.
+        $mapBefore = get_option( Identifiers::OPTION_LEGACY_PODCAST_MAP );
+        $this->assertIsArray( $mapBefore );
+        $this->assertSame( $newPodcast, (int) ( $mapBefore[ $legacy ] ?? 0 ),
+            'PodcastWriter must record legacy->new podcast id in the durable map at migrate time.' );
+
+        $result = ( new Finalizer() )->run( true );
+        $this->assertNull( $result['refused'] );
+
+        // The Crosswalk back-ref is stripped, but the durable map SURVIVES Finalize.
+        $this->assertSame( '', (string) get_post_meta( $newPodcast, Crosswalk::LEGACY_POST_ID, true ),
+            'Finalize must strip the Crosswalk back-ref.' );
+        $mapAfter = get_option( Identifiers::OPTION_LEGACY_PODCAST_MAP );
+        $this->assertIsArray( $mapAfter );
+        $this->assertSame( $newPodcast, (int) ( $mapAfter[ $legacy ] ?? 0 ),
+            'The durable podcast map must survive Finalize so legacy feed URLs keep resolving.' );
+    }
+
+    public function test_refuses_multi_podcast_finalize_when_durable_map_incomplete(): void {
+        // Seed TWO legacy podcasts so a fall-through to the default would be wrong.
+        $this->fixture->createSermon();
+        $podcastA = $this->fixture->createPodcast( 'Podcast A' );
+        $podcastB = $this->fixture->createPodcast( 'Podcast B' );
+        $this->fixture->setOption( LegacyIdentifiers::OPTION_DEFAULT_PODCAST, $podcastA );
+
+        $this->migrateAndVerify();
+
+        // Simulate the broken pre-fix state: the durable map was never populated.
+        delete_option( Identifiers::OPTION_LEGACY_PODCAST_MAP );
+
+        $legacyBefore = $this->legacyPostIds( LegacyIdentifiers::POST_TYPE_PODCAST );
+
+        $result = ( new Finalizer() )->run( true );
+
+        $this->assertIsString( $result['refused'],
+            'Finalize must REFUSE a multi-podcast site whose durable map is incomplete.' );
+        $this->assertStringContainsString( 'podcast', strtolower( (string) $result['refused'] ) );
+        // Nothing deleted; phase stays verified for a corrected retry.
+        $this->assertSame( array(), $result['deleted']['posts'] );
+        $this->assertSame( $legacyBefore, $this->legacyPostIds( LegacyIdentifiers::POST_TYPE_PODCAST ) );
+        $this->assertSame( 'verified', ( new MigrationState() )->phase() );
     }
 }

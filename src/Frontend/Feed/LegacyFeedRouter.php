@@ -36,6 +36,13 @@ final class LegacyFeedRouter {
 
         $query_vars['feed'] = PodcastFeed::FEED;
 
+        // Clear the STALE legacy scoping vars. Left in place, the main WP_Query would
+        // still be scoped to the now-UNREGISTERED wpfc_sermon post type, match zero
+        // posts, and WP::handle_404() (no feed exemption) would status_header(404) —
+        // do_feed() would then emit an RSS body under a 404, which Apple/Google treat
+        // as "feed gone". Unsetting them lets the routed feed dispatch cleanly.
+        unset( $query_vars['post_type'], $query_vars['id'] );
+
         // phpcs:ignore WordPress.Security.NonceVerification.Recommended
         $legacyId            = isset( $_GET['id'] ) ? (int) $_GET['id'] : 0;
         $_GET['podcast']     = ( new LegacyPodcastId() )->resolve( $legacyId );

@@ -29,10 +29,28 @@ final class PodcastFeed {
         // Belt-and-suspenders: if anything routes through feed_content_type() for our feed,
         // return RSS rather than the WP default of application/octet-stream.
         add_filter( 'feed_content_type', array( $this, 'contentType' ), 10, 2 );
+        // A request for OUR feed is always valid (it renders a well-formed channel even
+        // with zero episodes), so short-circuit WP::handle_404() — which has no feed
+        // exemption and would otherwise status_header(404) when the main query matches
+        // no posts. This is what keeps the routed legacy URL on HTTP 200.
+        add_filter( 'pre_handle_404', array( $this, 'preventFeed404' ), 10, 2 );
     }
 
     public function contentType( string $type, string $feed ): string {
         return $feed === self::FEED ? 'application/rss+xml' : $type;
+    }
+
+    /**
+     * Short-circuit WP::handle_404() for our feed so the request never 404s.
+     *
+     * @param bool      $preempt  Whether to short-circuit the 404 handling.
+     * @param \WP_Query $wpQuery  The query being dispatched.
+     */
+    public function preventFeed404( $preempt, $wpQuery ) {
+        if ( $wpQuery instanceof \WP_Query && self::FEED === $wpQuery->get( 'feed' ) ) {
+            return true;
+        }
+        return $preempt;
     }
 
     public function render(): void {

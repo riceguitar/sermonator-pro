@@ -64,6 +64,25 @@ final class LegacyFeedRouterTest extends WP_UnitTestCase {
 
         $this->assertSame( PodcastFeed::FEED, $vars['feed'] );
         $this->assertSame( $new, (int) $_GET['podcast'] );
+        // The stale legacy scoping vars must be cleared so the main query is not
+        // scoped to the unregistered wpfc_sermon post type (which would 404).
+        $this->assertArrayNotHasKey( 'post_type', $vars );
+        $this->assertArrayNotHasKey( 'id', $vars );
+    }
+
+    public function test_clears_legacy_id_query_var_so_main_query_does_not_404(): void {
+        $new = $this->podcast( 'Sunday Sermons' );
+        update_option( ID::OPTION_DEFAULT_PODCAST, $new );
+
+        $vars = ( new LegacyFeedRouter() )->route( array(
+            'feed'      => 'rss2',
+            'post_type' => LegacyIdentifiers::POST_TYPE_SERMON,
+            'id'        => 5,
+        ) );
+
+        $this->assertSame( PodcastFeed::FEED, $vars['feed'] );
+        $this->assertArrayNotHasKey( 'post_type', $vars );
+        $this->assertArrayNotHasKey( 'id', $vars );
     }
 
     public function test_rewrites_legacy_sermon_feed_detected_via_raw_query_string(): void {
@@ -124,6 +143,56 @@ final class LegacyFeedRouterTest extends WP_UnitTestCase {
 
         ob_start();
         ( new PodcastFeed() )->render();
+        $xml = (string) ob_get_clean();
+
+        $this->assertNotFalse( simplexml_load_string( $xml ), 'Feed must be well-formed XML.' );
+        $this->assertStringContainsString( '<title>Sunday Sermons</title>', $xml );
+    }
+
+    /**
+     * The load-bearing invariant: the ACTUAL legacy GET request, driven through the
+     * REAL WP routing pipeline (parse_request → the `request` filter → WP_Query →
+     * handle_404 → do_feed), must NOT 404 and must dispatch OUR feed handler.
+     *
+     * This exercises the most error-prone seam — that rewriting query_vars['feed']
+     * (and clearing the stale wpfc_sermon scoping vars) causes do_feed() to fire our
+     * registered handler and yields a 200 RSS response rather than a 404 on the
+     * unregistered legacy post type.
+     */
+    public function test_legacy_get_request_dispatches_feed_via_real_pipeline_without_404(): void {
+        // The legacy post type is intentionally NOT registered post-migration — that is
+        // exactly what would 404 the URL if the router did not clear the scoping vars.
+        if ( ! post_type_exists( ID::POST_TYPE_PODCAST ) ) {
+            register_post_type( ID::POST_TYPE_PODCAST, array( 'public' => true ) );
+        }
+
+        // Register the REAL feed handler (add_feed + content type + pre_handle_404) and
+        // the legacy router (the `request` filter) onto WP's pipeline.
+        ( new PodcastFeed() )->register();
+        ( new LegacyFeedRouter() )->hook();
+
+        $new = $this->podcast( 'Sunday Sermons' );
+        update_option( ID::OPTION_DEFAULT_PODCAST, $new );
+
+        // Drive the actual legacy URL through the full pipeline. go_to() runs
+        // WP::main(): parse_request (our `request` filter rewrites feed + clears
+        // post_type/id), the main WP_Query, and handle_404 (our pre_handle_404 fires).
+        $this->go_to( home_url( '/?feed=rss2&post_type=wpfc_sermon&id=5' ) );
+
+        // (a) The legacy URL must NOT 404 — the single most load-bearing invariant.
+        $this->assertFalse( $GLOBALS['wp_query']->is_404(), 'Legacy feed URL must not 404.' );
+        $this->assertTrue( is_feed(), 'Request must be dispatched as a feed.' );
+        $this->assertSame( PodcastFeed::FEED, get_query_var( 'feed' ), 'Feed must be rewritten to ours.' );
+
+        // (b) The content type negotiated through WP must be RSS, not octet-stream.
+        $this->assertSame(
+            'application/rss+xml',
+            apply_filters( 'feed_content_type', 'application/octet-stream', get_query_var( 'feed' ) )
+        );
+
+        // (c) do_feed() must dispatch OUR registered handler and emit the migrated title.
+        ob_start();
+        do_feed();
         $xml = (string) ob_get_clean();
 
         $this->assertNotFalse( simplexml_load_string( $xml ), 'Feed must be well-formed XML.' );

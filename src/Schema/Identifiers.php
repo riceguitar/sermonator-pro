@@ -43,9 +43,11 @@ final class Identifiers {
      * back-ref meta (which the Finalizer strips), this option must survive Finalize
      * so /?feed=rss2&post_type=wpfc_sermon&id=<legacy> keeps resolving forever.
      *
-     * TODO(parity-followup): population is a SEPARATE deferred task — this map must
-     * be written at migrate time (legacy podcast id => new podcast id) and the
-     * Finalizer must NOT strip it.
+     * Populated at migrate time by PodcastWriter (legacy podcast id => new podcast id),
+     * written alongside the Crosswalk back-ref so it exists BEFORE Finalize can strip it.
+     * The Finalizer never deletes it (it is a sermonator_* option, not in the legacy
+     * sermonmanager_* delete set) and hard-refuses to finalize a multi-podcast site whose
+     * map is incomplete, so the legacy→new correspondence is never silently lost.
      */
     public const OPTION_LEGACY_PODCAST_MAP      = 'sermonator_legacy_podcast_map';
     public const META_DATE_NORMALIZED           = 'sermonator_date_normalized';

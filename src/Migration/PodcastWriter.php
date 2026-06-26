@@ -68,6 +68,10 @@ final class PodcastWriter {
                 // the meta remap so the now-available term self-heals and the open
                 // missing_podcast_term_crosswalk flag clears. A completed record with
                 // NO open term flag is left entirely untouched (no re-write).
+                // Idempotently ensure the durable map carries this pair even for a
+                // record completed by an OLDER writer that predates map population.
+                $this->recordLegacyPodcastMap( $legacyId, $existing );
+
                 $persisted = $this->readFlags( $existing );
                 if ( $this->hasOpenTermCrosswalkFlag( $persisted ) ) {
                     $flags = $this->applyScopedSettingsRemap( $existing, $legacyId, $persisted );
@@ -183,6 +187,13 @@ final class PodcastWriter {
     private function applyPostInsertSpine( int $newId, int $legacyId, array $flags ): array {
         // Back-ref FIRST, immediately after insert (unique → idempotent on resume).
         Crosswalk::markLegacy( $newId, $legacyId );
+
+        // DURABLE legacy→new podcast map, written alongside the back-ref so it exists
+        // BEFORE the Finalizer can strip LEGACY_POST_ID. This is the only post-Finalize-
+        // safe source for resolving a legacy ?id=<podcast> feed URL (see
+        // LegacyPodcastId): the Finalizer strips the Crosswalk back-ref but this option
+        // is NOT in its legacy-option delete set (sermonator_* prefix, not sermonmanager_*).
+        $this->recordLegacyPodcastMap( $legacyId, $newId );
 
         // Slug drift: WP may uniquify post_name on insert. Record the original
         // legacy slug and flag the change.
@@ -597,6 +608,27 @@ final class PodcastWriter {
     /** Write the MIGRATION_COMPLETE flag LAST (replace/unique — idempotent). */
     private function markComplete( int $newId ): void {
         update_post_meta( $newId, Crosswalk::MIGRATION_COMPLETE, '1' );
+    }
+
+    /**
+     * Record the durable legacy-podcast-id → new-podcast-id pair in
+     * OPTION_LEGACY_PODCAST_MAP. Idempotent: only writes when the entry is new or
+     * changed. This option survives Finalize (the Finalizer deletes only
+     * sermonmanager_* + a fixed legacy set, never this sermonator_* option), so legacy
+     * /?feed=rss2&post_type=wpfc_sermon&id=<legacy> URLs keep resolving to the correct
+     * podcast forever — after the Crosswalk back-ref has been stripped.
+     */
+    private function recordLegacyPodcastMap( int $legacyId, int $newId ): void {
+        if ( $legacyId <= 0 || $newId <= 0 ) {
+            return;
+        }
+        $map = get_option( Identifiers::OPTION_LEGACY_PODCAST_MAP, array() );
+        $map = is_array( $map ) ? $map : array();
+        if ( isset( $map[ $legacyId ] ) && (int) $map[ $legacyId ] === $newId ) {
+            return; // already recorded — idempotent no-op.
+        }
+        $map[ $legacyId ] = $newId;
+        update_option( Identifiers::OPTION_LEGACY_PODCAST_MAP, $map );
     }
 
     /**
