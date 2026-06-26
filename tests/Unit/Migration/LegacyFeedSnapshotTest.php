@@ -5,6 +5,7 @@ use PHPUnit\Framework\TestCase;
 use Brain\Monkey;
 use Brain\Monkey\Functions;
 use Sermonator\Migration\LegacyFeedSnapshot;
+use Sermonator\Schema\Identifiers as ID;
 
 final class LegacyFeedSnapshotTest extends TestCase {
     /** @var array<string,mixed> */
@@ -44,5 +45,38 @@ final class LegacyFeedSnapshotTest extends TestCase {
         $this->assertNull( ( new LegacyFeedSnapshot() )->guidFor( -1 ) );
         $this->assertNull( ( new LegacyFeedSnapshot() )->guidFor( 0 ) );
         $this->assertNull( ( new LegacyFeedSnapshot() )->guidFor( 99 ) );
+    }
+
+    public function test_make_durable_stamps_legacy_guid_on_new_post(): void {
+        ( new LegacyFeedSnapshot() )->store( array( 42 => 'wpfc-legacy-guid' ) );
+
+        $stamped = array();
+        Functions\when( 'update_post_meta' )->alias( function ( $postId, $key, $value ) use ( &$stamped ) {
+            $stamped[] = array( $postId, $key, $value );
+            return true;
+        } );
+
+        // new post id 5000 <- legacy id 42.
+        ( new LegacyFeedSnapshot() )->makeDurable( 5000, 42 );
+
+        $this->assertSame(
+            array( array( 5000, ID::META_LEGACY_GUID, 'wpfc-legacy-guid' ) ),
+            $stamped
+        );
+    }
+
+    public function test_make_durable_is_a_noop_without_a_snapshot_entry(): void {
+        ( new LegacyFeedSnapshot() )->store( array( 42 => 'wpfc-legacy-guid' ) );
+
+        $stamped = array();
+        Functions\when( 'update_post_meta' )->alias( function ( $postId, $key, $value ) use ( &$stamped ) {
+            $stamped[] = array( $postId, $key, $value );
+            return true;
+        } );
+
+        // Legacy id 7 has no snapshot entry (e.g. a podcast, or never captured).
+        ( new LegacyFeedSnapshot() )->makeDurable( 5000, 7 );
+
+        $this->assertSame( array(), $stamped );
     }
 }

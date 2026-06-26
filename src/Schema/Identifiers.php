@@ -50,6 +50,18 @@ final class Identifiers {
      * map is incomplete, so the legacy→new correspondence is never silently lost.
      */
     public const OPTION_LEGACY_PODCAST_MAP      = 'sermonator_legacy_podcast_map';
+
+    /**
+     * Durable per-episode legacy RSS <guid>, stamped on the NEW sermonator_sermon
+     * post id so already-subscribed podcast apps never re-download the back catalogue
+     * after the switch (rollback story 1). The post-Finalize-safe counterpart to the
+     * legacy-keyed OPTION_LEGACY_FEED_SNAPSHOT: where the snapshot is keyed by the
+     * LEGACY post id and is only reachable PRE-Finalize via the Crosswalk LEGACY_POST_ID
+     * back-ref (which the Finalizer strips), this meta is keyed by the durable NEW post
+     * id and is NEVER in Crosswalk::strippableBackRefs(), so the GUID replay survives
+     * Finalize. Finalize stamps it from the snapshot BEFORE stripping the back-ref.
+     */
+    public const META_LEGACY_GUID               = 'sermonator_legacy_guid';
     public const META_DATE_NORMALIZED           = 'sermonator_date_normalized';
 
     /**

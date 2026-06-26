@@ -72,10 +72,12 @@ use Sermonator\Schema\Identifiers;
 final class Finalizer {
     private MigrationState $state;
     private Verifier $verifier;
+    private LegacyFeedSnapshot $feedSnapshot;
 
-    public function __construct( ?MigrationState $state = null, ?Verifier $verifier = null ) {
-        $this->state    = $state ?? new MigrationState();
-        $this->verifier = $verifier ?? new Verifier( $this->state );
+    public function __construct( ?MigrationState $state = null, ?Verifier $verifier = null, ?LegacyFeedSnapshot $feedSnapshot = null ) {
+        $this->state        = $state ?? new MigrationState();
+        $this->verifier     = $verifier ?? new Verifier( $this->state );
+        $this->feedSnapshot = $feedSnapshot ?? new LegacyFeedSnapshot();
     }
 
     /**
@@ -327,6 +329,17 @@ final class Finalizer {
         // delete and the back-ref strip for this record (human-clear required).
         if ( $this->hasUnresolvedDivergence( $newId ) ) {
             return 0;
+        }
+
+        // DURABILITY (rollback story 1): make the legacy podcast GUID durable in the
+        // NEW post's namespace BEFORE we strip the LEGACY_POST_ID back-ref below. The
+        // feed's pre-Finalize GUID replay translates new->legacy via that back-ref to
+        // read the legacy-keyed LegacyFeedSnapshot; once the back-ref is gone the only
+        // surviving bridge is the META_LEGACY_GUID this stamps (NOT in the strip
+        // allowlist). Episode GUIDs are sermon-level; for podcasts the snapshot has no
+        // entry, so makeDurable is a harmless no-op. Idempotent on resume.
+        if ( $newType === Identifiers::POST_TYPE_SERMON ) {
+            $this->feedSnapshot->makeDurable( $newId, $legacyId );
         }
 
         // The whole op below is idempotent (the get_post()/findNewByLegacyId() guards),
