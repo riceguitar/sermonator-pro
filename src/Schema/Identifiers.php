@@ -36,6 +36,18 @@ final class Identifiers {
     public const OPTION_PRE_MIGRATION_BACKUP    = 'sermonator_pre_migration_backup';
     public const OPTION_MIGRATION_PROGRESS      = 'sermonator_migration_progress';
     public const OPTION_LEGACY_FEED_SNAPSHOT    = 'sermonator_legacy_feed_snapshot';
+
+    /**
+     * Durable legacy-podcast-id -> new-podcast-id map, the post-Finalize-safe
+     * resolver for legacy podcast feed URLs. Unlike the Crosswalk LEGACY_POST_ID
+     * back-ref meta (which the Finalizer strips), this option must survive Finalize
+     * so /?feed=rss2&post_type=wpfc_sermon&id=<legacy> keeps resolving forever.
+     *
+     * TODO(parity-followup): population is a SEPARATE deferred task — this map must
+     * be written at migrate time (legacy podcast id => new podcast id) and the
+     * Finalizer must NOT strip it.
+     */
+    public const OPTION_LEGACY_PODCAST_MAP      = 'sermonator_legacy_podcast_map';
     public const META_DATE_NORMALIZED           = 'sermonator_date_normalized';
 
     /**
