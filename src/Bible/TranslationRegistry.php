@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Sermonator\Bible;
 
+use Sermonator\Admin\SettingsRegistrar;
 use Sermonator\Schema\BibleTranslations;
 use Sermonator\Schema\Identifiers;
 
@@ -66,12 +67,20 @@ final class TranslationRegistry {
     }
 
     private static function resolveLink(): string {
-        $stored = (string) get_option(
-            Identifiers::OPTION_BIBLE_LINK_VERSION,
-            BibleTranslations::DEFAULT_LINK_VERSION
-        );
-        return array_key_exists( $stored, BibleTranslations::curatedLinkVersions() )
-            ? $stored
-            : BibleTranslations::DEFAULT_LINK_VERSION;
+        $stored = (string) get_option( Identifiers::OPTION_BIBLE_LINK_VERSION, '' );
+
+        if ( array_key_exists( $stored, BibleTranslations::curatedLinkVersions() ) ) {
+            return $stored;
+        }
+
+        // No valid stored row — e.g. a fresh or just-migrated site where the
+        // axis-A option has never been explicitly saved. Route the fallback
+        // through the SAME legacy-seeded default the admin form uses, instead of
+        // the hardcoded ESV constant. This is what carries an upgraded church's
+        // KJV/NIV choice onto the FRONT-END link path: register_setting's
+        // default_option_* filter only applies in admin/REST requests where
+        // register() ran, never on a normal page render, so the render path must
+        // consult the legacy seed itself rather than re-flooring to ESV.
+        return SettingsRegistrar::defaultLinkVersion();
     }
 }

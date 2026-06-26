@@ -98,4 +98,28 @@ final class TranslationRegistryTest extends TestCase {
         $this->stubOptions( array() );
         $this->assertSame( 'ESV', TranslationRegistry::current()->linkVersion() );
     }
+
+    public function test_link_version_falls_back_to_migrated_legacy_seed_on_frontend(): void {
+        // Regression (Bundle 3 review #3/#4/#5): an upgraded church configured for
+        // KJV links. The new axis-A option was never explicitly saved, but the
+        // migration persisted sermonator_verse_bible_version. The FRONT-END render
+        // path (TranslationRegistry, not the admin Settings API) must resolve KJV
+        // rather than flooring to ESV — register_setting's default does not apply
+        // on a normal page render.
+        $this->stubOptions(
+            array( Identifiers::OPTION_PREFIX . 'verse_bible_version' => 'KJV' )
+        );
+        $this->assertSame( 'KJV', TranslationRegistry::current()->linkVersion() );
+    }
+
+    public function test_link_version_prefers_stored_option_over_migrated_seed(): void {
+        // An explicit admin save of the new option wins over the legacy seed.
+        $this->stubOptions(
+            array(
+                Identifiers::OPTION_BIBLE_LINK_VERSION             => 'NIV',
+                Identifiers::OPTION_PREFIX . 'verse_bible_version' => 'KJV',
+            )
+        );
+        $this->assertSame( 'NIV', TranslationRegistry::current()->linkVersion() );
+    }
 }

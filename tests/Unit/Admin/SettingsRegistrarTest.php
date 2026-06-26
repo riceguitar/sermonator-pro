@@ -68,6 +68,47 @@ final class SettingsRegistrarTest extends TestCase {
         $this->assertSame( BibleTranslations::DEFAULT_LINK_VERSION, SettingsRegistrar::defaultLinkVersion() );
     }
 
+    public function test_link_version_default_prefers_migrated_option(): void {
+        // Post-finalize the sermonmanager_ row is gone; the church's choice lives
+        // at sermonator_verse_bible_version. defaultLinkVersion() must read it.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_PREFIX . 'verse_bible_version' ? 'KJV' : $default;
+            }
+        );
+
+        $this->assertSame( 'KJV', SettingsRegistrar::defaultLinkVersion() );
+    }
+
+    public function test_link_version_default_prefers_migrated_over_pre_finalize_legacy(): void {
+        // During the migration window both rows can coexist; the migrated row wins.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                if ( $name === Identifiers::OPTION_PREFIX . 'verse_bible_version' ) {
+                    return 'NASB';
+                }
+                if ( $name === 'sermonmanager_verse_bible_version' ) {
+                    return 'KJV';
+                }
+                return $default;
+            }
+        );
+
+        $this->assertSame( 'NASB', SettingsRegistrar::defaultLinkVersion() );
+    }
+
+    public function test_link_version_default_falls_back_to_pre_finalize_legacy(): void {
+        // Before the migrated row exists, the pre-finalize sermonmanager_ row still
+        // seeds the default.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === 'sermonmanager_verse_bible_version' ? 'NKJV' : $default;
+            }
+        );
+
+        $this->assertSame( 'NKJV', SettingsRegistrar::defaultLinkVersion() );
+    }
+
     // --- Axis B: inline translation sanitize ---------------------------------
 
     public function test_inline_translation_sanitize_keeps_eligible_value(): void {
@@ -160,16 +201,25 @@ final class SettingsRegistrarTest extends TestCase {
         $this->assertIsCallable( $inline['args']['sanitize_callback'] );
     }
 
-    public function test_hook_registers_init_and_update_listeners(): void {
+    public function test_hook_registers_init_create_and_update_listeners(): void {
         Functions\expect( 'add_action' )
             ->once()
             ->with( 'admin_init', \Mockery::type( 'array' ) );
         Functions\expect( 'add_action' )
             ->once()
             ->with( 'rest_api_init', \Mockery::type( 'array' ) );
+
+        // Both the create AND update paths must be wired for each axis, so the
+        // first-time save (add_option) is not missed (see hook() docblock).
+        Functions\expect( 'add_action' )
+            ->once()
+            ->with( 'add_option_' . Identifiers::OPTION_BIBLE_LINK_VERSION, \Mockery::type( 'array' ) );
         Functions\expect( 'add_action' )
             ->once()
             ->with( 'update_option_' . Identifiers::OPTION_BIBLE_LINK_VERSION, \Mockery::type( 'array' ) );
+        Functions\expect( 'add_action' )
+            ->once()
+            ->with( 'add_option_' . Identifiers::OPTION_BIBLE_INLINE_TRANSLATION, \Mockery::type( 'array' ) );
         Functions\expect( 'add_action' )
             ->once()
             ->with( 'update_option_' . Identifiers::OPTION_BIBLE_INLINE_TRANSLATION, \Mockery::type( 'array' ) );

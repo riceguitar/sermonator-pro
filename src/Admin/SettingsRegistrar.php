@@ -23,9 +23,12 @@ use Sermonator\Schema\Identifiers;
  *     against {@see BibleTranslations::curatedInline()} (inline-eligible only,
  *     so an ambiguous slug like BSB is never accepted here).
  *
- * Updating either option bumps {@see Identifiers::OPTION_BIBLE_CACHE_GEN} so the
- * warmed/normalized chapter cache is invalidated by generation rather than a
- * `DELETE … LIKE` sweep.
+ * Creating OR updating either option bumps {@see Identifiers::OPTION_BIBLE_CACHE_GEN}
+ * so the warmed/normalized chapter cache is invalidated by generation rather than
+ * a `DELETE … LIKE` sweep. The create path matters: on a fresh site the first
+ * admin save of a translation routes through WordPress's `add_option()` (no stored
+ * row yet), firing `add_option_{$option}` — never `update_option_{$option}` — so
+ * both hooks must be wired or the first (common) configuration change is missed.
  *
  * Registration runs on both `admin_init` (Settings API) and `rest_api_init`
  * (so `show_in_rest` exposure works inside the non-admin REST context the block
@@ -39,18 +42,37 @@ final class SettingsRegistrar {
      */
     private const LEGACY_LINK_VERSION_OPTION = 'sermonmanager_verse_bible_version';
 
+    /**
+     * The migration target for {@see self::LEGACY_LINK_VERSION_OPTION}: the
+     * migration prefix-swaps `sermonmanager_verse_bible_version` →
+     * `sermonator_verse_bible_version` ({@see \Sermonator\Migration\MappingContract::mapOptionName})
+     * and the Finalizer then deletes the `sermonmanager_*` originals. So on a
+     * migrated+finalized site the church's real choice lives HERE, not at the
+     * legacy name. Read-only seed for the axis-A default; never written.
+     */
+    private const MIGRATED_LINK_VERSION_OPTION = Identifiers::OPTION_PREFIX . 'verse_bible_version';
+
     public function hook(): void {
         add_action( 'admin_init', array( $this, 'register' ) );
         add_action( 'rest_api_init', array( $this, 'register' ) );
 
-        add_action(
-            'update_option_' . Identifiers::OPTION_BIBLE_LINK_VERSION,
-            array( $this, 'bumpCacheGen' )
-        );
-        add_action(
-            'update_option_' . Identifiers::OPTION_BIBLE_INLINE_TRANSLATION,
-            array( $this, 'bumpCacheGen' )
-        );
+        // Bump the cache generation on BOTH the create (add_option_*) and the
+        // update (update_option_*) paths. WordPress routes the first save of an
+        // as-yet-unstored option through add_option(), which fires
+        // add_option_{$option} but NOT update_option_{$option}; listening only on
+        // the update hook would silently skip the bump on the common first-time
+        // configuration save, serving stale cache under the new translation.
+        // bumpCacheGen() takes no parameters, so it is signature-compatible with
+        // the 1-arg add_option_* and 2-arg update_option_* actions alike.
+        foreach (
+            array(
+                Identifiers::OPTION_BIBLE_LINK_VERSION,
+                Identifiers::OPTION_BIBLE_INLINE_TRANSLATION,
+            ) as $option
+        ) {
+            add_action( 'add_option_' . $option, array( $this, 'bumpCacheGen' ) );
+            add_action( 'update_option_' . $option, array( $this, 'bumpCacheGen' ) );
+        }
     }
 
     public function register(): void {
@@ -120,12 +142,28 @@ final class SettingsRegistrar {
      * curated link version, otherwise {@see BibleTranslations::DEFAULT_LINK_VERSION}.
      * Validating against the curated list keeps the default in sync with the
      * settings dropdown and the sanitize whitelist.
+     *
+     * Resolution order honors the legacy choice DURABLY across the migration
+     * lifecycle: the migrated `sermonator_verse_bible_version` row (the only copy
+     * that survives Finalizer's `sermonmanager_*` deletion) is consulted FIRST,
+     * then the pre-finalize `sermonmanager_verse_bible_version` row. Without the
+     * migrated-first read an upgraded+finalized church silently drops its KJV/NIV
+     * choice to ESV — a legacy-parity loss this work is held against.
      */
     public static function defaultLinkVersion(): string {
-        $legacy = get_option( self::LEGACY_LINK_VERSION_OPTION );
+        foreach (
+            array(
+                self::MIGRATED_LINK_VERSION_OPTION,
+                self::LEGACY_LINK_VERSION_OPTION,
+            ) as $optionName
+        ) {
+            $candidate = get_option( $optionName );
 
-        if ( is_string( $legacy ) && array_key_exists( $legacy, BibleTranslations::curatedLinkVersions() ) ) {
-            return $legacy;
+            if ( is_string( $candidate )
+                && array_key_exists( $candidate, BibleTranslations::curatedLinkVersions() )
+            ) {
+                return $candidate;
+            }
         }
 
         return BibleTranslations::DEFAULT_LINK_VERSION;
