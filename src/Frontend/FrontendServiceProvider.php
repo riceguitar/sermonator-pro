@@ -16,6 +16,7 @@ use Sermonator\Frontend\Blocks\TaxonomyFilterBlock;
 use Sermonator\Frontend\Blocks\PodcastSubscribeBlock;
 use Sermonator\Frontend\Feed\PodcastFeed;
 use Sermonator\Frontend\Feed\LegacyFeedRouter;
+use Sermonator\Frontend\Compat\LegacyShortcodes;
 use Sermonator\Frontend\Seo\SeoHead;
 
 /**
@@ -36,6 +37,7 @@ final class FrontendServiceProvider {
         ( new ClassicTemplates() )->hook();
         ( new ArchiveOrdering() )->hook();
         ( new Shortcode() )->hook();
+        ( new LegacyShortcodes() )->hook();
         ( new PodcastFeed() )->hook();
         ( new LegacyFeedRouter() )->hook();
         ( new SeoHead() )->hook();
