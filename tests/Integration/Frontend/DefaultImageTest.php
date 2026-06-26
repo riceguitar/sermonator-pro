@@ -72,7 +72,17 @@ final class DefaultImageTest extends WP_UnitTestCase {
 
         $html = ( new Renderer() )->featuredImage( $view );
         $this->assertStringContainsString( 'sermonator-single__media', $html );
-        $this->assertStringContainsString( 'wp-image-' . $thumbId, $html );
+        // The attachment src URL is the token WP's wp_get_attachment_image()/
+        // get_the_post_thumbnail() actually emit (the caller's explicit `class`
+        // attr OVERRIDES core's default attrs, and 'wp-image-<id>' is an
+        // editor/content artifact never produced by these template APIs). It is
+        // also the only token that proves WHICH attachment rendered.
+        $this->assertStringContainsString( (string) wp_get_attachment_url( $thumbId ), $html );
+        $this->assertStringNotContainsString(
+            (string) wp_get_attachment_url( $defaultId ),
+            $html,
+            'the configured default must not appear when a real thumbnail wins'
+        );
     }
 
     public function test_no_thumbnail_falls_back_to_configured_default(): void {
@@ -88,7 +98,9 @@ final class DefaultImageTest extends WP_UnitTestCase {
 
         $html = ( new Renderer() )->featuredImage( $view );
         $this->assertStringContainsString( 'sermonator-single__media', $html );
-        $this->assertStringContainsString( 'wp-image-' . $defaultId, $html );
+        // Assert on the attachment src URL WP actually emits (see the sibling
+        // thumbnail test) — proving the configured default attachment rendered.
+        $this->assertStringContainsString( (string) wp_get_attachment_url( $defaultId ), $html );
     }
 
     public function test_no_thumbnail_no_default_renders_nothing(): void {
@@ -101,6 +113,11 @@ final class DefaultImageTest extends WP_UnitTestCase {
     }
 
     public function test_legacy_url_default_image_resolves_once_and_persists_into_live_key(): void {
+        // The one-time URL→id scan + persist is gated to a privileged context
+        // (is_admin()||wp_doing_cron()) so the front end never pays; set an admin
+        // screen so this proof exercises the real resolution path.
+        set_current_screen( 'edit-' . Identifiers::POST_TYPE_SERMON );
+
         // A migrated CMB2 display container that holds ONLY a URL-valued
         // default_image (companion id absent) — the case DisplayDefaults skips.
         $attachmentId = $this->newAttachment();
@@ -123,6 +140,8 @@ final class DefaultImageTest extends WP_UnitTestCase {
     }
 
     public function test_unresolvable_legacy_url_does_not_poison_the_live_key(): void {
+        set_current_screen( 'edit-' . Identifiers::POST_TYPE_SERMON );
+
         update_option(
             'sermonmanager_display',
             array( 'default_image' => 'http://example.test/never-existed.jpg' )
@@ -132,6 +151,64 @@ final class DefaultImageTest extends WP_UnitTestCase {
         $this->assertFalse(
             get_option( Identifiers::OPTION_DEFAULT_IMAGE_ID ),
             'an unresolvable URL leaves the live key unset so a later migration can still seed it'
+        );
+    }
+
+    /**
+     * The one-time URL→id scan + persist must NOT fire on the public render path
+     * (front end never pays): an unauthenticated visitor reads only the live key +
+     * id-keyed seed, never triggering attachment_url_to_postid() or a DB write.
+     */
+    public function test_front_end_does_not_scan_or_persist_legacy_url(): void {
+        // No admin/cron context: is_admin() is false in the default test request,
+        // which is exactly the unauthenticated front-end case the gate protects.
+        $attachmentId = $this->newAttachment();
+        $url          = (string) wp_get_attachment_url( $attachmentId );
+        update_option( Identifiers::OPTION_PREFIX . 'display', array( 'default_image' => $url ) );
+
+        $this->assertSame(
+            0,
+            ( new EffectiveImage() )->defaultImageId(),
+            'the front end never resolves the legacy URL'
+        );
+        $this->assertFalse(
+            get_option( Identifiers::OPTION_DEFAULT_IMAGE_ID ),
+            'the front end never persists into the live key (deferred to admin/cron)'
+        );
+    }
+
+    /**
+     * An explicitly stored live `0` ("no fallback image", a deliberate admin
+     * choice the sanitize boundary persists) must be honored verbatim — never
+     * resurrected/overridden by a surviving migrated/legacy default_image, even on
+     * an admin request where the URL→id resolution would otherwise run. This pins
+     * the #1 data-preservation fix: distinguishing a stored 0 from an absent row.
+     */
+    public function test_explicit_zero_is_honored_over_migrated_default(): void {
+        set_current_screen( 'edit-' . Identifiers::POST_TYPE_SERMON );
+
+        // A migrated default exists (both an id-keyed seed AND a URL fallback)…
+        $migratedId = $this->newAttachment();
+        update_option(
+            Identifiers::OPTION_PREFIX . 'display',
+            array(
+                'default_image_id' => $migratedId,
+                'default_image'    => (string) wp_get_attachment_url( $migratedId ),
+            )
+        );
+
+        // …but the admin has deliberately cleared the live key to 0.
+        update_option( Identifiers::OPTION_DEFAULT_IMAGE_ID, 0 );
+
+        $this->assertSame(
+            0,
+            ( new EffectiveImage() )->defaultImageId(),
+            'a deliberate "no fallback image" choice is never clobbered by a migration artifact'
+        );
+        $this->assertSame(
+            0,
+            (int) get_option( Identifiers::OPTION_DEFAULT_IMAGE_ID ),
+            'the stored 0 is left intact (not overwritten by a resurrected legacy id)'
         );
     }
 }

@@ -22,6 +22,12 @@ final class TemplateDataTest extends TestCase {
         Functions\when( 'get_option' )->alias(
             static fn( string $name, $default = false ) => $default
         );
+        // These term/meta-focused tests exercise the public render path: the
+        // EffectiveImage URL→id resolution is gated to is_admin()||wp_doing_cron(),
+        // so a front-end context (both false) keeps the fallback image off this
+        // path without a DB scan/write.
+        Functions\when( 'is_admin' )->justReturn( false );
+        Functions\when( 'wp_doing_cron' )->justReturn( false );
     }
 
     protected function tearDown(): void {

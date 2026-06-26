@@ -29,6 +29,12 @@ final class EffectiveImageTest extends TestCase {
         Functions\when( 'get_option' )->alias(
             static fn( string $name, $default = false ) => $default
         );
+        // The one-time legacy-URL→id scan + persist is gated to a privileged
+        // context (is_admin()||wp_doing_cron()); default these resolution-order
+        // tests to an admin request so they exercise the real resolution path.
+        // The dedicated gate test below flips both to false (the front-end case).
+        Functions\when( 'is_admin' )->justReturn( true );
+        Functions\when( 'wp_doing_cron' )->justReturn( false );
     }
 
     protected function tearDown(): void {
@@ -90,6 +96,43 @@ final class EffectiveImageTest extends TestCase {
             }
         );
         Functions\when( 'attachment_url_to_postid' )->justReturn( 0 );
+        Functions\expect( 'update_option' )->never();
+
+        $this->assertSame( 0, ( new EffectiveImage() )->resolve( 0 ) );
+    }
+
+    public function test_explicit_stored_zero_is_honored_not_resurrected(): void {
+        // The admin deliberately cleared the live key to 0 ("no fallback image",
+        // a value the sanitize boundary persists). get_option returns that stored
+        // 0 (the option ROW exists), so it must be honored verbatim — NOT treated
+        // as "unset" and overwritten by a surviving migrated/legacy default_image.
+        // No id-keyed seed read, no URL scan, no DB write (#1 data preservation).
+        Functions\when( 'get_option' )->alias(
+            static fn( string $name, $default = false ) =>
+                ID::OPTION_DEFAULT_IMAGE_ID === $name ? 0 : $default
+        );
+        Functions\expect( 'attachment_url_to_postid' )->never();
+        Functions\expect( 'update_option' )->never();
+
+        $this->assertSame( 0, ( new EffectiveImage() )->resolve( 0 ) );
+    }
+
+    public function test_front_end_never_scans_or_persists_legacy_url(): void {
+        // Front-end (unauthenticated) context: the live key + id-keyed seed are
+        // absent and a legacy URL container exists, but the scan + persist are
+        // gated to admin/cron — so the visitor gets 0 with NO postmeta scan and NO
+        // DB write (deferred to the next admin/cron pass).
+        Functions\when( 'is_admin' )->justReturn( false );
+        Functions\when( 'wp_doing_cron' )->justReturn( false );
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                if ( ID::OPTION_PREFIX . 'display' === $name ) {
+                    return array( 'default_image' => 'http://example.test/wp-content/uploads/default.jpg' );
+                }
+                return $default;
+            }
+        );
+        Functions\expect( 'attachment_url_to_postid' )->never();
         Functions\expect( 'update_option' )->never();
 
         $this->assertSame( 0, ( new EffectiveImage() )->resolve( 0 ) );
