@@ -37,6 +37,14 @@ final class SermonView {
         public readonly array $topics = array(),
         public readonly array $books = array(),
         public readonly array $serviceTypes = array(),
-        public readonly string $preacherLabel = ''
+        public readonly string $preacherLabel = '',
+        /**
+         * The effective featured-image attachment id — the real thumbnail when
+         * set, else the configured site-wide default ({@see EffectiveImage}).
+         * Resolved impurely in {@see TemplateData} so the pure {@see Renderer}
+         * never reads `get_option`. Falls back to the default image only when
+         * {@see self::$imageId} is 0 (legacy `default_image` parity).
+         */
+        public readonly int $effectiveImageId = 0
     ) {}
 }

@@ -52,6 +52,7 @@ final class RendererTest extends TestCase {
             notes: $over['notes'] ?? '',
             preachers: $over['preachers'] ?? array( array( 'name' => 'Pastor John', 'url' => 'http://x/p' ) ),
             preacherLabel: $over['preacherLabel'] ?? '',
+            effectiveImageId: $over['effectiveImageId'] ?? 0,
         );
     }
 
@@ -170,6 +171,16 @@ final class RendererTest extends TestCase {
         $html = ( new Renderer() )->featuredImage( $this->view( array( 'imageId' => 42 ) ) );
         $this->assertStringContainsString( 'sermonator-single__media', $html );
         $this->assertStringContainsString( '<img src="http://x/img.jpg" alt="">', $html );
+    }
+
+    public function test_featured_image_renders_default_when_no_thumbnail(): void {
+        // No real thumbnail (imageId 0) but a resolved default image id: the
+        // Renderer renders the configured default via the attachment API (legacy
+        // default_image parity), never the post-thumbnail API.
+        Functions\when( 'wp_get_attachment_image' )->justReturn( '<img src="http://x/default.jpg" alt="">' );
+        $html = ( new Renderer() )->featuredImage( $this->view( array( 'effectiveImageId' => 77 ) ) );
+        $this->assertStringContainsString( 'sermonator-single__media', $html );
+        $this->assertStringContainsString( '<img src="http://x/default.jpg" alt="">', $html );
     }
 
     public function test_bulletin_empty_when_no_url(): void {

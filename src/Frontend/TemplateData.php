@@ -17,6 +17,7 @@ final class TemplateData {
         $str = static fn( string $key ): string => (string) get_post_meta( $postId, $key, true );
 
         $rawDate = $str( ID::META_DATE );
+        $imageId = (int) $str( '_thumbnail_id' );
 
         return new SermonView(
             id:                $postId,
@@ -30,7 +31,7 @@ final class TemplateData {
             videoEmbed:        $str( ID::META_VIDEO_EMBED ),
             videoUrl:          $str( ID::META_VIDEO_URL ),
             views:             (int) $str( ID::META_VIEWS ),
-            imageId:           (int) $str( '_thumbnail_id' ),
+            imageId:           $imageId,
             bulletinUrl:       $str( ID::META_BULLETIN ),
             notes:             $str( ID::META_NOTES ),
             preachers:         $this->terms( $postId, ID::TAX_PREACHER ),
@@ -39,6 +40,7 @@ final class TemplateData {
             books:             $this->terms( $postId, ID::TAX_BOOK ),
             serviceTypes:      $this->terms( $postId, ID::TAX_SERVICE_TYPE ),
             preacherLabel:     $this->preacherLabel(),
+            effectiveImageId:  ( new EffectiveImage() )->resolve( $imageId ),
         );
     }
 

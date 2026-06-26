@@ -110,10 +110,22 @@ final class Renderer {
 
 
     public function featuredImage( SermonView $v ): string {
-        if ( $v->imageId <= 0 ) {
+        if ( $v->imageId > 0 ) {
+            // Real post thumbnail (responsive srcset via the post-thumbnail API).
+            $img = get_the_post_thumbnail( $v->id, 'large', array( 'class' => 'sermonator-single__image', 'loading' => 'eager' ) );
+        } elseif ( $v->effectiveImageId > 0 ) {
+            // No thumbnail: render the configured site-wide default image (legacy
+            // `default_image` parity). The id is resolved impurely in TemplateData
+            // ({@see EffectiveImage}) so this method stays free of get_option.
+            $img = wp_get_attachment_image(
+                $v->effectiveImageId,
+                'large',
+                false,
+                array( 'class' => 'sermonator-single__image', 'loading' => 'eager' )
+            );
+        } else {
             return '';
         }
-        $img = get_the_post_thumbnail( $v->id, 'large', array( 'class' => 'sermonator-single__image', 'loading' => 'eager' ) );
         return is_string( $img ) && $img !== '' ? '<figure class="sermonator-single__media">' . $img . '</figure>' : '';
     }
 
