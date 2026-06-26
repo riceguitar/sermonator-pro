@@ -262,10 +262,19 @@ final class BibleRefsBackfillTest extends TestCase {
             'refs' => array( array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16, 'source' => 'authoring' ) ),
         ) );
 
+        // The backfill dual-wrote the JHN book term; the re-saved authoring envelope
+        // still depends on it for book-archive / "sermons on John" queryability.
+        $john = $this->termIdFor( 'John' );
+        $this->assertContains( $john, $this->terms[1], 'Backfill dual-wrote the John term.' );
+
         $backfill->reverse();
 
         $envelope = $this->envelopeOf( 1 );
         $this->assertSame( 'authoring', $envelope['refs'][0]['source'], 'Author edit must survive reverse.' );
+        // The book term is load-bearing for the preserved authoring envelope: a reverse
+        // that strips it would leave refs present but un-queryable — a partial clobber of
+        // authoring data. Ownership-gated term removal must keep it intact.
+        $this->assertContains( $john, $this->terms[1], 'Author-owned book term must survive reverse.' );
     }
 
     public function test_writes_are_gated_during_active_migration(): void {

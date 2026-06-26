@@ -180,19 +180,24 @@ final class BibleRefsBackfill {
             }
 
             if ( $entry['refs'] ) {
-                // Only delete an envelope we still own. If an author has re-saved the
-                // post since the backfill (source:'authoring'), leave their data intact.
+                // Only undo an envelope — AND the TAX_BOOK terms we dual-wrote alongside
+                // it — when the backfill still owns the post's bible data. If an author
+                // has re-saved since the backfill (source:'authoring'), the envelope is
+                // theirs and the book terms are load-bearing for that authoring data, so
+                // leave BOTH intact: never clobber authoring, stay exactly reversible.
+                // (terms are only ever logged on this refs branch; the sentinel branch
+                // logs terms=array(), so this gate fully covers term removal.)
                 if ( $this->isOwnBackfillEnvelope( $id ) ) {
                     delete_post_meta( $id, ID::META_BIBLE_REFS );
+
+                    if ( array() !== $entry['terms'] ) {
+                        wp_remove_object_terms( $id, $entry['terms'], ID::TAX_BOOK );
+                    }
                 }
             }
 
             if ( $entry['sentinel'] ) {
                 delete_post_meta( $id, ID::META_BIBLE_REFS_UNPARSEABLE );
-            }
-
-            if ( array() !== $entry['terms'] ) {
-                wp_remove_object_terms( $id, $entry['terms'], ID::TAX_BOOK );
             }
 
             ++$reversed;
