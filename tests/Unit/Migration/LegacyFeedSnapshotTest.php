@@ -31,4 +31,18 @@ final class LegacyFeedSnapshotTest extends TestCase {
         $this->assertSame( 'wpfc-7', ( new LegacyFeedSnapshot() )->guidFor( 7 ) );
         $this->assertNull( ( new LegacyFeedSnapshot() )->guidFor( 999 ) );
     }
+
+    public function test_filters_invalid_entries_during_store(): void {
+        ( new LegacyFeedSnapshot() )->store( array(
+            -1 => 'negative-id-guid',
+            0 => 'zero-id-guid',
+            99 => '',
+            42 => 'good-guid',
+        ) );
+
+        $this->assertSame( 'good-guid', ( new LegacyFeedSnapshot() )->guidFor( 42 ) );
+        $this->assertNull( ( new LegacyFeedSnapshot() )->guidFor( -1 ) );
+        $this->assertNull( ( new LegacyFeedSnapshot() )->guidFor( 0 ) );
+        $this->assertNull( ( new LegacyFeedSnapshot() )->guidFor( 99 ) );
+    }
 }

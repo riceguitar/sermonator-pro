@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 namespace Sermonator\Migration;
 
+use Sermonator\Schema\Identifiers;
+
 /**
  * Persists the legacy podcast feed's per-episode GUID, captured at detect/migrate time before
  * Finalize, keyed by legacy post ID. Replayed by the feed layer so already-subscribed apps do
@@ -10,7 +12,7 @@ namespace Sermonator\Migration;
  * legacy data; the stored map is the only writable artifact and is reversible (delete option).
  */
 final class LegacyFeedSnapshot {
-    public const OPTION = 'sermonator_legacy_feed_snapshot';
+    public const OPTION = Identifiers::OPTION_LEGACY_FEED_SNAPSHOT;
 
     /** @param array<int,string> $guidByLegacyPostId */
     public function store( array $guidByLegacyPostId ): void {

@@ -35,6 +35,7 @@ final class Identifiers {
     public const OPTION_MIGRATION_STATE         = 'sermonator_migration_state';
     public const OPTION_PRE_MIGRATION_BACKUP    = 'sermonator_pre_migration_backup';
     public const OPTION_MIGRATION_PROGRESS      = 'sermonator_migration_progress';
+    public const OPTION_LEGACY_FEED_SNAPSHOT    = 'sermonator_legacy_feed_snapshot';
     public const META_DATE_NORMALIZED           = 'sermonator_date_normalized';
 
     /**
