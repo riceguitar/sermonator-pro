@@ -108,7 +108,10 @@ final class SettingsRegistrar {
     public function sanitizeLinkVersion( $value ): string {
         $value = is_string( $value ) ? $value : '';
 
-        return array_key_exists( $value, BibleTranslations::curatedLinkVersions() )
+        // Axis A is UNCONSTRAINED (link-only, no text hosted) — accept any
+        // format-valid version code verbatim, NOT only the 5-entry dropdown list,
+        // so a church's real legacy verse_bible_version (e.g. NLT/CSB/AMP) is honored.
+        return BibleTranslations::isValidLinkVersionCode( $value )
             ? $value
             : self::defaultLinkVersion();
     }
@@ -160,7 +163,7 @@ final class SettingsRegistrar {
             $candidate = get_option( $optionName );
 
             if ( is_string( $candidate )
-                && array_key_exists( $candidate, BibleTranslations::curatedLinkVersions() )
+                && BibleTranslations::isValidLinkVersionCode( $candidate )
             ) {
                 return $candidate;
             }

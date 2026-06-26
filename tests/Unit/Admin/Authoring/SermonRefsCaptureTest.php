@@ -161,5 +161,43 @@ namespace Sermonator\Tests\Unit\Admin\Authoring {
             $this->assertNotEmpty( $envelope, 'Corrected passage now produces a structured envelope.' );
             $this->assertSame( 'JHN', $envelope['refs'][0]['bookUSFM'] );
         }
+
+        public function test_edited_passage_refreshes_a_stale_autoparse_envelope(): void {
+            // An existing AUTO-PARSE envelope (confidence 'probable', not author-confirmed)
+            // for the OLD passage must be re-derived when the author edits the passage and
+            // re-saves — otherwise the single-sermon row keeps rendering the old reference.
+            $this->meta[ $this->postId ][ ID::META_BIBLE_REFS ] = json_encode( array(
+                'v'    => 1,
+                'refs' => array(
+                    array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16, 'verseEnd' => 16, 'chapterEnd' => null, 'raw' => 'John 3:16', 'source' => 'backfill', 'confidence' => 'probable', 'srcVersification' => 'ESV' ),
+                ),
+            ) );
+            $this->meta[ $this->postId ][ ID::META_BIBLE_PASSAGE ] = 'Romans 5:1';
+
+            ( new SermonRefsCapture() )->capture( $this->postId, $this->post() );
+
+            $envelope = $this->envelope();
+            $this->assertSame( 'ROM', $envelope['refs'][0]['bookUSFM'], 'Stale auto-parse envelope is refreshed from the edited passage.' );
+            $this->assertSame( 'authoring', $envelope['refs'][0]['source'] );
+        }
+
+        public function test_author_confirmed_exact_envelope_is_never_clobbered(): void {
+            // A Phase-3b author-CONFIRMED envelope (any ref confidence 'exact') is
+            // sacrosanct — an authoring re-save must NOT overwrite it even if the free-text
+            // passage now differs.
+            $this->meta[ $this->postId ][ ID::META_BIBLE_REFS ] = json_encode( array(
+                'v'    => 1,
+                'refs' => array(
+                    array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16, 'verseEnd' => 16, 'chapterEnd' => null, 'raw' => 'John 3:16', 'source' => 'authoring', 'confidence' => 'exact', 'srcVersification' => 'ESV' ),
+                ),
+            ) );
+            $this->meta[ $this->postId ][ ID::META_BIBLE_PASSAGE ] = 'Romans 5:1';
+
+            ( new SermonRefsCapture() )->capture( $this->postId, $this->post() );
+
+            $envelope = $this->envelope();
+            $this->assertSame( 'JHN', $envelope['refs'][0]['bookUSFM'], 'Author-confirmed (exact) envelope is preserved, not refreshed.' );
+            $this->assertSame( 'exact', $envelope['refs'][0]['confidence'] );
+        }
     }
 }

@@ -96,4 +96,18 @@ final class BibleTranslations {
             'NKJV' => 'New King James Version',
         );
     }
+
+    /**
+     * Whether a string is a structurally-valid axis-A link version CODE. Axis A is
+     * UNCONSTRAINED (it only builds external reference links — no text is hosted), so any
+     * BibleGateway-style alphanumeric code is accepted verbatim (ESV, NLT, CSB, AMP, MSG,
+     * NET, NIVUK, RVR1960, …). {@see curatedLinkVersions()} is ONLY the settings-dropdown
+     * source, NEVER the validation gate — gating axis A on that 5-entry list would
+     * silently floor a migrated church's real legacy `verse_bible_version` (e.g. NLT) to
+     * ESV on the front-end link path, a legacy-parity loss. The reference is rawurlencode'd
+     * into the link, so a format-valid code is render-safe.
+     */
+    public static function isValidLinkVersionCode( string $code ): bool {
+        return (bool) preg_match( '/^[A-Za-z0-9]{1,20}$/', $code );
+    }
 }

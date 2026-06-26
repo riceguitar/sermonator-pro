@@ -60,10 +60,20 @@ final class SettingsRegistrarTest extends TestCase {
         $this->assertSame( 'KJV', $registrar->sanitizeLinkVersion( 'NOT_A_VERSION' ) );
     }
 
-    public function test_link_version_default_ignores_uncurated_legacy_value(): void {
-        // Legacy 'NCV' is a real Sermon Manager option value but not in our curated
-        // link list, so the default must fall back to ESV rather than carry it.
+    public function test_link_version_default_honors_uncurated_but_valid_legacy_value(): void {
+        // Axis A is UNCONSTRAINED (link-only): a real legacy verse_bible_version like
+        // 'NCV' (not in the 5-entry dropdown) must be carried VERBATIM onto the link
+        // path, never floored to ESV — otherwise a migrated church silently loses its
+        // chosen version on the very render path Phase 3a ships.
         Functions\when( 'get_option' )->justReturn( 'NCV' );
+
+        $this->assertSame( 'NCV', SettingsRegistrar::defaultLinkVersion() );
+    }
+
+    public function test_link_version_default_floors_only_a_malformed_legacy_value(): void {
+        // A structurally-invalid code (spaces/punctuation) is not a usable link
+        // version and floors to ESV.
+        Functions\when( 'get_option' )->justReturn( 'not a version!' );
 
         $this->assertSame( BibleTranslations::DEFAULT_LINK_VERSION, SettingsRegistrar::defaultLinkVersion() );
     }

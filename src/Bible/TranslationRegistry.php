@@ -69,7 +69,9 @@ final class TranslationRegistry {
     private static function resolveLink(): string {
         $stored = (string) get_option( Identifiers::OPTION_BIBLE_LINK_VERSION, '' );
 
-        if ( array_key_exists( $stored, BibleTranslations::curatedLinkVersions() ) ) {
+        // Axis A is UNCONSTRAINED — any format-valid stored version code (incl. one
+        // outside the 5-entry dropdown list, e.g. a migrated NLT) renders verbatim.
+        if ( BibleTranslations::isValidLinkVersionCode( $stored ) ) {
             return $stored;
         }
 

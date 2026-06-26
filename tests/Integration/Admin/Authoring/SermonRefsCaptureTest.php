@@ -108,17 +108,19 @@ final class SermonRefsCaptureTest extends WP_UnitTestCase {
         $this->assertSame( '', get_post_meta( $id, ID::META_BIBLE_REFS, true ) );
     }
 
-    public function test_resave_never_overwrites_an_existing_envelope(): void {
+    public function test_resave_refreshes_a_stale_autoparse_envelope(): void {
         $id = $this->authorSermon( 'John 3:16' );
-        $this->assertNotEmpty( $this->refs( $id ) );
+        $this->assertSame( 'JHN', $this->refs( $id )[0]['bookUSFM'] );
 
-        // A later passage edit must NOT replace the already-captured envelope
-        // (fill-missing-only; a Phase 3b author-confirmed envelope stays sacrosanct).
+        // Editing the passage must REFRESH the auto-parsed envelope so the single-sermon
+        // row no longer renders the OLD reference. (Auto-parses are not author-confirmed;
+        // a Phase 3b confidence:'exact' envelope stays sacrosanct — covered in the unit
+        // tests test_author_confirmed_exact_envelope_is_never_clobbered.)
         update_post_meta( $id, ID::META_BIBLE_PASSAGE, 'Genesis 1:1' );
         wp_update_post( array( 'ID' => $id, 'post_title' => 'Edited passage' ) );
 
         $refs = $this->refs( $id );
-        $this->assertSame( 'JHN', $refs[0]['bookUSFM'], 'First-captured envelope is preserved.' );
+        $this->assertSame( 'GEN', $refs[0]['bookUSFM'], 'Auto-parse envelope is refreshed from the edited passage.' );
     }
 
     /**

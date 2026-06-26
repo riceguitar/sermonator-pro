@@ -103,7 +103,38 @@ final class SermonRefsCapture {
         // Net effect for a still-unparseable passage is unchanged: the producer simply
         // re-stamps it. NEVER touches META_BIBLE_PASSAGE or an existing REFS envelope.
         delete_post_meta( $post_id, Identifiers::META_BIBLE_REFS_UNPARSEABLE );
+        $this->clearStaleAutoParseEnvelope( $post_id );
 
         $this->capture->captureForPost( $post_id, 'authoring' );
+    }
+
+    /**
+     * On the EDITABLE authoring surface an existing AUTO-PARSED envelope must be
+     * re-derived from the CURRENT passage on every save. The producer's fill-missing
+     * skip is keyed on envelope EXISTENCE, so without this an edit of the passage
+     * (e.g. "John 3:16" -> "Romans 5:1") is a permanent no-op and the single-sermon
+     * scripture row keeps rendering the OLD reference + link (silently wrong). We delete
+     * the stale envelope here so the producer re-derives it — EXCEPT a Phase-3b
+     * author-CONFIRMED envelope (any ref with confidence 'exact', a value RefsCapture
+     * reserves for the confirm-chip flow and never emits on auto-parse), which is
+     * sacrosanct. The backfill caller does NOT clear, so its frozen-data idempotency is
+     * untouched. (Stale TAX_BOOK terms may linger additively on refresh — never data
+     * loss, matching reverse()'s same never-clobber trade-off.)
+     */
+    private function clearStaleAutoParseEnvelope( int $post_id ): void {
+        $raw = (string) get_post_meta( $post_id, Identifiers::META_BIBLE_REFS, true );
+        if ( $raw === '' ) {
+            return;
+        }
+
+        $env  = json_decode( $raw, true );
+        $refs = ( is_array( $env ) && isset( $env['refs'] ) && is_array( $env['refs'] ) ) ? $env['refs'] : array();
+        foreach ( $refs as $ref ) {
+            if ( is_array( $ref ) && ( $ref['confidence'] ?? '' ) === 'exact' ) {
+                return; // Phase-3b author-confirmed — never clobber.
+            }
+        }
+
+        delete_post_meta( $post_id, Identifiers::META_BIBLE_REFS );
     }
 }
