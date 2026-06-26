@@ -35,6 +35,33 @@ final class Identifiers {
     public const OPTION_MIGRATION_STATE         = 'sermonator_migration_state';
     public const OPTION_PRE_MIGRATION_BACKUP    = 'sermonator_pre_migration_backup';
     public const OPTION_MIGRATION_PROGRESS      = 'sermonator_migration_progress';
+    public const OPTION_LEGACY_FEED_SNAPSHOT    = 'sermonator_legacy_feed_snapshot';
+
+    /**
+     * Durable legacy-podcast-id -> new-podcast-id map, the post-Finalize-safe
+     * resolver for legacy podcast feed URLs. Unlike the Crosswalk LEGACY_POST_ID
+     * back-ref meta (which the Finalizer strips), this option must survive Finalize
+     * so /?feed=rss2&post_type=wpfc_sermon&id=<legacy> keeps resolving forever.
+     *
+     * Populated at migrate time by PodcastWriter (legacy podcast id => new podcast id),
+     * written alongside the Crosswalk back-ref so it exists BEFORE Finalize can strip it.
+     * The Finalizer never deletes it (it is a sermonator_* option, not in the legacy
+     * sermonmanager_* delete set) and hard-refuses to finalize a multi-podcast site whose
+     * map is incomplete, so the legacy→new correspondence is never silently lost.
+     */
+    public const OPTION_LEGACY_PODCAST_MAP      = 'sermonator_legacy_podcast_map';
+
+    /**
+     * Durable per-episode legacy RSS <guid>, stamped on the NEW sermonator_sermon
+     * post id so already-subscribed podcast apps never re-download the back catalogue
+     * after the switch (rollback story 1). The post-Finalize-safe counterpart to the
+     * legacy-keyed OPTION_LEGACY_FEED_SNAPSHOT: where the snapshot is keyed by the
+     * LEGACY post id and is only reachable PRE-Finalize via the Crosswalk LEGACY_POST_ID
+     * back-ref (which the Finalizer strips), this meta is keyed by the durable NEW post
+     * id and is NEVER in Crosswalk::strippableBackRefs(), so the GUID replay survives
+     * Finalize. Finalize stamps it from the snapshot BEFORE stripping the back-ref.
+     */
+    public const META_LEGACY_GUID               = 'sermonator_legacy_guid';
     public const META_DATE_NORMALIZED           = 'sermonator_date_normalized';
 
     /**

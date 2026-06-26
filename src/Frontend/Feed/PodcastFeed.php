@@ -29,10 +29,28 @@ final class PodcastFeed {
         // Belt-and-suspenders: if anything routes through feed_content_type() for our feed,
         // return RSS rather than the WP default of application/octet-stream.
         add_filter( 'feed_content_type', array( $this, 'contentType' ), 10, 2 );
+        // A request for OUR feed is always valid (it renders a well-formed channel even
+        // with zero episodes), so short-circuit WP::handle_404() — which has no feed
+        // exemption and would otherwise status_header(404) when the main query matches
+        // no posts. This is what keeps the routed legacy URL on HTTP 200.
+        add_filter( 'pre_handle_404', array( $this, 'preventFeed404' ), 10, 2 );
     }
 
     public function contentType( string $type, string $feed ): string {
         return $feed === self::FEED ? 'application/rss+xml' : $type;
+    }
+
+    /**
+     * Short-circuit WP::handle_404() for our feed so the request never 404s.
+     *
+     * @param bool      $preempt  Whether to short-circuit the 404 handling.
+     * @param \WP_Query $wpQuery  The query being dispatched.
+     */
+    public function preventFeed404( $preempt, $wpQuery ) {
+        if ( $wpQuery instanceof \WP_Query && self::FEED === $wpQuery->get( 'feed' ) ) {
+            return true;
+        }
+        return $preempt;
     }
 
     public function render(): void {
@@ -54,13 +72,35 @@ final class PodcastFeed {
 
         $config = $factory->fromPost( $podcastId, $feedUrl );
         $items  = $this->items();
+
+        // Fail-visible (rollback story 1 + the Legacy Compatibility Contract): per-podcast
+        // item filtering is an explicit Tier B deferral, so on a MULTI-podcast site this feed
+        // carries the resolved podcast's channel identity but the full site-wide sermon set
+        // (over-inclusion). Surface that discrepancy — exactly like sermonator_feed_truncated —
+        // so it is observable to the admin/migration report, never silently-different content.
+        if ( $this->publishedPodcastCount() > 1 ) {
+            do_action( 'sermonator_feed_unscoped_multipodcast', $podcastId, count( $items ) );
+        }
+
         echo ( new FeedBuilder() )->build( $config, $items ); // phpcs:ignore WordPress.Security.EscapeOutput
+    }
+
+    /** Number of published podcasts (capped at 2 — callers only need to know if >1). */
+    private function publishedPodcastCount(): int {
+        $ids = get_posts( array(
+            'post_type'      => ID::POST_TYPE_PODCAST,
+            'post_status'    => 'publish',
+            'posts_per_page' => 2,
+            'fields'         => 'ids',
+        ) );
+        return count( $ids );
     }
 
     /** @return list<FeedItem> */
     private function items(): array {
         $result   = ( new SermonQuery() )->run( array( 'perPage' => self::MAX_ITEMS ) );
         $resolver = new EnclosureResolver();
+        $guids    = new LegacyEpisodeGuid();
 
         if ( $result->total > self::MAX_ITEMS ) {
             // Observable, not silent: older episodes beyond the cap are not in the feed.
@@ -76,7 +116,7 @@ final class PodcastFeed {
             $items[] = new FeedItem(
                 title:        $view->title,
                 link:         $view->permalink,
-                guid:         'sermonator-' . $view->id,
+                guid:         $guids->resolve( $view->id ),
                 description:  $this->description( $view->id ),
                 pubTimestamp: $view->preachedTimestamp ?? (int) get_post_time( 'U', true, $view->id ),
                 audioUrl:     $enc['url'],

@@ -33,7 +33,7 @@ final class Registrar {
                 'capability_type' => Identifiers::POST_TYPE_SERMON,
                 'map_meta_cap'    => true,
                 'hierarchical'    => false,
-                'supports'        => array( 'title', 'editor', 'thumbnail', 'excerpt', 'comments', 'revisions', 'author' ),
+                'supports'        => array( 'title', 'editor', 'thumbnail', 'excerpt', 'comments', 'revisions', 'author', 'custom-fields' ),
                 'rewrite'         => array( 'slug' => 'sermons', 'with_front' => false ),
             )
         );

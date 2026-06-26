@@ -47,21 +47,17 @@ Block Bindings API, etc. — old installs "must modernize first," per the owner)
   - Phase 3: Apple-compatible **podcast RSS feed** (`src/Frontend/Feed/`) + the reversible
     **audio-size backfill** `wp sermonator audio backfill` + subscribe block.
   - Phase 4: schema.org JSON-LD + Open Graph (`src/Frontend/Seo/`); cross-theme verified.
-- **Test status on `main`:** unit **119**, integration **386** — all green on WP 7.0.
+- **The "Sermon Details" authoring layer** — implemented on branch `authoring-layer`:
+  - `Sermonator\Admin\Authoring\` meta write contract, REST audio-metadata endpoint,
+    save-time preached-date normalizer, and a Gutenberg sidebar panel (`build/sermon-details/`).
+  - Shared `Schema\VideoEmbedPolicy` reused by the renderer and the authoring sanitizer.
+  - Migration-gated writes; global meta registration does not interfere with migration's raw
+    legacy-value writes.
+- **Test status:** unit **148**, integration **399** — all green on WP 7.0.
 
 ### DESIGNED but NOT built (your immediate next task)
-- **The "Sermon Details" authoring layer.** Today wp-admin has NO UI to edit any
-  sermon-specific field (preached date, scripture, audio, video, notes) — only title/body/
-  featured-image/taxonomies. A new sermon created in wp-admin gets none of that meta. This is
-  the biggest gap to the plugin being genuinely usable (not just a migration target).
-  - **Spec:** `docs/superpowers/specs/2026-06-23-sermonator-authoring-layer-design.md`
-  - **Plan:** `docs/superpowers/plans/2026-06-23-sermonator-authoring-layer.md`  ← execute this
-  - Decision (owner-owned ADR): native Gutenberg sidebar panel built with `@wordpress/scripts`
-    (JSX). All forum gates (tenth-man / time-travel / rollback) are run and folded into the
-    spec — **honor them** (migration-gated writes, site-timezone date-only, editor never
-    clobbers a migrated audio size, shared video allowlist).
-  - This branch (`authoring-layer`) contains the spec + plan. The owner will likely want a
-    final review of the spec before you implement.
+- Nothing currently in flight. The next priority should be picked with the owner; likely
+  candidates are the backlog items below.
 
 ### DEFERRED / backlog (not yet designed)
 - Extend the audio backfill to populate **duration** (currently size-only) for the back catalog.
@@ -170,8 +166,11 @@ A real WP 7.0 site for clicking around + live verification, with the plugin **sy
   `authoring-layer` (and pushed).
 
 ## 7. Suggested first move for the new agent
-1. `git checkout main && composer install`; confirm `composer test:unit` is green.
-2. Read the authoring **spec** + **plan** (§2 above) and the owner's note on the spec.
-3. Start the Local app + verify the WP-CLI wrapper works; open the sermon edit screen to see
-   the gap firsthand.
-4. Implement the authoring plan task-by-task (TDD), review adversarially, PR.
+1. `git checkout main && composer install`; confirm `composer test:unit` and the wp-env
+   integration suite are green.
+2. Pick the next backlog item with the owner (§2). Strong candidates:
+   - Extend the audio backfill to populate **duration** for the back catalog.
+   - Editor inspector controls for the existing front-end blocks.
+   - Version bump + distribution-ready plugin headers.
+3. Run the design forum gates (adr-on-rails, tenth-man, time-travel-critic, rollback-story),
+   write a spec + plan, implement TDD, and review adversarially before PR.

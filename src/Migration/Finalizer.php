@@ -72,10 +72,12 @@ use Sermonator\Schema\Identifiers;
 final class Finalizer {
     private MigrationState $state;
     private Verifier $verifier;
+    private LegacyFeedSnapshot $feedSnapshot;
 
-    public function __construct( ?MigrationState $state = null, ?Verifier $verifier = null ) {
-        $this->state    = $state ?? new MigrationState();
-        $this->verifier = $verifier ?? new Verifier( $this->state );
+    public function __construct( ?MigrationState $state = null, ?Verifier $verifier = null, ?LegacyFeedSnapshot $feedSnapshot = null ) {
+        $this->state        = $state ?? new MigrationState();
+        $this->verifier     = $verifier ?? new Verifier( $this->state );
+        $this->feedSnapshot = $feedSnapshot ?? new LegacyFeedSnapshot();
     }
 
     /**
@@ -230,6 +232,19 @@ final class Finalizer {
             );
         }
 
+        // GATE 4 (data-preservation hard guard): on a MULTI-podcast site the durable
+        // OPTION_LEGACY_PODCAST_MAP MUST already carry every migrated podcast's legacy id
+        // BEFORE we strip the Crosswalk LEGACY_POST_ID back-ref. Otherwise the only record
+        // of the legacy→new podcast correspondence is destroyed at this irreversible point
+        // and every legacy ?id=<podcast> feed URL would silently fall back to the DEFAULT
+        // podcast (a subscriber to podcast B served podcast A). Refuse fail-visibly rather
+        // than destroy the mapping. Single-podcast sites (default == only podcast) are
+        // unaffected and pass. PodcastWriter populates this map at migrate time.
+        $mapGuard = $this->refuseOnUnmappedMultiPodcast();
+        if ( $mapGuard !== null ) {
+            return $this->refuse( $deleted, $mapGuard );
+        }
+
         // COMMIT POINT. All gates passed → the destructive step is committed. Advance the
         // phase to 'finalized' BEFORE touching any data, so a crash anywhere in the
         // (non-atomic) destruction re-enters the idempotent drain on the next run()
@@ -314,6 +329,17 @@ final class Finalizer {
         // delete and the back-ref strip for this record (human-clear required).
         if ( $this->hasUnresolvedDivergence( $newId ) ) {
             return 0;
+        }
+
+        // DURABILITY (rollback story 1): make the legacy podcast GUID durable in the
+        // NEW post's namespace BEFORE we strip the LEGACY_POST_ID back-ref below. The
+        // feed's pre-Finalize GUID replay translates new->legacy via that back-ref to
+        // read the legacy-keyed LegacyFeedSnapshot; once the back-ref is gone the only
+        // surviving bridge is the META_LEGACY_GUID this stamps (NOT in the strip
+        // allowlist). Episode GUIDs are sermon-level; for podcasts the snapshot has no
+        // entry, so makeDurable is a harmless no-op. Idempotent on resume.
+        if ( $newType === Identifiers::POST_TYPE_SERMON ) {
+            $this->feedSnapshot->makeDurable( $newId, $legacyId );
         }
 
         // The whole op below is idempotent (the get_post()/findNewByLegacyId() guards),
@@ -482,6 +508,44 @@ final class Finalizer {
         ) );
 
         return array_values( array_map( 'intval', (array) $ids ) );
+    }
+
+    /**
+     * Hard guard against silently destroying the legacy→new podcast correspondence on a
+     * multi-podcast site. Returns a refusal reason when MORE THAN ONE migrated podcast
+     * exists and the durable OPTION_LEGACY_PODCAST_MAP does not already map EVERY migrated
+     * podcast's legacy id to its new id; otherwise null (safe to proceed).
+     *
+     * Single-podcast sites pass unconditionally (the default podcast IS the only podcast,
+     * so a fall-through to default is always correct).
+     */
+    private function refuseOnUnmappedMultiPodcast(): ?string {
+        $podcastIds = Crosswalk::migratedPostIds( Identifiers::POST_TYPE_PODCAST );
+        if ( count( $podcastIds ) <= 1 ) {
+            return null;
+        }
+
+        $map = get_option( Identifiers::OPTION_LEGACY_PODCAST_MAP, array() );
+        $map = is_array( $map ) ? $map : array();
+
+        foreach ( $podcastIds as $newId ) {
+            $legacyId = (int) get_post_meta( $newId, Crosswalk::LEGACY_POST_ID, true );
+            if ( $legacyId <= 0 ) {
+                continue; // No back-ref to preserve — nothing to map for this record.
+            }
+            if ( ! isset( $map[ $legacyId ] ) || (int) $map[ $legacyId ] <= 0 ) {
+                return sprintf(
+                    'Finalize refused: %d migrated podcasts but the durable legacy podcast map '
+                    . '(%s) is missing legacy id %d — finalizing would strip the back-ref and '
+                    . 'permanently lose legacy feed routing. Re-run migration to populate the map.',
+                    count( $podcastIds ),
+                    Identifiers::OPTION_LEGACY_PODCAST_MAP,
+                    $legacyId
+                );
+            }
+        }
+
+        return null;
     }
 
     /**

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/bulletin",
+  "title": "Sermon Bulletin",
+  "category": "widgets",
+  "icon": "pdf",
+  "description": "A download link for the sermon bulletin PDF.",
+  "textdomain": "sermonator",
+  "usesContext": [ "postId" ],
+  "attributes": {
+    "postId": { "type": "number" }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}

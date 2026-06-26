@@ -1,0 +1,163 @@
+/**
+ * Sermon Details meta-box styles.
+ *
+ * The React UI mounts into #sermonator-meta-box-root. These styles support the
+ * card-based section layout used by the Sermon Details meta box.
+ */
+
+#sermonator-meta-box-root {
+	min-height: 100px;
+}
+
+.sermonator-meta-box-placeholder {
+	padding: 1em;
+	color: #646970;
+	background: #f6f7f7;
+	border: 1px dashed #c3c4c7;
+	border-radius: 4px;
+}
+
+/* Container */
+.sermonator-meta-box {
+	padding: 4px 0;
+}
+
+.sermonator-meta-box .components-notice {
+	margin: 0 0 12px;
+}
+
+.sermonator-meta-box .components-notice:last-child {
+	margin-bottom: 0;
+}
+
+/* Sections / cards */
+.sermonator-meta-section {
+	background: #f6f7f7;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	padding: 16px;
+	margin-bottom: 16px;
+}
+
+.sermonator-meta-section:last-child {
+	margin-bottom: 0;
+}
+
+.sermonator-meta-section__title {
+	margin: 0 0 12px;
+	font-size: 14px;
+	font-weight: 600;
+	line-height: 1.4;
+	color: #1d2327;
+}
+
+/* Two-column grid */
+.sermonator-meta-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 16px;
+}
+
+@media (max-width: 600px) {
+	.sermonator-meta-grid {
+		grid-template-columns: 1fr;
+	}
+}
+
+.sermonator-meta-grid__item {
+	min-width: 0;
+}
+
+/* Compact date input */
+.sermonator-meta-box .components-text-control__input[type="date"] {
+	max-width: 160px;
+}
+
+/* Audio / file rows */
+.sermonator-audio-row,
+.sermonator-file-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	padding: 8px 0;
+	border-bottom: 1px solid #dcdcde;
+}
+
+.sermonator-audio-row__name,
+.sermonator-file-row__name {
+	font-size: 13px;
+	line-height: 1.4;
+	color: #3c434a;
+	word-break: break-all;
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.sermonator-audio-row__actions,
+.sermonator-file-row__actions {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-shrink: 0;
+}
+
+/* Audio info badges */
+.sermonator-audio-info {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px;
+	flex-shrink: 0;
+}
+
+.sermonator-audio-info__badge {
+	display: inline-block;
+	padding: 2px 8px;
+	background: #e0e0e0;
+	border-radius: 12px;
+	font-size: 12px;
+	line-height: 1.4;
+	color: #3c434a;
+	white-space: nowrap;
+}
+
+/* Audio details row (fetch button + badges) */
+.sermonator-audio-details {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 12px;
+	margin-top: 12px;
+}
+
+.sermonator-fetching {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+}
+
+/* Empty state */
+.sermonator-meta-empty {
+	color: #646970;
+	font-style: italic;
+}
+
+.sermonator-meta-save-status {
+	display: block;
+	margin-bottom: 12px;
+	font-size: 12px;
+	color: #646970;
+}
+
+/* Spacing inside sections */
+.sermonator-meta-section > .components-base-control,
+.sermonator-meta-section > .components-base-control + .components-base-control,
+.sermonator-meta-grid__item > .components-base-control + .components-base-control {
+	margin-top: 12px;
+}
+
+.sermonator-meta-section > .components-base-control:first-child,
+.sermonator-meta-grid__item > .components-base-control:first-child {
+	margin-top: 0;
+}

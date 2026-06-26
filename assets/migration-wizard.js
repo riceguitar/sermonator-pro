@@ -171,6 +171,25 @@
 				setBusy( false );
 				return;
 			}
+			// Verify reports its result in-place; only reload on a clean pass.
+			if ( action === 'verify' && res.data.report ) {
+				var report = res.data.report;
+				if ( report.complete ) {
+					log( 'Verification passed.' );
+					window.location.reload();
+					return;
+				}
+				var lines = [ 'Verification did not pass. Review the issues below, then re-run Detect and Migrate if needed.' ];
+				lines.push( '- Drift: ' + ( report.drift || 0 ) );
+				lines.push( '- Missing: ' + ( report.missing || 0 ) );
+				lines.push( '- Open failure flags: ' + ( report.openFlags && report.openFlags.length ? report.openFlags.length : 0 ) );
+				if ( report.openFlags && report.openFlags.length ) {
+					lines.push( 'Flags: ' + report.openFlags.join( ', ' ) );
+				}
+				log( lines.join( '\n' ), true );
+				setBusy( false );
+				return;
+			}
 			window.location.reload();
 		} ).catch( function () {
 			log( 'Network error.', true );

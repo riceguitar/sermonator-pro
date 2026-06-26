@@ -53,10 +53,13 @@ final class BlockTemplates {
         return '<!-- wp:template-part {"slug":"header","tagName":"header"} /-->'
             . '<!-- wp:group {"tagName":"main","layout":{"type":"constrained"}} --><main class="wp-block-group">'
             . '<!-- wp:post-title {"level":1} /-->'
+            . '<!-- wp:sermonator/featured-image /-->'
             . '<!-- wp:sermonator/sermon-meta /-->'
+            . '<!-- wp:sermonator/bulletin /-->'
             . '<!-- wp:sermonator/audio-player /-->'
             . '<!-- wp:sermonator/video /-->'
             . '<!-- wp:post-content /-->'
+            . '<!-- wp:sermonator/notes /-->'
             . '</main><!-- /wp:group -->'
             . '<!-- wp:template-part {"slug":"footer","tagName":"footer"} /-->';
     }

@@ -65,6 +65,37 @@ final class Renderer {
         return '';
     }
 
+
+    public function featuredImage( SermonView $v ): string {
+        if ( $v->imageId <= 0 ) {
+            return '';
+        }
+        $img = get_the_post_thumbnail( $v->id, 'large', array( 'class' => 'sermonator-single__image', 'loading' => 'eager' ) );
+        return is_string( $img ) && $img !== '' ? '<figure class="sermonator-single__media">' . $img . '</figure>' : '';
+    }
+
+    public function bulletin( SermonView $v ): string {
+        if ( $v->bulletinUrl === '' ) {
+            return '';
+        }
+        $url = esc_url( $v->bulletinUrl );
+        return '<div class="sermonator-bulletin">'
+            . '<a class="button" href="' . $url . '" download>'
+            . esc_html__( 'Download bulletin', 'sermonator' )
+            . '</a></div>';
+    }
+
+    public function notes( SermonView $v ): string {
+        if ( $v->notes === '' ) {
+            return '';
+        }
+        $url = esc_url( $v->notes );
+        return '<div class="sermonator-notes">'
+            . '<a class="button" href="' . $url . '" download>'
+            . esc_html__( 'Download sermon notes', 'sermonator' )
+            . '</a></div>';
+    }
+
     public function dateLabel( SermonView $v ): string {
         if ( $v->preachedTimestamp === null ) {
             return '';
@@ -170,46 +201,13 @@ final class Renderer {
     }
 
     /**
-     * Allowed HTML for a stored video embed. wp_kses_post() strips <iframe>, which would
-     * silently delete YouTube/Vimeo embeds, so we extend the post allowlist with iframe (and
-     * <video>/<source> for self-hosted) limited to safe, embed-relevant attributes.
-     *
-     * `style` is deliberately NOT allowed: kses does not parse CSS, so an allowed style
-     * attribute would let an editor turn an iframe into a full-page invisible overlay
-     * (clickjacking). Sizing is handled by width/height + the stylesheet's max-width.
+     * Allowed HTML for a stored video embed. Delegates to the shared policy so the authoring
+     * layer and the renderer can never drift.
      *
      * @return array<string,array<string,bool>>
      */
     private function allowedVideoHtml(): array {
-        $allowed           = wp_kses_allowed_html( 'post' );
-        $allowed['iframe'] = array(
-            'src'             => true,
-            'width'           => true,
-            'height'          => true,
-            'frameborder'     => true,
-            'allow'           => true,
-            'allowfullscreen' => true,
-            'title'           => true,
-            'loading'         => true,
-            'referrerpolicy'  => true,
-            'name'            => true,
-            'class'           => true,
-            'sandbox'         => true,
-        );
-        $allowed['video']  = array(
-            'src'      => true,
-            'width'    => true,
-            'height'   => true,
-            'controls' => true,
-            'preload'  => true,
-            'poster'   => true,
-            'class'    => true,
-        );
-        $allowed['source'] = array(
-            'src'  => true,
-            'type' => true,
-        );
-        return $allowed;
+        return \Sermonator\Schema\VideoEmbedPolicy::allowed();
     }
 
     private function row( string $key, string $label, string $valueHtml ): string {

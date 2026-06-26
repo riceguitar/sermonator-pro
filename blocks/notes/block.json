@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/notes",
+  "title": "Sermon Notes",
+  "category": "widgets",
+  "icon": "text-page",
+  "description": "The pastor's notes or study guide for a sermon.",
+  "textdomain": "sermonator",
+  "usesContext": [ "postId" ],
+  "attributes": {
+    "postId": { "type": "number" }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}
