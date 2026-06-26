@@ -45,6 +45,13 @@ final class Plugin {
         ( new \Sermonator\Admin\Authoring\AuthoringServiceProvider() )->hook();
         ( new \Sermonator\Admin\SettingsRegistrar() )->hook();
         ( new \Sermonator\Admin\DisplaySettingsRegistrar() )->hook();
+        // Deferred, change-only rewrite flush for the live archive-slug option.
+        // Wired unconditionally (like SettingsRegistrar): the add/update write
+        // listeners must catch a save in any context, while the init@99 flush
+        // self-scopes to admin/cron inside the handler so a front-end visitor
+        // never pays the flush. The live key is DISTINCT from the migration
+        // prefix-swap artifact, so a verbatim migration re-run never fires it.
+        ( new \Sermonator\Frontend\SlugRewriteFlusher() )->hook();
         // Bible parse-coverage ground-truth audit. All-contexts on purpose: the daily
         // recompute cron (EVENT_HOOK) and the on-save recompute (save_post_<sermon>)
         // must fire outside admin, and the site_status_tests filter is a harmless pure
