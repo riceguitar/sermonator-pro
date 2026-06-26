@@ -91,6 +91,10 @@ final class Plugin {
         ( new \Sermonator\Admin\MigrationController() )->hook();
         ( new \Sermonator\Admin\MigrationWizard() )->hook();
         ( new \Sermonator\Admin\LegacyDataNotice() )->hook();
+        // Settings-page Form 2 (podcast identity) admin-post.php handler. Admin-context
+        // only: the admin_post_* hook fires solely on admin-post.php, and the handler is
+        // phase-gated + nonce/cap-guarded before it writes through to the podcast meta.
+        ( new \Sermonator\Admin\PodcastIdentityController() )->hook();
     }
 
     /**
