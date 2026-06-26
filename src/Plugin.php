@@ -103,6 +103,12 @@ final class Plugin {
         // only: the admin_post_* hook fires solely on admin-post.php, and the handler is
         // phase-gated + nonce/cap-guarded before it writes through to the podcast meta.
         ( new \Sermonator\Admin\PodcastIdentityController() )->hook();
+        // The one opinionated settings page (Bible + Display via Settings API Form 1,
+        // Podcast identity via admin-post Form 2). Admin-context only: add_submenu_page +
+        // add_settings_* + screen-scoped asset enqueue all belong to admin requests. It
+        // registers no option (Form 1's options are owned by SettingsRegistrar +
+        // DisplaySettingsRegistrar) and writes nothing itself.
+        ( new \Sermonator\Admin\SettingsPage() )->hook();
     }
 
     /**
