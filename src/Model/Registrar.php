@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Sermonator\Model;
 
+use Sermonator\Schema\DisplayDefaults;
 use Sermonator\Schema\Identifiers;
 
 final class Registrar {
@@ -34,8 +35,34 @@ final class Registrar {
                 'map_meta_cap'    => true,
                 'hierarchical'    => false,
                 'supports'        => array( 'title', 'editor', 'thumbnail', 'excerpt', 'comments', 'revisions', 'author', 'custom-fields' ),
-                'rewrite'         => array( 'slug' => 'sermons', 'with_front' => false ),
+                'rewrite'         => array( 'slug' => $this->archiveSlug(), 'with_front' => false ),
             )
+        );
+    }
+
+    /**
+     * The CPT archive (and single-sermon permalink) base slug, read at `init@5`
+     * from the live {@see Identifiers::OPTION_ARCHIVE_SLUG} option.
+     *
+     * LOAD-BEARING CONTRACT (spec §1.3 / §1.4): the explicit `get_option()`
+     * fallback MUST be exactly {@see DisplayDefaults::defaultArchiveSlug()} — the
+     * identical seed resolver {@see \Sermonator\Frontend\SlugRewriteFlusher}'s
+     * first-save (add) path uses as its "old routing slug" baseline. The two are
+     * coupled: the flusher suppresses a rewrite flush when the first save merely
+     * persists the seed, which is only correct if the CPT was actually registered
+     * under that same seed here. Do NOT substitute a hardcoded `'sermons'` /
+     * {@see DisplayDefaults::HARD_ARCHIVE_SLUG} — on a migrated site whose seed
+     * resolves to e.g. `preken`, that would route the CPT under a different base
+     * than the flusher assumes and silently skip a genuinely-needed flush (404)
+     * or schedule a spurious one.
+     *
+     * `register_setting()`'s registered default is absent at `init@5`, so the
+     * explicit fallback is the only thing that seeds the value on this path.
+     */
+    private function archiveSlug(): string {
+        return (string) get_option(
+            Identifiers::OPTION_ARCHIVE_SLUG,
+            DisplayDefaults::defaultArchiveSlug()
         );
     }
 
