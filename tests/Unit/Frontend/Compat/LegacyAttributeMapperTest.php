@@ -364,21 +364,25 @@ final class LegacyAttributeMapperTest extends TestCase {
         }
     }
 
-    // === UNSUPPORTED (named) =================================================
+    // === UNSUPPORTED §63 no-op (NOT named — sermon set byte-identical) ========
 
-    public function test_image_size_is_named(): void {
+    public function test_image_size_is_not_named(): void {
+        // Contract ledger: image_size is presentation-only (no-op) — the sermon SET is
+        // unchanged, so naming it would be a false alarm. No notice owed.
         $result = $this->mapper()->map( array( 'image_size' => 'thumbnail' ) );
 
-        $this->assertContains( 'image_size', $result->unfaithfulAttrs );
+        $this->assertSame( array(), $result->unfaithfulAttrs );
     }
 
-    public function test_hide_filter_form_attrs_are_named(): void {
+    public function test_hide_filter_form_attrs_are_not_named(): void {
+        // Contract ledger: hide_* gate a filter FORM that is itself absent — content is
+        // byte-identical, so no per-call notice is owed (signed §63 exception).
         foreach ( array(
             'hide_filters', 'hide_topics', 'hide_series', 'hide_preachers',
             'hide_books', 'hide_dates', 'hide_service_types',
         ) as $attr ) {
             $result = $this->mapper()->map( array( $attr => 'yes' ) );
-            $this->assertContains( $attr, $result->unfaithfulAttrs, "$attr should be named" );
+            $this->assertSame( array(), $result->unfaithfulAttrs, "$attr should NOT be named" );
         }
     }
 

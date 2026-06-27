@@ -24,7 +24,10 @@ use Sermonator\Schema\Identifiers as ID;
  *  - NO-OP-SAFE    — honoring vs ignoring yields byte-identical content; not named.
  *  - UNVALIDATABLE — best-effort applied or dropped, but cannot be validated against
  *                    the absent SM source; NAMED (precise per-attribute notice).
- *  - UNSUPPORTED   — a deferred surface; NAMED, no faked content render.
+ *  - UNSUPPORTED   — a deferred surface recorded as a signed §63 exception. Per the
+ *                    Contract ledger these are NOT named when the sermon SET is
+ *                    byte-identical (image_size presentation-only; hide_* gate an absent
+ *                    filter form) — naming a content-faithful attr would be a false alarm.
  *
  * Faithfulness anchors (all line refs into Sermon Manager 2.15.15
  * includes/class-sm-shortcodes.php `display_sermons()`):
@@ -72,12 +75,6 @@ final class LegacyAttributeMapper {
         'hide_filters', 'hide_topics', 'hide_series', 'hide_preachers',
         'hide_books', 'hide_dates', 'hide_service_types',
         'show_initial',
-    );
-
-    /** Legacy filter-form hide_* attrs (UNSUPPORTED — the filter FORM is not rendered). */
-    private const HIDE_FILTER_ATTRS = array(
-        'hide_filters', 'hide_topics', 'hide_series', 'hide_preachers',
-        'hide_books', 'hide_dates', 'hide_service_types',
     );
 
     public function __construct(
@@ -155,20 +152,14 @@ final class LegacyAttributeMapper {
             $unfaithful[] = 'show_initial';
         }
 
-        // --- image_size (UNSUPPORTED §63 no-op; named) ---------------------------
-        if ( $this->present( $atts['image_size'] ?? null ) ) {
-            $unfaithful[] = 'image_size';
-        }
-
-        // --- hide_* filter-form attrs (UNSUPPORTED §63; named) -------------------
-        // NOTE: hide_nav / hide_pagination are NOT here — they are pagination aliases
-        // (NO-OP-SAFE) consumed by the disable_pagination axis below, not filter-form
-        // controls.
-        foreach ( self::HIDE_FILTER_ATTRS as $hideAttr ) {
-            if ( $this->present( $atts[ $hideAttr ] ?? null ) ) {
-                $unfaithful[] = $hideAttr;
-            }
-        }
+        // --- image_size + hide_* filter-form attrs (UNSUPPORTED §63; NOT named) --
+        // Per the Compatibility Contract ledger (and the signed §63 deferral-exception
+        // record): image_size is presentation-only and hide_* gate a filter FORM that is
+        // itself absent — in BOTH cases the sermon SET is byte-identical, so neither is a
+        // fail-wrong and no per-call notice is owed. They stay in RECOGNIZED so the
+        // unknown-attr loop below does not re-flag them. (hide_nav / hide_pagination are
+        // NOT filter-form attrs — they are pagination aliases consumed by the
+        // disable_pagination axis below.)
 
         // disable_pagination (aliases hide_nav, hide_pagination) is NO-OP-SAFE: the
         // grid renders no pager today, so there is nothing to disable -> not named.
