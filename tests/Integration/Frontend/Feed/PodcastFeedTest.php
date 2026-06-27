@@ -8,12 +8,14 @@ use WP_UnitTestCase;
 use Sermonator\Frontend\Feed\EnclosureResolver;
 use Sermonator\Frontend\Feed\PodcastConfigFactory;
 use Sermonator\Frontend\Feed\PodcastFeed;
+use Sermonator\Frontend\SermonQuery;
 use Sermonator\Schema\Identifiers as ID;
 
 final class PodcastFeedTest extends WP_UnitTestCase {
     protected function tearDown(): void {
         delete_option( ID::OPTION_DEFAULT_PODCAST );
         unset( $_GET['podcast'] );
+        set_query_var( SermonQuery::PAGE_QUERY_VAR, '' );
         parent::tearDown();
     }
 
@@ -90,6 +92,45 @@ final class PodcastFeedTest extends WP_UnitTestCase {
         $this->assertSame( 1, substr_count( $xml, '<item>' ) );
         $this->assertStringContainsString( 'Included', $xml );
         $this->assertStringNotContainsString( 'NoSize', $xml );
+    }
+
+    /**
+     * Regression (Bundle 2 / T5 review): SermonQuery::run() defaults a missing `page` to the
+     * registered PUBLIC `sermon_page` query var. The feed MUST be immune to that var — a stray or
+     * hostile `?sermon_page=N` on the feed URL must NOT serve a different (or empty) episode set.
+     * Proves never-fail-WRONG on the flagship read-only surface.
+     */
+    public function test_feed_ignores_sermon_page_query_var(): void {
+        $this->podcast();
+        $this->sermonWithAudio( 1000, 'First' );
+        $this->sermonWithAudio( 2000, 'Second' );
+
+        // sermon_page=2 would, if the feed honored it, push the offset past the data (MAX_ITEMS=300,
+        // total<300 → totalPages=1) and serve an EMPTY feed.
+        set_query_var( SermonQuery::PAGE_QUERY_VAR, '2' );
+        $withVar = $this->capture();
+
+        $this->assertSame( 2, substr_count( $withVar, '<item>' ), 'sermon_page=2 must NOT empty the feed.' );
+        $this->assertStringContainsString( 'First', $withVar );
+        $this->assertStringContainsString( 'Second', $withVar );
+    }
+
+    /**
+     * Stronger pin: the rendered feed is BYTE-IDENTICAL with and without `?sermon_page=2`, so a
+     * cached/poisoned pagination param cannot alter the feed's content at all.
+     */
+    public function test_feed_is_byte_identical_regardless_of_sermon_page(): void {
+        $this->podcast();
+        $this->sermonWithAudio( 1000, 'First' );
+        $this->sermonWithAudio( 2000, 'Second' );
+
+        set_query_var( SermonQuery::PAGE_QUERY_VAR, '' );
+        $baseline = $this->capture();
+
+        set_query_var( SermonQuery::PAGE_QUERY_VAR, '2' );
+        $withVar = $this->capture();
+
+        $this->assertSame( $baseline, $withVar, 'sermon_page must not change a single byte of the feed.' );
     }
 
     public function test_feed_without_default_podcast_is_valid_empty_channel(): void {

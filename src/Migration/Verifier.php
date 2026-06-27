@@ -171,6 +171,17 @@ final class Verifier {
             }
         }
 
+        // §63 prevalence counter (Bundle 2, T11). Write-gated here: verify is an explicit
+        // migrator action. By verify, podcasts have migrated, so this run captures the
+        // per-podcast term-scope counts (empty at detect) ALONGSIDE the source-content scans —
+        // the post-verify rollup carries everything. Never throws: a counter failure must not
+        // turn a faithful verification into a crash.
+        try {
+            ( new PrevalenceCounter() )->run();
+        } catch ( \Throwable $e ) {
+            unset( $e );
+        }
+
         return new VerifyReport( $complete, $drift, $missing, $openFlags, $counts );
     }
 

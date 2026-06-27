@@ -45,6 +45,18 @@ final class Identifiers {
 
     public const OPTION_PREFIX                  = 'sermonator_';
     public const META_PODCAST_SETTINGS          = 'sermonator_podcast_settings';
+
+    /**
+     * Sub-key INSIDE the {@see self::META_PODCAST_SETTINGS} blob selecting which sermon medium the
+     * feed serves (legacy Pro "Sermons to show"). Migrated VERBATIM from the legacy
+     * `sm_podcast_settings['sermons_to_show']` (it is not a taxonomy key, so {@see
+     * \Sermonator\Migration\PodcastWriter} passes it through unchanged and {@see
+     * \Sermonator\Schema\PodcastMetaSchema} preserves it). Legacy values: empty/absent = audio-only
+     * (today's faithful behavior), `video` / `audio_priority` / `video_priority` = non-audio modes
+     * whose faithfulness is a recorded §63 deferral. Read by {@see
+     * \Sermonator\Frontend\Feed\PodcastModeResolver}.
+     */
+    public const PODCAST_SETTING_FEED_MODE      = 'sermons_to_show';
     public const OPTION_DEFAULT_PODCAST         = 'sermonator_default_podcast';
     public const OPTION_TERM_IMAGES             = 'sermonator_term_images';
     public const OPTION_TERM_IMAGES_SETTINGS    = 'sermonator_term_images_settings';
@@ -52,6 +64,12 @@ final class Identifiers {
     public const OPTION_PRE_MIGRATION_BACKUP    = 'sermonator_pre_migration_backup';
     public const OPTION_MIGRATION_PROGRESS      = 'sermonator_migration_progress';
     public const OPTION_LEGACY_FEED_SNAPSHOT    = 'sermonator_legacy_feed_snapshot';
+    /**
+     * Precomputed migration prevalence rollup (Bundle 2, §63 / T11) — written ONLY on the
+     * write-gated detect/verify path, read by the wizard report. Mirrors OPTION_BIBLE_STATS:
+     * never written on a GET/report read path.
+     */
+    public const OPTION_MIGRATION_PREVALENCE    = 'sermonator_migration_prevalence';
 
     /** Axis A: bible-link version; default mirrors legacy verse_bible_version (e.g. ESV). */
     public const OPTION_BIBLE_LINK_VERSION      = 'sermonator_bible_link_version';
@@ -120,6 +138,18 @@ final class Identifiers {
     public const OPTION_ARCHIVE_SLUG            = 'sermonator_sermon_archive_slug';
     public const OPTION_DEFAULT_IMAGE_ID        = 'sermonator_sermon_default_image_id';
     public const OPTION_PREACHER_LABEL          = 'sermonator_preacher_label';
+
+    /**
+     * Legacy Sermon Manager archive ordering defaults, migrated VERBATIM by
+     * OptionWriter's wholesale `sermonmanager_*`→`sermonator_*` prefix-swap (see
+     * MappingContract::mapOptionName). The Bundle 2 `[sermons]` shim consults these
+     * as the default `order`/`orderby` and to resolve `orderby=date` exactly as
+     * SM's display_sermons() did (date→published ONLY when archive_orderby==='date',
+     * else preached). SM's own defaults when the option is ABSENT: orderby
+     * `date_preached`, order `desc` (class-sm-settings-display.php:69/80).
+     */
+    public const OPTION_ARCHIVE_ORDERBY         = 'sermonator_archive_orderby';
+    public const OPTION_ARCHIVE_ORDER           = 'sermonator_archive_order';
 
     /**
      * Persistent flag set by SlugRewriteFlusher ONLY on a real archive-slug value

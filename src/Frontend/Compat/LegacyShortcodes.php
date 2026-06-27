@@ -4,20 +4,28 @@ declare(strict_types=1);
 
 namespace Sermonator\Frontend\Compat;
 
+use Sermonator\Frontend\Assets;
 use Sermonator\Frontend\Blocks\AbstractBlock;
 use Sermonator\Frontend\Blocks\LatestSeriesBlock;
 use Sermonator\Frontend\Blocks\SermonImagesBlock;
 use Sermonator\Frontend\Blocks\TaxonomyFilterBlock;
-use Sermonator\Frontend\Shortcode;
 use Sermonator\Frontend\Blocks\PodcastSubscribeBlock;
+use Sermonator\Frontend\Renderer;
+use Sermonator\Frontend\SermonQuery;
 
 /**
  * Legacy-shortcode shims. Migrated pages contain [sermons] et al.; without these tags
  * WordPress prints the raw "[sermons]" text.
  *
  * Tiers (per the Legacy Compatibility Contract):
- *  - [sermons]/[sermons_sm] — Tier A safe sermon list + the generic editor "needs review"
- *    notice. Attribute-faithful output is Bundle 2; unchanged here.
+ *  - [sermons]/[sermons_sm] — Bundle 2 ATTRIBUTE-FAITHFUL. The raw atts are classified by
+ *    {@see LegacyAttributeMapper} (FAITHFUL / NO-OP-SAFE / UNVALIDATABLE / UNSUPPORTED per
+ *    cell), the faithful axes are applied through {@see SermonQuery}, and the result is
+ *    rendered as a paginated list by the pure {@see Renderer}. The review notice is now
+ *    PRECISE: it names ONLY the present unfaithful attributes (an empty set → NO notice, the
+ *    earned end-state) — replacing the Bundle 1 generic safe-default render. When the list
+ *    has more results than a single page shows, {@see self::TRUNCATED_ACTION} fires so the
+ *    silent-tail-drop risk is observable even to visitors (the editor notice is not).
  *  - [list_sermons]/[latest_series]/[sermon_images] — now delegate to the FAITHFUL Bundle 4
  *    display blocks (term list / latest-series card / term-image grid) instead of the
  *    wrong-type safe sermon list. A reworded PER-TAG review notice is KEPT and prepended:
@@ -43,6 +51,16 @@ final class LegacyShortcodes {
 
     /** The tag that maps onto the podcast-subscribe capability instead of the sermon list. */
     public const PODCAST_TAG = 'list_podcasts';
+
+    /**
+     * Fired whenever an attribute-faithful [sermons]/[sermons_sm] list spans more than one page
+     * (`total > perPage`) — the pre-pagination edge / hard-cap condition where a naive pager-less
+     * render would silently drop the long tail. ALWAYS fires (visitor-facing observability),
+     * independent of the editor-only review notice. Args: (int $total, int $perPage).
+     */
+    public const TRUNCATED_ACTION = 'sermonator_list_truncated';
+
+    public function __construct( private readonly ?LegacyAttributeMapper $mapper = null ) {}
 
     /** All legacy tags this shim registers. */
     public const TAGS = array(
@@ -88,16 +106,113 @@ final class LegacyShortcodes {
     }
 
     /**
-     * Generic safe sermon-list default for [sermons]/[sermons_sm] (Bundle 2). Prepends the
-     * generic editor-only "needs review" notice so a migrated listing that may differ from its
-     * legacy filters is never silently wrong.
+     * Attribute-faithful [sermons]/[sermons_sm] (Bundle 2, T6): map the RAW atts through
+     * {@see LegacyAttributeMapper}, run the faithful axes through {@see SermonQuery}, and render
+     * the list with the pure {@see Renderer}. Replaces the Bundle 1 safe-default render.
+     *
+     * Pagination is HONORED per the legacy `disable_pagination` axis: when set
+     * ({@see LegacyMappedQuery::$disablePagination}) the non-paginated {@see Renderer::grid()}
+     * is rendered (first page, no pager) exactly as legacy `display_sermons()` hid its pager;
+     * otherwise the {@see Renderer::paginatedGrid()} variant keeps the long tail reachable.
+     *
+     * The editor notice is PRECISE — built ONLY from the mapper's `unfaithfulAttrs`; an empty
+     * set means every attribute was faithfully reproduced and NO notice is shown (the earned
+     * end-state). When the list spans more than one page, {@see self::TRUNCATED_ACTION} fires so
+     * the silent-tail-drop risk is observable even to logged-out visitors (who never see the
+     * editor-facing notice). Never renders silently-different content.
      *
      * @param array<string,string>|string $atts
      */
     public function render( $atts = array(), ?string $content = null, string $tag = '' ): string {
-        $list = ( new Shortcode() )->render( is_array( $atts ) ? $atts : array() );
+        $mapped = $this->mapper()->map( is_array( $atts ) ? $atts : array() );
 
-        return self::needsReviewNotice() . $list;
+        // Read-path pin (spec §2.2): the embedded current page comes from the dedicated,
+        // registered `sermon_page` query var — NEVER the archive main query's `paged`/`page`.
+        $args         = $mapped->toSermonQueryArgs();
+        $args['page'] = SermonQuery::currentPage();
+
+        $result = ( new SermonQuery() )->run( $args );
+
+        // Observability: a list with more results than one page shows would silently drop its
+        // long tail under a pager-less render (the canonical fail-wrong). Fire ALWAYS — this is a
+        // visitor-facing signal, decoupled from the editor-only notice and from login state.
+        $perPage = (int) ( $mapped->gridArgs['perPage'] ?? 0 );
+        if ( $perPage > 0 && $result->total > $perPage ) {
+            do_action( self::TRUNCATED_ACTION, $result->total, $perPage );
+        }
+
+        $this->enqueueGridStyle();
+
+        // disable_pagination (aliases hide_nav/hide_pagination) is now HONORED: a truthy
+        // value suppresses the pager exactly as legacy display_sermons() :1129 hid
+        // wp_pagenavi/paginate_links, rendering the non-paginated grid (the first page of
+        // perPage items). Otherwise emit the paginated variant so a large archive's long
+        // tail stays reachable. Either way the always-on TRUNCATED_ACTION above keeps the
+        // tail-drop observable — when pagination is disabled the drop is the editor's
+        // explicit request, not a silent divergence.
+        $renderer = new Renderer();
+        $html     = $mapped->disablePagination
+            ? $renderer->grid( $result )
+            : $renderer->paginatedGrid( $result, $this->listBaseUrl() );
+
+        return self::preciseNotice( $mapped->unfaithfulAttrs ) . $html;
+    }
+
+    /** The injected mapper, or a default-constructed one (its own shared resolvers). */
+    private function mapper(): LegacyAttributeMapper {
+        return $this->mapper ?? new LegacyAttributeMapper();
+    }
+
+    /**
+     * The base URL for the embedded list's pager: the current (embedding) page's permalink with
+     * any stale `sermon_page` stripped, so {@see Renderer::pager()} can append `?sermon_page=N`
+     * (query-string form — NOT pretty `/page/N/` permalinks, which collide with the main query
+     * and 404 on a static page). Falls back to the home URL off-loop.
+     */
+    private function listBaseUrl(): string {
+        $objectId  = (int) get_queried_object_id();
+        $permalink = $objectId > 0 ? get_permalink( $objectId ) : '';
+        if ( is_string( $permalink ) && $permalink !== '' ) {
+            return remove_query_arg( SermonQuery::PAGE_QUERY_VAR, $permalink );
+        }
+        return home_url( '/' );
+    }
+
+    /**
+     * Shortcodes do not trigger block-asset loading, so enqueue the grid stylesheet directly
+     * (mirrors {@see Shortcode::render()}). No-op when the handle is not registered.
+     */
+    private function enqueueGridStyle(): void {
+        if ( wp_style_is( Assets::STYLE_HANDLE, 'registered' ) ) {
+            wp_enqueue_style( Assets::STYLE_HANDLE );
+        }
+    }
+
+    /**
+     * The PRECISE per-attribute review notice for [sermons]/[sermons_sm]: names ONLY the present
+     * unfaithful attributes. An empty set → '' (no notice — the earned end-state). Each attribute
+     * name is `esc_html`'d (they originate from raw, attacker-controllable shortcode atts) before
+     * being folded into the escaped, translated message; editor-only via {@see self::wrapNotice()}.
+     *
+     * @param list<string> $unfaithfulAttrs
+     */
+    private static function preciseNotice( array $unfaithfulAttrs ): string {
+        if ( $unfaithfulAttrs === array() ) {
+            return '';
+        }
+
+        $names = implode(
+            ', ',
+            array_map( static fn( string $attr ): string => esc_html( $attr ), $unfaithfulAttrs )
+        );
+
+        $message = sprintf(
+            /* translators: %s: comma-separated list of shortcode attribute names. */
+            esc_html__( 'This sermon listing was migrated from Sermon Manager. These attributes could not be verified against the original and may render differently — review before relying on them: %s', 'sermonator' ),
+            $names
+        );
+
+        return self::wrapNotice( $message );
     }
 
     /**
@@ -159,8 +274,10 @@ final class LegacyShortcodes {
     }
 
     /**
-     * Generic editor-only review notice for the Bundle 2 sermon-list tags (and the
-     * SermonImagesBlock safe-list fallback). Empty for visitors.
+     * Generic editor-only "needs review" notice, retained for the {@see SermonImagesBlock}
+     * safe-list fallback (no migrated artwork → a default listing). The [sermons]/[sermons_sm]
+     * tags now use the PRECISE per-attribute notice ({@see self::preciseNotice()}); this generic
+     * wording stays only for the wrong-type-fallback surface. Empty for visitors.
      */
     public static function needsReviewNotice(): string {
         return self::wrapNotice(

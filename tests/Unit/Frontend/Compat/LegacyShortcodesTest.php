@@ -28,6 +28,7 @@ final class LegacyShortcodesTest extends TestCase {
         Functions\when( '__' )->returnArg();
         Functions\when( 'esc_html' )->returnArg();
         Functions\when( 'esc_attr' )->returnArg();
+        Functions\when( 'esc_attr__' )->returnArg();
         Functions\when( 'esc_url' )->returnArg();
         Functions\when( 'wp_kses_post' )->returnArg();
         Functions\when( 'is_wp_error' )->justReturn( false );
@@ -43,9 +44,12 @@ final class LegacyShortcodesTest extends TestCase {
         }
         if ( ! class_exists( 'WP_Query' ) ) {
             eval(
-                'class WP_Query { public $posts = array(); public function __construct( $args = array() ) {'
+                'class WP_Query { public $posts = array(); public $found_posts = 0; public $max_num_pages = 1;'
+                . ' public function __construct( $args = array() ) {'
                 . ' $GLOBALS["__sermonator_ls_args"] = $args;'
-                . ' $this->posts = $GLOBALS["__sermonator_ls_posts"] ?? array(); } }'
+                . ' $this->posts = $GLOBALS["__sermonator_ls_posts"] ?? array();'
+                . ' $this->found_posts = $GLOBALS["__sermonator_ls_found"] ?? count( $this->posts );'
+                . ' $this->max_num_pages = $GLOBALS["__sermonator_ls_pages"] ?? 1; } }'
             );
         }
         $GLOBALS['__sermonator_ls_posts'] = array();
@@ -53,9 +57,39 @@ final class LegacyShortcodesTest extends TestCase {
     }
 
     protected function tearDown(): void {
-        unset( $GLOBALS['__sermonator_ls_posts'], $GLOBALS['__sermonator_ls_args'] );
+        unset(
+            $GLOBALS['__sermonator_ls_posts'],
+            $GLOBALS['__sermonator_ls_args'],
+            $GLOBALS['__sermonator_ls_found'],
+            $GLOBALS['__sermonator_ls_pages']
+        );
         Monkey\tearDown();
         parent::tearDown();
+    }
+
+    /**
+     * Stub the WP surface the attribute-faithful [sermons] render() touches OUTSIDE the mapper:
+     * the option-driven mapper defaults, the registered `sermon_page` read, the pager base URL,
+     * and the asset-enqueue guard. The heavy WP_Query/TemplateData stack is mocked via the
+     * faked WP_Query (empty posts → no TemplateData) so these unit tests exercise the T6 WIRING
+     * (precise notice + truncation action + base URL), with full rendering pinned by integration.
+     */
+    private function stubRenderEnv( bool $isEditor ): void {
+        $options = array(
+            'posts_per_page'           => 10,
+            ID::OPTION_ARCHIVE_ORDER   => 'desc',
+            ID::OPTION_ARCHIVE_ORDERBY => 'date_preached',
+        );
+        Functions\when( 'get_option' )->alias(
+            static function ( $key, $default = false ) use ( $options ) {
+                return $options[ $key ] ?? ( $default !== false ? $default : '' );
+            }
+        );
+        Functions\when( 'get_query_var' )->justReturn( 1 );
+        Functions\when( 'get_queried_object_id' )->justReturn( 0 );
+        Functions\when( 'home_url' )->justReturn( 'http://example.test/' );
+        Functions\when( 'wp_style_is' )->justReturn( false );
+        Functions\when( 'current_user_can' )->justReturn( $isEditor );
     }
 
     private function term( int $ttId, string $name, string $description = '' ): \WP_Term {
@@ -193,5 +227,169 @@ final class LegacyShortcodesTest extends TestCase {
         $this->assertStringContainsString( 'sermonator-compat-notice', $html );
         $this->assertStringContainsString( 'sermonator-image-grid', $html );
         $this->assertStringContainsString( 'advent.jpg', $html );
+    }
+
+    // ---------------------------------------------------------------- [sermons] render() (T6)
+
+    /**
+     * A faithful-only [sermons] (every attribute reproducible) renders the mapped query through
+     * the engine and shows NO review notice — the earned end-state. The output is real HTML, never
+     * the raw shortcode text.
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_faithful_only_sermons_renders_query_with_no_notice(): void {
+        $this->stubRenderEnv( isEditor: true );
+
+        $html = ( new LegacyShortcodes() )->render( array() );
+
+        $this->assertStringNotContainsString( 'sermonator-compat-notice', $html,
+            'a faithful-only [sermons] must drop the review notice (empty unfaithful set)' );
+        $this->assertStringContainsString( 'sermonator-grid', $html );
+        $this->assertStringNotContainsString( '[sermons]', $html );
+    }
+
+    /**
+     * An [sermons] carrying an UNKNOWN attribute renders the query AND a precise notice naming
+     * ONLY that attribute — never the faithful ones (order is faithful, so it is not named).
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_unknown_attr_renders_query_plus_notice_naming_only_it(): void {
+        $this->stubRenderEnv( isEditor: true );
+
+        $html = ( new LegacyShortcodes() )->render( array( 'frobnicate' => 'yes', 'order' => 'asc' ) );
+
+        $this->assertStringContainsString( 'sermonator-compat-notice', $html );
+        $this->assertStringContainsString( 'frobnicate', $html, 'the unknown attr must be named' );
+        $this->assertStringNotContainsString( 'order', $html, 'a FAITHFUL attr must NOT be named' );
+        $this->assertStringContainsString( 'sermonator-grid', $html );
+    }
+
+    /**
+     * image_size is the signed §63 no-op (presentation-only; the sermon SET is unchanged), so it
+     * earns NO notice — proving the ledger cell shipped faithful, not a false alarm.
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_image_size_is_a_noop_with_no_notice(): void {
+        $this->stubRenderEnv( isEditor: true );
+
+        $html = ( new LegacyShortcodes() )->render( array( 'image_size' => 'large' ) );
+
+        $this->assertStringNotContainsString( 'sermonator-compat-notice', $html,
+            'image_size is §63 presentation-only — the sermon set is unchanged, so no notice is owed' );
+        $this->assertStringContainsString( 'sermonator-grid', $html );
+    }
+
+    /**
+     * A logged-out visitor sees the rendered content but NOT the editor-facing notice, while the
+     * truncation do_action ALWAYS fires when the list spans more than one page — so the
+     * silent-tail-drop risk is observable independent of login state.
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_visitor_sees_content_no_notice_but_truncation_action_fires(): void {
+        $this->stubRenderEnv( isEditor: false );
+        // 50 found, default per_page 10 → total > perPage → the truncation signal must fire.
+        $GLOBALS['__sermonator_ls_found'] = 50;
+
+        $fired = array();
+        Functions\when( 'do_action' )->alias(
+            static function ( $hook, ...$args ) use ( &$fired ) {
+                if ( $hook === LegacyShortcodes::TRUNCATED_ACTION ) {
+                    $fired[] = $args;
+                }
+            }
+        );
+
+        // An unknown attr is present, but the visitor must never see the editor notice.
+        $html = ( new LegacyShortcodes() )->render( array( 'frobnicate' => 'yes' ) );
+
+        $this->assertStringNotContainsString( 'sermonator-compat-notice', $html,
+            'the precise notice is editor-facing — a visitor never sees it' );
+        $this->assertStringContainsString( 'sermonator-grid', $html, 'the visitor still sees rendered content' );
+        $this->assertSame( array( array( 50, 10 ) ), $fired,
+            'sermonator_list_truncated must fire once with (total, perPage), regardless of login' );
+    }
+
+    /**
+     * disable_pagination (and its aliases) SUPPRESSES the pager: even with a multi-page list
+     * (total > perPage), render() emits the non-paginated grid with NO pager nav — faithfully
+     * reproducing SM hiding wp_pagenavi/paginate_links — and shows no review notice (the axis
+     * is honored, hence faithful). Without it, the same list renders the pager. This pins the
+     * fail-visible gap the pager landing would otherwise open.
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_disable_pagination_suppresses_pager(): void {
+        $this->stubRenderEnv( isEditor: true );
+        // 50 found across 5 pages → the pager WOULD render without the flag.
+        $GLOBALS['__sermonator_ls_found'] = 50;
+        $GLOBALS['__sermonator_ls_pages'] = 5;
+        Functions\when( 'do_action' )->justReturn( null );
+        Functions\when( 'add_query_arg' )->justReturn( 'http://example.test/?sermon_page=2' );
+
+        $disabled = ( new LegacyShortcodes() )->render( array( 'disable_pagination' => 'true' ) );
+        $this->assertStringContainsString( 'sermonator-grid', $disabled, 'content still renders' );
+        $this->assertStringNotContainsString( 'sermonator-pager', $disabled,
+            'disable_pagination must suppress the pager exactly as SM hid its pager' );
+        $this->assertStringNotContainsString( 'sermonator-compat-notice', $disabled,
+            'disable_pagination is honored → faithful → no review notice' );
+
+        // Control: the SAME multi-page list WITHOUT the flag DOES render the pager.
+        $paged = ( new LegacyShortcodes() )->render( array() );
+        $this->assertStringContainsString( 'sermonator-pager', $paged,
+            'without disable_pagination the multi-page list still paginates' );
+    }
+
+    /**
+     * Each disable_pagination alias suppresses the pager too.
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_disable_pagination_aliases_suppress_pager(): void {
+        $this->stubRenderEnv( isEditor: true );
+        $GLOBALS['__sermonator_ls_found'] = 50;
+        $GLOBALS['__sermonator_ls_pages'] = 5;
+        Functions\when( 'do_action' )->justReturn( null );
+        Functions\when( 'add_query_arg' )->justReturn( 'http://example.test/?sermon_page=2' );
+
+        foreach ( array( 'hide_nav', 'hide_pagination' ) as $alias ) {
+            $html = ( new LegacyShortcodes() )->render( array( $alias => '1' ) );
+            $this->assertStringNotContainsString( 'sermonator-pager', $html, "$alias must suppress the pager" );
+            $this->assertStringContainsString( 'sermonator-grid', $html );
+        }
+    }
+
+    /**
+     * The converse pin: a single-page list (total <= perPage) does NOT fire the truncation
+     * signal — nothing is dropped, so no false alarm.
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_truncation_action_does_not_fire_within_a_single_page(): void {
+        $this->stubRenderEnv( isEditor: true );
+        $GLOBALS['__sermonator_ls_found'] = 3; // < default per_page 10
+
+        $fired = false;
+        Functions\when( 'do_action' )->alias(
+            static function ( $hook ) use ( &$fired ) {
+                if ( $hook === LegacyShortcodes::TRUNCATED_ACTION ) {
+                    $fired = true;
+                }
+            }
+        );
+
+        ( new LegacyShortcodes() )->render( array() );
+
+        $this->assertFalse( $fired, 'no truncation when the whole list fits one page' );
     }
 }

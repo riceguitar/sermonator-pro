@@ -1,0 +1,190 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sermonator\Tests\Integration\Migration;
+
+use WP_UnitTestCase;
+use Sermonator\Migration\LegacyIdentifiers as LID;
+use Sermonator\Migration\LegacySchemaRegistrar;
+use Sermonator\Migration\PrevalenceCounter;
+
+/**
+ * Integration coverage for the §63 prevalence counter (spec T11), driving the REAL default
+ * providers against a live `$wpdb`: the published-podcast WP_Query, the `[sermons]` content
+ * `LIKE` scan + `shortcode_parse_atts()` density, the migrated-podcast scope read, and the
+ * reused {@see \Sermonator\Migration\PageBuilderScanner} scan. NOT run in this environment
+ * (no Docker / wp-env); authored to run under wp-env later.
+ *
+ * What the unit test cannot exercise and this does:
+ *   - {@see PrevalenceCounter::queryLegacyPodcastScopes()} over a real publish/draft mix of legacy
+ *     `wpfc_sm_podcast` posts, reading the REAL per-podcast scope source (OBJECT-TERM relationships
+ *     over the legacy sermon taxonomies — NOT the migrated blob, which is empty on real SM Pro);
+ *   - {@see PrevalenceCounter::queryShortcodeEmbeds()} — real `[sermons` LIKE + the regex that
+ *     distinguishes `[sermons]`/`[sermons_sm]` from `[list_sermons]`/`[sermon_images]`, with
+ *     real `shortcode_parse_atts()` attribute parsing;
+ *   - a hard NO-WRITE-ON-REPORT assertion: a row-count + content checksum snapshot of
+ *     wp_posts/wp_postmeta/wp_options around tally() + renderReport(), asserted byte-identical;
+ *   - run() actually persisting OPTION_MIGRATION_PREVALENCE (the write-gated path).
+ */
+final class PrevalenceCounterTest extends WP_UnitTestCase {
+    public function set_up(): void {
+        parent::set_up();
+        // The prevalence podcast tally reads the REAL scope source — legacy wpfc_sm_podcast
+        // OBJECT-TERM relationships over the legacy sermon taxonomies — so the legacy schema
+        // must be registered for the reads (and the object-term assignments below) to resolve.
+        LegacySchemaRegistrar::ensureRegistered();
+    }
+
+    /**
+     * Create a published LEGACY podcast carrying the given OBJECT-TERM scope (the real SM Pro
+     * scope source). $objectScope maps a legacy sermon taxonomy slug to a list of term names to
+     * create and assign. An empty map is an unscoped podcast.
+     *
+     * @param array<string,list<string>> $objectScope
+     */
+    private function makePodcast( array $objectScope = array(), string $status = 'publish' ): int {
+        $id = (int) self::factory()->post->create( array(
+            'post_type'   => LID::POST_TYPE_PODCAST,
+            'post_status' => $status,
+            'post_title'  => 'A Podcast',
+        ) );
+
+        foreach ( $objectScope as $taxonomy => $termNames ) {
+            $termIds = array();
+            foreach ( (array) $termNames as $name ) {
+                $term      = wp_insert_term( $name, $taxonomy );
+                $termIds[] = is_wp_error( $term ) ? 0 : (int) $term['term_id'];
+            }
+            wp_set_object_terms( $id, array_filter( $termIds ), $taxonomy );
+        }
+
+        return $id;
+    }
+
+    /** Create a post embedding the given content. */
+    private function makePost( string $content ): int {
+        return (int) self::factory()->post->create( array(
+            'post_type'    => 'page',
+            'post_status'  => 'publish',
+            'post_content' => $content,
+        ) );
+    }
+
+    public function test_run_persists_the_full_prevalence_rollup(): void {
+        // Two published podcasts: one single-axis object-term scope, one multi-axis. One unscoped.
+        // One DRAFT (must be excluded from the published count).
+        $this->makePodcast( array( LID::TAX_SERIES => array( 'Romans' ) ) );
+        $this->makePodcast( array( LID::TAX_PREACHER => array( 'Pastor A' ), LID::TAX_TOPIC => array( 'Grace' ) ) );
+        $this->makePodcast( array() );
+        $this->makePodcast( array( LID::TAX_SERIES => array( 'Hidden' ) ), 'draft' );
+
+        // Embedded [sermons] density: a 2-attr embed, a bare embed, and a decoy that must NOT match.
+        $this->makePost( 'Intro [sermons per_page="5" orderby="date"] outro' );
+        $this->makePost( 'Just [sermons] here' );
+        $this->makePost( 'A [list_sermons] and [sermon_images] — neither is the sermons list.' );
+
+        $stats = ( new PrevalenceCounter() )->run();
+
+        // Persisted (write-gated) and readable back.
+        $this->assertSame( $stats, PrevalenceCounter::stats() );
+
+        $this->assertSame( 3, $stats['podcasts']['published'] );
+        $this->assertSame( 2, $stats['podcasts']['with_scope'] );
+        $this->assertSame( 1, $stats['podcasts']['single_scoped'] );
+        $this->assertTrue( $stats['podcasts']['multi_podcast'] );
+
+        // Only the two real [sermons] embeds; the decoy line is excluded.
+        $this->assertSame( 2, $stats['shortcodes']['posts'] );
+        $this->assertSame( 1, $stats['shortcodes']['with_attributes'] );
+        $this->assertSame( 2, $stats['shortcodes']['max_attributes'] );
+        $this->assertSame( 1, $stats['shortcodes']['attribute_histogram']['per_page'] );
+        $this->assertSame( 1, $stats['shortcodes']['attribute_histogram']['orderby'] );
+
+        // Page-builder block ships zero findings in this fixture (no builder pages).
+        $this->assertSame( 0, $stats['page_builder']['pages'] );
+    }
+
+    /**
+     * Locks in the intended (and correct) production behavior: a real `[sermons]` token in prose
+     * IS a sermons embed and MUST be counted, while sibling shortcodes whose names merely contain
+     * `sermons` ({@see `[list_sermons]`}/{@see `[sermon_images]`}) are NOT. This is the inverse of
+     * the §63 decoy fixture and guards against a regex over-/under-match regression.
+     */
+    public function test_real_sermons_token_in_prose_is_counted(): void {
+        $this->makePost( 'Prose with a stray [sermons] token mid-paragraph counts.' );
+        $this->makePost( 'A [list_sermons] and [sermon_images] do not count.' );
+
+        $shortcodes = ( new PrevalenceCounter() )->tally()['shortcodes'];
+
+        $this->assertSame( 1, $shortcodes['posts'] );
+        $this->assertSame( 0, $shortcodes['with_attributes'] );
+        $this->assertSame( 0, $shortcodes['max_attributes'] );
+    }
+
+    public function test_shortcode_attribute_density_parses_real_atts(): void {
+        $this->makePost( '[sermons per_page="5" orderby="date" filter_by="series"]' );
+        $this->makePost( '[sermons_sm per_page="3"]' );
+
+        $shortcodes = ( new PrevalenceCounter() )->tally()['shortcodes'];
+
+        $this->assertSame( 2, $shortcodes['posts'] );
+        $this->assertSame( 3, $shortcodes['max_attributes'] );
+        $this->assertSame( 4, $shortcodes['total_attributes'] ); // 3 + 1
+        $this->assertSame( 2, $shortcodes['attribute_histogram']['per_page'] );
+        $this->assertSame( 1, $shortcodes['attribute_histogram']['orderby'] );
+        $this->assertSame( 1, $shortcodes['attribute_histogram']['filter_by'] );
+    }
+
+    public function test_page_builder_findings_are_reused_from_the_scanner(): void {
+        // An Elementor page embedding a legacy sermon shortcode → floor + meta-shortcode findings.
+        $id = $this->makePost( '' );
+        update_post_meta(
+            $id,
+            '_elementor_data',
+            '[{"id":"a1","widgetType":"shortcode","settings":{"shortcode":"[sermons per_page=5]"}}]'
+        );
+
+        $builder = ( new PrevalenceCounter() )->tally()['page_builder'];
+
+        $this->assertGreaterThanOrEqual( 1, $builder['pages'] );
+        $this->assertGreaterThanOrEqual( 1, $builder['builder_embedded'] );
+        $this->assertGreaterThanOrEqual( 1, $builder['shortcode_in_meta'] );
+    }
+
+    public function test_tally_and_report_perform_zero_writes(): void {
+        $this->makePodcast( array( LID::TAX_SERIES => array( 'Romans' ) ) );
+        $this->makePost( '[sermons per_page="5"]' );
+
+        // Seed the option once (the only legitimate write) so renderReport has data to read.
+        ( new PrevalenceCounter() )->run();
+
+        $before = $this->dbFingerprint();
+
+        $counter = new PrevalenceCounter();
+        $counter->tally();
+        $html = $counter->renderReport();
+
+        $after = $this->dbFingerprint();
+
+        $this->assertSame( $before, $after, 'tally() + renderReport() must not write to the database' );
+        $this->assertStringContainsString( 'sermonator-prevalence', $html );
+    }
+
+    /**
+     * A row-count + content checksum of the post/meta/option tables, used to prove a code path
+     * wrote nothing. Excludes the prevalence option itself is unnecessary — we snapshot AFTER the
+     * seeding run, so a no-write path leaves the fingerprint identical.
+     *
+     * @return array<string,string>
+     */
+    private function dbFingerprint(): array {
+        global $wpdb;
+
+        return array(
+            'posts'    => (string) $wpdb->get_var( "SELECT CONCAT(COUNT(*), ':', COALESCE(MD5(GROUP_CONCAT(ID, post_modified_gmt ORDER BY ID)), '')) FROM {$wpdb->posts}" ),
+            'postmeta' => (string) $wpdb->get_var( "SELECT CONCAT(COUNT(*), ':', COALESCE(MD5(GROUP_CONCAT(meta_id, meta_value ORDER BY meta_id)), '')) FROM {$wpdb->postmeta}" ),
+            'options'  => (string) $wpdb->get_var( "SELECT CONCAT(COUNT(*), ':', COALESCE(MD5(GROUP_CONCAT(option_name, option_value ORDER BY option_id)), '')) FROM {$wpdb->options}" ),
+        );
+    }
+}

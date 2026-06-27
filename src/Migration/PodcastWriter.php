@@ -61,13 +61,15 @@ final class PodcastWriter {
             }
 
             if ( $this->isComplete( $existing ) ) {
-                // COMPLETE — normally a no-op skip. But a podcast's feed-scope term
-                // references live inside settings meta; if a record was somehow
-                // stamped COMPLETE while a filter-term crosswalk was still missing
-                // (e.g. an older writer that did not withhold COMPLETE), re-run ONLY
-                // the meta remap so the now-available term self-heals and the open
-                // missing_podcast_term_crosswalk flag clears. A completed record with
-                // NO open term flag is left entirely untouched (no re-write).
+                // COMPLETE — a podcast's feed-scope term references live inside settings
+                // meta, so this branch still reconciles scope. If a record was stamped
+                // COMPLETE while a filter-term crosswalk was still missing (an older
+                // writer that did not withhold COMPLETE), re-run the BLOB meta remap so
+                // the now-available term self-heals and the open
+                // missing_podcast_term_crosswalk flag clears. A record with NO open term
+                // flag still gets a MERGE-ONLY object-term scope reconcile (below) so a
+                // pre-fix COMPLETE record that never read object-terms picks up its
+                // per-podcast scope in place rather than over-including every sermon.
                 // Idempotently ensure the durable map carries this pair even for a
                 // record completed by an OLDER writer that predates map population.
                 $this->recordLegacyPodcastMap( $legacyId, $existing );
@@ -81,7 +83,32 @@ final class PodcastWriter {
                     }
                     return new WriteResult( $existing, false, $flags, false );
                 }
-                return new WriteResult( $existing, false, $persisted, false );
+
+                // IMPORTANT (B2-deep-compat fix): COMPLETE with NO open term flag is NOT
+                // automatically a no-op. A record stamped MIGRATION_COMPLETE by a PRE-FIX
+                // writer (which never read object-terms) carries NEITHER the migrated
+                // object-term scope NOR a missing flag — yet a scoped feed would keep
+                // over-including the FULL site-wide sermon set to live subscribers, the
+                // exact over-inclusion this fix exists to close, with no fail-visible
+                // signal. The elaborate in-place resume machinery never reaches these
+                // records without a full Rollback. Reconcile the object-term scope IN
+                // PLACE so an already-complete record self-heals across the version
+                // boundary. mergeObjectTermScope is MERGE-ONLY (admin-edit safe, never
+                // re-derives the blob like applyScopedSettingsRemap) and gates its meta
+                // write on an actual diff — a true no-op for records already carrying the
+                // correct scope (the common case), so this adds no churn.
+                $reconciled = $this->mergeObjectTermScope( $existing, $legacyId, $persisted );
+                if ( $reconciled !== $persisted ) {
+                    $this->writeFlags( $existing, $reconciled );
+                }
+                // If the reconcile turned up an UNRESOLVED scope term, WITHHOLD COMPLETE
+                // (mirror the forward-path discipline) so the record drops back into the
+                // resume leg and self-heals once the term migrates — rather than serving
+                // a feed scoped to a dead term, stamped-complete-and-skipped-forever.
+                if ( $this->hasOpenTermCrosswalkFlag( $reconciled ) ) {
+                    delete_post_meta( $existing, Crosswalk::MIGRATION_COMPLETE );
+                }
+                return new WriteResult( $existing, false, $reconciled, false );
             }
 
             // Stamped but PARTIAL — RESUME on the existing post (never insert).
@@ -219,6 +246,13 @@ final class PodcastWriter {
         $flags = $this->stripTermCrosswalkFlags( $flags );
         $flags = array_merge( $flags, $this->applyMeta( $newId, $legacyId ) );
 
+        // MUST-FIX 1: mirror the legacy podcast's OBJECT-TERM feed scope (the REAL SM
+        // Pro source — the sm_podcast_settings blob carries NO taxonomy-scope field)
+        // into the migrated settings scope keys, MERGING with the blob refs applyMeta
+        // just wrote. Without this, per-podcast filtering is inert on real installs and
+        // a scoped single podcast over-includes every sermon to live subscribers.
+        $flags = $this->mergeObjectTermScope( $newId, $legacyId, $flags );
+
         $this->writeFlags( $newId, $flags );
 
         return array_values( array_unique( $flags ) );
@@ -251,27 +285,136 @@ final class PodcastWriter {
         // term filters). Asymmetric with applyMeta, which only deletes per target key when
         // the legacy source key is actually present. Guard: skip BOTH the delete and the
         // re-add when $values === [] so existing settings survive the self-heal intact.
-        if ( $values === array() ) {
+        // Blob-derived settings: only rewrite when the legacy blob is ACTUALLY present.
+        // An empty/absent blob is a NO-OP for the blob path (FIX 1 / B2a fix10) so the
+        // migrated settings (and any post-migration admin edit) survive the self-heal.
+        if ( $values !== array() ) {
+            delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
+
+            foreach ( $values as $value ) {
+                if ( is_string( $value ) ) {
+                    $maybe = maybe_unserialize( $value );
+                    if ( is_array( $maybe ) ) {
+                        $value = $this->remapSettingsTerms( $maybe, $flags );
+                    } else {
+                        $flags[] = 'podcast_settings_unremapped';
+                    }
+                } elseif ( is_array( $value ) ) {
+                    $value = $this->remapSettingsTerms( $value, $flags );
+                }
+                add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $value ) );
+            }
+        }
+
+        // MUST-FIX 1: the REAL SM Pro per-podcast scope lives in OBJECT-TERMS, not the
+        // blob (empty on real installs). Merge it on this self-heal path too, REGARDLESS
+        // of blob presence, so a scope-only podcast self-heals once its scope terms
+        // migrate. Merge-only — never clobbers blob refs or post-migration admin edits.
+        $flags = $this->mergeObjectTermScope( $newId, $legacyId, $flags );
+
+        return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * MUST-FIX 1 — mirror the legacy podcast's OBJECT-TERM feed scope into the migrated
+     * {@see Identifiers::META_PODCAST_SETTINGS} scope keys.
+     *
+     * Reads the legacy object-term scope READ-ONLY (legacy data byte-immutable until
+     * Finalize), crosswalks each legacy term id to its NEW term id, and MERGES the
+     * resolved new ids into the migrated settings via the WordPress-free
+     * {@see PodcastObjectTermScopeMapper} — never clobbering the blob refs already
+     * migrated nor any other settings key. Each unresolved scope term records the shared
+     * {@see Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX} flag so COMPLETE is WITHHELD and
+     * the resolver/feed fall back to UNSCOPED (never a dead-term/empty feed).
+     *
+     * REVERSIBILITY/IDEMPOTENCY: the ONLY new write is to META_PODCAST_SETTINGS (already
+     * part of the migrated record applyMeta writes and Rollback deletes wholesale) plus
+     * MIGRATION_FLAGS (already managed). NO new un-reversible write is introduced, and a
+     * re-run reproduces the identical merged array from legacy + the crosswalk.
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function mergeObjectTermScope( int $newId, int $legacyId, array $flags ): array {
+        $legacyScope = $this->readLegacyObjectTermScope( $legacyId );
+        if ( $legacyScope === array() ) {
             return array_values( array_unique( $flags ) );
         }
 
-        delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
+        // IMPORTANT (B2-deep-compat fix): read the FULL multiset, not just row-1.
+        // applyMeta() DELIBERATELY preserves >1 META_PODCAST_SETTINGS rows under this
+        // target key (the FIX IMPORTANT #9 union logic / meta_key_collision flag): a
+        // legacy podcast carrying duplicate sm_podcast_settings rows, or a stray
+        // verbatim sermonator_podcast_settings row alongside the renamed one, migrates
+        // as >1 rows. The previous get_post_meta(...,true) read only row-1 and the
+        // delete-all-then-add-one below then COLLAPSED the multiset, permanently
+        // dropping rows 2..N on every spine pass (unrecoverable after Finalize). Read
+        // every row so the count is preserved.
+        $rows = get_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, false );
+        $rows = is_array( $rows ) ? array_values( $rows ) : array();
 
-        foreach ( $values as $value ) {
-            if ( is_string( $value ) ) {
-                $maybe = maybe_unserialize( $value );
-                if ( is_array( $maybe ) ) {
-                    $value = $this->remapSettingsTerms( $maybe, $flags );
-                } else {
-                    $flags[] = 'podcast_settings_unremapped';
-                }
-            } elseif ( is_array( $value ) ) {
-                $value = $this->remapSettingsTerms( $value, $flags );
+        // The feed-functional row is the FIRST (canonical) one — the resolver reads
+        // ONLY row-1 via get_post_meta(...,true). Merge the object-term scope into THAT
+        // row only; rows 2..N are byte-immutable carry-through.
+        $canonical = $rows === array() ? array() : $rows[0];
+        $canonical = is_array( $canonical ) ? $canonical : array();
+
+        $result = PodcastObjectTermScopeMapper::merge(
+            $canonical,
+            $legacyScope,
+            MappingContract::taxonomyMap(),
+            fn( int $legacyTermId ): ?int => $this->terms->newTermId( $legacyTermId )
+        );
+
+        if ( $result['changed'] ) {
+            // Delete-then-re-add the ENTIRE list (merged canonical row first, then rows
+            // 2..N verbatim) so the row COUNT is preserved — never collapsed to one.
+            // Idempotent on resume; each value round-trips byte-exact through wp_slash
+            // (recurses into arrays). When there were zero existing rows this writes the
+            // single merged row, matching the prior fresh-podcast behaviour.
+            $rest = array_slice( $rows, 1 );
+            delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
+            add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $result['settings'] ) );
+            foreach ( $rest as $row ) {
+                add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $row ) );
             }
-            add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $value ) );
         }
 
-        return array_values( array_unique( $flags ) );
+        return array_values( array_unique( array_merge( $flags, $result['flags'] ) ) );
+    }
+
+    /**
+     * Read the legacy podcast's OBJECT-TERM feed scope — the REAL SM Pro per-podcast
+     * scope source (the sm_podcast_settings blob has no taxonomy-scope field). READ-ONLY:
+     * wp_get_object_terms over the legacy sermon taxonomies, which
+     * {@see LegacySchemaRegistrar} registers so they resolve even with the legacy plugin
+     * DEACTIVATED. Reading object terms is taxonomy-scoped (wp_term_relationships), not
+     * post-type-scoped, so the legacy podcast's relationships resolve regardless of which
+     * post type the taxonomy is associated with.
+     *
+     * @return array<string,list<int>> legacy taxonomy slug => legacy term ids (non-empty axes only).
+     */
+    private function readLegacyObjectTermScope( int $legacyId ): array {
+        $scope = array();
+        foreach ( LegacyIdentifiers::sermonTaxonomies() as $legacyTaxonomy ) {
+            $terms = wp_get_object_terms( $legacyId, $legacyTaxonomy, array( 'fields' => 'ids' ) );
+            if ( is_wp_error( $terms ) || ! is_array( $terms ) ) {
+                continue;
+            }
+
+            $ids = array();
+            foreach ( $terms as $termId ) {
+                $termId = (int) $termId;
+                if ( $termId > 0 ) {
+                    $ids[] = $termId;
+                }
+            }
+            if ( $ids !== array() ) {
+                $scope[ $legacyTaxonomy ] = array_values( array_unique( $ids ) );
+            }
+        }
+
+        return $scope;
     }
 
     /**
@@ -447,7 +590,7 @@ final class PodcastWriter {
             }
             // Unresolved positive id — never a silent drop. Leave the legacy id in
             // place and flag it so COMPLETE is withheld and the id self-heals later.
-            $flags[] = 'missing_podcast_term_crosswalk:' . (int) $value;
+            $flags[] = Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX . (int) $value;
         }
 
         return $value;
@@ -659,7 +802,7 @@ final class PodcastWriter {
      */
     private function hasOpenTermCrosswalkFlag( array $flags ): bool {
         foreach ( $flags as $flag ) {
-            if ( str_starts_with( (string) $flag, 'missing_podcast_term_crosswalk:' ) ) {
+            if ( str_starts_with( (string) $flag, Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX ) ) {
                 return true;
             }
         }
@@ -678,7 +821,7 @@ final class PodcastWriter {
         return array_values( array_filter(
             $flags,
             static function ( $flag ): bool {
-                return ! str_starts_with( (string) $flag, 'missing_podcast_term_crosswalk:' );
+                return ! str_starts_with( (string) $flag, Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX );
             }
         ) );
     }

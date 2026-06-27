@@ -66,6 +66,21 @@ final class Plugin {
         // reader everywhere. Without this wiring OPTION_BIBLE_STATS is never computed
         // and the Site Health test never appears.
         ( new \Sermonator\Bible\CoverageAudit() )->hook();
+        // Page-builder fail-visible floor (Bundle 2, T10). Wired alongside CoverageAudit and
+        // for the same reason: site_status_tests must register so the Site Health "direct" test
+        // appears on the Site Health screen AND runs under the weekly wp_site_health_scheduled_check
+        // cron (neither is admin-context), while the admin_notices wizard report self-scopes to the
+        // wizard screen inside maybeRenderWizardNotice(). Both surfaces are pure reads; the lazy
+        // candidateProvider means $wpdb is only touched when a callback actually fires. WITHOUT this
+        // wiring neither surface registers and legacy sermon content trapped in a page builder stays
+        // a SILENT break at the migration switch — the exact invariant this class exists to enforce.
+        ( new \Sermonator\Migration\PageBuilderScanner() )->hook();
+        // §63 migration prevalence report (Bundle 2, T11). hook() registers ONLY the
+        // admin_notices wizard-report surface, which self-scopes to the wizard screen and is a
+        // PURE READER of the precomputed OPTION_MIGRATION_PREVALENCE — it never recomputes or
+        // writes on a GET. The rollup is written only on the gated detect/verify actions
+        // (Orchestrator::detect / Verifier::verify).
+        ( new \Sermonator\Migration\PrevalenceCounter() )->hook();
 
         self::registerAdmin();
         self::registerFrontend();

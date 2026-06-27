@@ -30,6 +30,22 @@ final class Crosswalk {
     /** Legacy post content preserved for rollback/verification (safe from stripping). */
     public const LEGACY_POST_CONTENT = '_sermonator_legacy_post_content';
 
+    /**
+     * Cross-subsystem contract token for the per-podcast feed-scope "dead term"
+     * signal. {@see \Sermonator\Migration\PodcastWriter} STAMPS a flag
+     * `MISSING_PODCAST_TERM_FLAG_PREFIX . <legacy term id>` into MIGRATION_FLAGS
+     * when a Pro feed carried scope but a scoped term did not resolve through the
+     * crosswalk at migration; {@see \Sermonator\Frontend\Feed\PodcastScopeResolver::hasIncompleteScope()}
+     * READS it so the feed falls back to UNSCOPED rather than silently emptying a
+     * live Apple/Spotify subscription.
+     *
+     * This single constant is the SOLE linkage enforcing that IRREVERSIBLE
+     * never-serve-empty-on-a-dead-term invariant across the write/read boundary.
+     * Both sides MUST reference it (never a bare literal) so the matcher can never
+     * silently drift out of agreement with the stamper.
+     */
+    public const MISSING_PODCAST_TERM_FLAG_PREFIX = 'missing_podcast_term_crosswalk:';
+
     private function __construct() {}
 
     /**

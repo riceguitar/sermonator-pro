@@ -327,6 +327,61 @@ final class Renderer {
     }
 
     /**
+     * A paginated grid: the same {@see self::grid()} cards PLUS an escaped pager, for an embedded
+     * list whose `per_page` (e.g. legacy `[sermons per_page=N]`) must be CERTIFIED faithful — the
+     * plain grid renders a fixed count with no pager, so on a large archive its long tail is
+     * silently lost. PURE: the page count and current page come from the {@see QueryResult}, and
+     * every pager link is built from the passed `$baseUrl` (no global reads here — the caller
+     * resolves the current request URL and the {@see SermonQuery::PAGE_QUERY_VAR} page).
+     *
+     * @param array{columns?:int} $opts
+     */
+    public function paginatedGrid( QueryResult $result, string $baseUrl, array $opts = array() ): string {
+        return $this->grid( $result, $opts )
+            . $this->pager( $result->totalPages, $result->page, $baseUrl );
+    }
+
+    /**
+     * An escaped pager (prev / numbered / next) over the {@see SermonQuery::PAGE_QUERY_VAR} query
+     * var. PURE: links are built with `add_query_arg( 'sermon_page', N, $baseUrl )` on the passed
+     * base URL — query-string form, deliberately NOT pretty `/page/N/` permalinks (which collide
+     * with the main query and 404 on a static embedding page). Every href is `esc_url`'d and every
+     * label `esc_html`'d. Returns '' when there is 0 or 1 page (nothing to page through).
+     */
+    public function pager( int $totalPages, int $currentPage, string $baseUrl ): string {
+        if ( $totalPages <= 1 ) {
+            return '';
+        }
+        $currentPage = max( 1, min( $totalPages, $currentPage ) );
+
+        $items = '';
+        if ( $currentPage > 1 ) {
+            $items .= $this->pagerLink( $currentPage - 1, $baseUrl, 'prev', __( 'Previous', 'sermonator' ) );
+        }
+        for ( $n = 1; $n <= $totalPages; $n++ ) {
+            if ( $n === $currentPage ) {
+                $items .= '<span class="sermonator-pager__current" aria-current="page">'
+                    . esc_html( (string) $n ) . '</span>';
+            } else {
+                $items .= $this->pagerLink( $n, $baseUrl, 'page', (string) $n );
+            }
+        }
+        if ( $currentPage < $totalPages ) {
+            $items .= $this->pagerLink( $currentPage + 1, $baseUrl, 'next', __( 'Next', 'sermonator' ) );
+        }
+
+        return '<nav class="sermonator-pager" role="navigation" aria-label="'
+            . esc_attr__( 'Sermons pagination', 'sermonator' ) . '">' . $items . '</nav>';
+    }
+
+    /** One escaped pager link to a given page of the embedded list. */
+    private function pagerLink( int $page, string $baseUrl, string $rel, string $label ): string {
+        $url = add_query_arg( SermonQuery::PAGE_QUERY_VAR, $page, $baseUrl );
+        return '<a class="sermonator-pager__link sermonator-pager__link--' . esc_attr( $rel ) . '"'
+            . ' href="' . esc_url( $url ) . '">' . esc_html( $label ) . '</a>';
+    }
+
+    /**
      * A list of taxonomy term links (used by the taxonomy-filter block). Pure: takes
      * already-resolved {name,url} pairs.
      *
