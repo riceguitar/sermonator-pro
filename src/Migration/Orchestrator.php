@@ -132,6 +132,19 @@ final class Orchestrator {
             $snapshot->store( ( new LegacyFeedGuidCapturer() )->capture() );
         }
 
+        // §63 prevalence counter (Bundle 2, T11). Write-gated here: detect is an explicit
+        // migrator action, never a passive GET, so persisting the rollup honors the
+        // no-write-on-read rule. The legacy/source-content scans (embedded-[sermons] density,
+        // page-builder findings) are meaningful from detect; the migrated-podcast scope counts
+        // populate at verify (podcasts are created during migrate). Never throws on the detect
+        // path — a counter failure must not block a migration.
+        try {
+            ( new PrevalenceCounter() )->run();
+        } catch ( \Throwable $e ) {
+            // Best-effort instrumentation; swallow so detect stays robust.
+            unset( $e );
+        }
+
         // none → detected. Re-detect from 'detected' is an idempotent no-op.
         if ( $phase === 'none' ) {
             $this->state->set( 'detected' );

@@ -75,6 +75,12 @@ final class Plugin {
         // wiring neither surface registers and legacy sermon content trapped in a page builder stays
         // a SILENT break at the migration switch — the exact invariant this class exists to enforce.
         ( new \Sermonator\Migration\PageBuilderScanner() )->hook();
+        // §63 migration prevalence report (Bundle 2, T11). hook() registers ONLY the
+        // admin_notices wizard-report surface, which self-scopes to the wizard screen and is a
+        // PURE READER of the precomputed OPTION_MIGRATION_PREVALENCE — it never recomputes or
+        // writes on a GET. The rollup is written only on the gated detect/verify actions
+        // (Orchestrator::detect / Verifier::verify).
+        ( new \Sermonator\Migration\PrevalenceCounter() )->hook();
 
         self::registerAdmin();
         self::registerFrontend();

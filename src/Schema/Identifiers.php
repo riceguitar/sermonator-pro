@@ -64,6 +64,12 @@ final class Identifiers {
     public const OPTION_PRE_MIGRATION_BACKUP    = 'sermonator_pre_migration_backup';
     public const OPTION_MIGRATION_PROGRESS      = 'sermonator_migration_progress';
     public const OPTION_LEGACY_FEED_SNAPSHOT    = 'sermonator_legacy_feed_snapshot';
+    /**
+     * Precomputed migration prevalence rollup (Bundle 2, §63 / T11) — written ONLY on the
+     * write-gated detect/verify path, read by the wizard report. Mirrors OPTION_BIBLE_STATS:
+     * never written on a GET/report read path.
+     */
+    public const OPTION_MIGRATION_PREVALENCE    = 'sermonator_migration_prevalence';
 
     /** Axis A: bible-link version; default mirrors legacy verse_bible_version (e.g. ESV). */
     public const OPTION_BIBLE_LINK_VERSION      = 'sermonator_bible_link_version';
