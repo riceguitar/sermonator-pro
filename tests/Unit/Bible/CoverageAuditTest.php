@@ -277,4 +277,280 @@ final class CoverageAuditTest extends TestCase {
 
         $this->assertSame( $before, $this->options[ ID::OPTION_BIBLE_STATS ] );
     }
+
+    // ----------------------------------------------------------------------------------
+    // Phase 3b — inline corpus-gate report (Task 14)
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Build an inline-shape ref envelope row. `srcVersification` defaults to ESV
+     * (eng-protestant) and `confidence` to `exact` (clears the default floor) so the
+     * row is inline-eligible unless a test deliberately diverges one field.
+     *
+     * @return array<string,mixed>
+     */
+    private function ref(
+        string $book,
+        int $chapter,
+        ?int $verseStart,
+        ?int $verseEnd = null,
+        string $confidence = 'exact',
+        string $src = 'ESV',
+        ?int $chapterEnd = null
+    ): array {
+        return array(
+            'bookUSFM'         => $book,
+            'chapterStart'     => $chapter,
+            'verseStart'       => $verseStart,
+            'verseEnd'         => $verseEnd,
+            'chapterEnd'       => $chapterEnd,
+            'confidence'       => $confidence,
+            'srcVersification' => $src,
+        );
+    }
+
+    /**
+     * A chapter resolver that returns a fixed normalized chapter carrying verses
+     * $present (each with one renderable text node), for ANY (translation,book,chapter).
+     *
+     * @param list<int> $present
+     *
+     * @return callable(string,string,int,bool):(array<int,mixed>|null)
+     */
+    private function chapterWith( array $present ): callable {
+        return static function ( $translation, $book, $chapter, $warm ) use ( $present ): array {
+            $verses = array();
+            foreach ( $present as $n ) {
+                $verses[] = array( 'number' => $n, 'nodes' => array( array( 'type' => 'text', 'text' => 'word' ) ) );
+            }
+            return $verses;
+        };
+    }
+
+    /**
+     * @param list<int>                                                       $ids
+     * @param callable(string,string,int,bool):(array<int,mixed>|null)|null   $chapterResolver
+     */
+    private function inlineAuditOver( array $ids, ?callable $chapterResolver = null ): CoverageAudit {
+        return new CoverageAudit(
+            static function () use ( $ids ): array {
+                return $ids;
+            },
+            $chapterResolver ?? $this->chapterWith( array() )
+        );
+    }
+
+    public function test_inline_report_eligible_ref_passes_all_layers(): void {
+        // Stored envelope: a single exact, ESV-sourced, present John 3:16.
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->ref( 'JHN', 3, 16 ) ) ),
+        ) );
+
+        $report = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16, 17, 18 ) ) )->inlineReport();
+
+        $this->assertSame( 1, $report['refs_total'] );
+        $this->assertSame( 1, $report['inline_eligible'] );
+        $this->assertSame( 100.0, $report['inline_eligible_pct'] );
+        $this->assertSame( 0, array_sum( $report['withheld'] ) );
+        $this->assertSame( 'ENGWEBP', $report['target'] );
+        $this->assertFalse( $report['heterogeneous'] );
+    }
+
+    public function test_inline_report_withheld_keys_are_always_present(): void {
+        $report = $this->inlineAuditOver( array() )->inlineReport();
+
+        foreach ( array(
+            'not-inline-eligible',
+            'low-confidence',
+            'translation-ineligible',
+            'src-versification-unsupported',
+            'src-heterogeneous',
+            'unmodeled-versification-pair',
+            'versification-divergent',
+            'cold-unwarmed',
+            'verse-out-of-range',
+        ) as $reason ) {
+            $this->assertArrayHasKey( $reason, $report['withheld'], "missing withheld reason: $reason" );
+            $this->assertSame( 0, $report['withheld'][ $reason ] );
+        }
+        $this->assertSame( 0, $report['refs_total'] );
+        $this->assertSame( 0.0, $report['inline_eligible_pct'] );
+    }
+
+    public function test_inline_report_tallies_each_reason_and_partitions(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'corpus',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                // eligible (present in the resolver-supplied chapter).
+                $this->ref( 'JHN', 3, 16 ),
+                // L1 not-inline-eligible: chapter-only (no verse).
+                $this->ref( 'JHN', 3, null ),
+                // L2 low-confidence: probable < exact floor.
+                $this->ref( 'JHN', 3, 16, null, 'probable' ),
+                // L4 src-versification-unsupported: foreign source, homogeneous w/ others? No —
+                // here the corpus is dominantly eng-protestant, so a lone foreign ref is
+                // heterogeneous, not unsupported. Use it for the heterogeneous bucket instead.
+                $this->ref( 'JHN', 3, 16, null, 'exact', 'RVR1960' ),
+                // L7 versification-divergent: ROM 16 is an enumerated divergent zone.
+                $this->ref( 'ROM', 16, 1 ),
+                // L9 verse-out-of-range: asks 16-20 but chapter only carries 16-18.
+                $this->ref( 'JHN', 3, 16, 20 ),
+            ) ),
+        ) );
+
+        $report = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16, 17, 18 ) ) )->inlineReport();
+
+        $this->assertSame( 6, $report['refs_total'] );
+        $this->assertSame( 1, $report['inline_eligible'] );
+        $this->assertSame( 1, $report['withheld']['not-inline-eligible'] );
+        $this->assertSame( 1, $report['withheld']['low-confidence'] );
+        $this->assertSame( 1, $report['withheld']['src-heterogeneous'] );
+        $this->assertSame( 1, $report['withheld']['versification-divergent'] );
+        $this->assertSame( 1, $report['withheld']['verse-out-of-range'] );
+
+        // Partition: eligible + every withheld bucket == refs_total.
+        $this->assertSame(
+            $report['refs_total'],
+            $report['inline_eligible'] + array_sum( $report['withheld'] )
+        );
+        $this->assertTrue( $report['heterogeneous'] );
+    }
+
+    public function test_inline_eligible_pct_math(): void {
+        // 2 eligible of 4 in-canon/valid refs == 50.0%.
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'corpus',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->ref( 'JHN', 3, 16 ),               // eligible
+                $this->ref( 'GEN', 1, 1 ),                // eligible
+                $this->ref( 'JHN', 3, 16, null, 'probable' ), // low-confidence
+                $this->ref( 'JHN', 3, null ),             // not-inline-eligible
+            ) ),
+        ) );
+
+        $report = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 1, 16 ) ) )->inlineReport();
+
+        $this->assertSame( 4, $report['refs_total'] );
+        $this->assertSame( 2, $report['inline_eligible'] );
+        $this->assertSame( 50.0, $report['inline_eligible_pct'] );
+    }
+
+    public function test_homogeneous_foreign_corpus_is_unsupported_not_heterogeneous(): void {
+        // Every ref is a foreign tradition: ONE bucket → not heterogeneous → plain L4.
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'corpus',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->ref( 'JHN', 3, 16, null, 'exact', 'RVR1960' ),
+                $this->ref( 'GEN', 1, 1, null, 'exact', 'RVR1960' ),
+            ) ),
+        ) );
+
+        $report = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 1, 16 ) ) )->inlineReport();
+
+        $this->assertSame( 2, $report['withheld']['src-versification-unsupported'] );
+        $this->assertSame( 0, $report['withheld']['src-heterogeneous'] );
+        $this->assertFalse( $report['heterogeneous'] );
+        $this->assertSame( array( 'unknown' => 2 ), $report['families'] );
+        $this->assertSame( 'unknown', $report['dominant_family'] );
+    }
+
+    public function test_cold_unwarmed_when_chapter_absent_offline(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->ref( 'JHN', 3, 16 ) ) ),
+        ) );
+
+        // Resolver returns null (chapter not vendored/warmed to disk yet).
+        $cold = static function ( $t, $b, $c, $w ): ?array {
+            return null;
+        };
+
+        $report = $this->inlineAuditOver( array( 1 ), $cold )->inlineReport();
+
+        $this->assertSame( 1, $report['withheld']['cold-unwarmed'] );
+        $this->assertSame( 0, $report['inline_eligible'] );
+    }
+
+    public function test_render_context_chapter_read_is_offline_only(): void {
+        // The audit's L8 read MUST pass warmContext=false (no network on the audit path).
+        $seenWarm = null;
+        $spy = static function ( $t, $b, $c, $warm ) use ( &$seenWarm ): array {
+            $seenWarm = $warm;
+            return array( array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'x' ) ) ) );
+        };
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->ref( 'JHN', 3, 16 ) ) ),
+        ) );
+
+        $this->inlineAuditOver( array( 1 ), $spy )->inlineReport();
+
+        $this->assertFalse( $seenWarm, 'L8 chapter read must be offline-only (warmContext=false)' );
+    }
+
+    public function test_inline_report_writes_nothing(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->ref( 'JHN', 3, 16 ) ) ),
+        ) );
+
+        $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->inlineReport();
+
+        // No-write-on-report: the read-only instrument must not persist the stats option.
+        $this->assertArrayNotHasKey( ID::OPTION_BIBLE_STATS, $this->options );
+    }
+
+    public function test_run_folds_inline_subreport_into_persisted_stats(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->ref( 'JHN', 3, 16 ) ) ),
+        ) );
+
+        $stats = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->run();
+
+        $this->assertArrayHasKey( 'inline', $stats );
+        $this->assertSame( $stats, $this->options[ ID::OPTION_BIBLE_STATS ] );
+        $this->assertSame( 1, $stats['inline']['refs_total'] );
+        $this->assertSame( 1, $stats['inline']['inline_eligible'] );
+        $this->assertArrayHasKey( 'unmodeled_pair_wrong_text', $stats['inline'] );
+    }
+
+    public function test_site_health_surfaces_inline_eligible_and_heterogeneity_warning(): void {
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => array(
+                'refs_total'                => 4,
+                'inline_eligible'           => 2,
+                'inline_eligible_pct'       => 50.0,
+                'withheld'                  => array(),
+                'unmodeled_pair_wrong_text' => 0,
+                'families'                  => array( 'eng-protestant' => 3, 'unknown' => 1 ),
+                'dominant_family'           => 'eng-protestant',
+                'heterogeneous'             => true,
+            ),
+        );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringContainsString( 'inline-eligible', $result['description'] );
+        $this->assertStringContainsString( 'mixes more than one source-versification tradition', $result['description'] );
+    }
+
+    public function test_site_health_omits_inline_paragraph_for_pre_3b_rollup(): void {
+        // A rollup persisted before the 3b extension has no `inline` key: back-compat.
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 1,
+            'resolved'       => 1,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 1, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+        );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'inline-eligible', $result['description'] );
+    }
 }

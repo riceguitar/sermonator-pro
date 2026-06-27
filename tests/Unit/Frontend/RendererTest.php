@@ -249,6 +249,209 @@ final class RendererTest extends TestCase {
         $this->assertStringContainsString( 'Matthew 5:1-7:29', $html );
     }
 
+    public function test_scripture_link_only_output_is_byte_identical_pin(): void {
+        // PIN: when every ref's inline payload is null, the rendered markup is
+        // byte-identical to the shipped Phase 3a link output. The inline feature can
+        // never silently regress link mode. (Default mocks return their arg verbatim.)
+        $resolved = new ResolvedScripture( array(
+            array(
+                'label'          => 'John 3:16',
+                'linkUrl'        => 'https://www.biblegateway.com/passage/?search=John%203%3A16&version=ESV',
+                'version'        => 'ESV',
+                'inlineEligible' => false,
+                'inline'         => null,
+            ),
+        ) );
+
+        $expected = '<section class="sermonator-scripture">'
+            . '<h2 class="sermonator-scripture__heading">Scripture</h2>'
+            . '<ul class="sermonator-scripture__list">'
+            . '<li class="sermonator-scripture__ref">'
+            . '<a class="sermonator-scripture__link" href="https://www.biblegateway.com/passage/?search=John%203%3A16&version=ESV">John 3:16</a>'
+            . ' <span class="sermonator-scripture__version">(ESV)</span>'
+            . '</li>'
+            . '</ul></section>';
+
+        $this->assertSame( $expected, ( new Renderer() )->scripture( $this->view(), $resolved ) );
+    }
+
+    public function test_scripture_renders_inline_payload_badge_and_typed_nodes(): void {
+        $resolved = new ResolvedScripture( array(
+            array(
+                'label'          => 'John 3:16',
+                'linkUrl'        => 'http://x/a',
+                'version'        => 'ESV',
+                'inlineEligible' => true,
+                'inline'         => array(
+                    'translation' => 'ENGWEBP',
+                    'attribution' => 'World English Bible',
+                    'verses'      => array(
+                        array(
+                            'number' => 16,
+                            'nodes'  => array(
+                                array( 'type' => 'text', 'text' => 'For God so loved the world, ' ),
+                                array( 'type' => 'wordsOfJesus', 'text' => 'that he gave his one and only Son' ),
+                                array( 'type' => 'note', 'text' => 'or, only begotten Son' ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ) );
+
+        $html = ( new Renderer() )->scripture( $this->view(), $resolved );
+
+        // Attribution badge + numbered verse + the three typed node renderings.
+        $this->assertStringContainsString( '<span class="sermonator-scripture__attribution">(World English Bible)</span>', $html );
+        $this->assertStringContainsString( '<span class="sermonator-scripture__verse">', $html );
+        $this->assertStringContainsString( '<sup class="sermonator-scripture__num">16</sup>', $html );
+        $this->assertStringContainsString( 'For God so loved the world, ', $html );
+        $this->assertStringContainsString( '<span class="sermonator-scripture__woj">that he gave his one and only Son</span>', $html );
+        $this->assertStringContainsString( '<sup class="sermonator-scripture__note">or, only begotten Son</sup>', $html );
+        // Inline mode emits NO 3a anchor/version-badge for this ref, and a short
+        // single-verse passage is NOT wrapped in <details>.
+        $this->assertStringNotContainsString( 'sermonator-scripture__link', $html );
+        $this->assertStringNotContainsString( '<details', $html );
+    }
+
+    public function test_scripture_inline_escapes_every_node_leaf(): void {
+        // Real escaping (not returnArg) so we prove no constructed leaf reaches output raw.
+        Functions\when( 'esc_html' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+        Functions\when( 'esc_html__' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+
+        $resolved = new ResolvedScripture( array(
+            array(
+                'label'          => 'John 3:16',
+                'linkUrl'        => 'http://x/a',
+                'version'        => 'ESV',
+                'inlineEligible' => true,
+                'inline'         => array(
+                    'translation' => 'ENGWEBP',
+                    'attribution' => '<b>WEB</b>',
+                    'verses'      => array(
+                        array(
+                            'number' => 16,
+                            'nodes'  => array(
+                                array( 'type' => 'text', 'text' => '<script>alert(1)</script>' ),
+                                array( 'type' => 'wordsOfJesus', 'text' => '<img src=x onerror=evil()>' ),
+                                array( 'type' => 'note', 'text' => '"><svg/onload=evil>' ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ) );
+
+        $html = ( new Renderer() )->scripture( $this->view(), $resolved );
+
+        // esc_html on every leaf — no raw markup from any payload value escapes.
+        $this->assertStringNotContainsString( '<script>', $html );
+        $this->assertStringNotContainsString( '<img src=x', $html );
+        $this->assertStringNotContainsString( '<svg', $html );
+        $this->assertStringNotContainsString( '<b>WEB</b>', $html );
+        $this->assertStringContainsString( '&lt;script&gt;', $html );
+        $this->assertStringContainsString( '&lt;b&gt;WEB&lt;/b&gt;', $html );
+        // The structural markup WE build (the woj/note wrappers) is still present,
+        // wrapping the escaped leaf — esc_html, never wp_kses on the text itself.
+        $this->assertStringContainsString( '<span class="sermonator-scripture__woj">', $html );
+        $this->assertStringContainsString( '<sup class="sermonator-scripture__note">', $html );
+    }
+
+    public function test_scripture_inline_unknown_node_type_degrades_to_escaped_text(): void {
+        // A node type the renderer does not model must NOT emit raw markup — it
+        // degrades to plain esc_html text (never-fail-wrong, never-fail-unsafe).
+        Functions\when( 'esc_html' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+        Functions\when( 'esc_html__' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+
+        $resolved = new ResolvedScripture( array(
+            array(
+                'label'          => 'John 3:16',
+                'linkUrl'        => 'http://x/a',
+                'version'        => 'ESV',
+                'inlineEligible' => true,
+                'inline'         => array(
+                    'translation' => 'ENGWEBP',
+                    'attribution' => 'World English Bible',
+                    'verses'      => array(
+                        array(
+                            'number' => 16,
+                            'nodes'  => array(
+                                array( 'type' => 'poetryBreak', 'text' => '<hr>' ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ) );
+
+        $html = ( new Renderer() )->scripture( $this->view(), $resolved );
+
+        $this->assertStringNotContainsString( '<hr>', $html );
+        $this->assertStringContainsString( '&lt;hr&gt;', $html );
+    }
+
+    public function test_scripture_inline_long_passage_wraps_in_native_details(): void {
+        $verses = array();
+        for ( $n = 1; $n <= 6; $n++ ) {
+            $verses[] = array( 'number' => $n, 'nodes' => array( array( 'type' => 'text', 'text' => "Verse {$n}. " ) ) );
+        }
+
+        $resolved = new ResolvedScripture( array(
+            array(
+                'label'          => 'Psalm 23:1-6',
+                'linkUrl'        => 'http://x/a',
+                'version'        => 'ESV',
+                'inlineEligible' => true,
+                'inline'         => array(
+                    'translation' => 'ENGWEBP',
+                    'attribution' => 'World English Bible',
+                    'verses'      => $verses,
+                ),
+            ),
+        ) );
+
+        $html = ( new Renderer() )->scripture( $this->view(), $resolved );
+
+        $this->assertStringContainsString( '<details class="sermonator-scripture__details">', $html );
+        $this->assertStringContainsString( '<summary class="sermonator-scripture__summary">', $html );
+        // All six verses are still rendered inside the collapsible body.
+        $this->assertSame( 6, substr_count( $html, 'sermonator-scripture__verse' ) );
+    }
+
+    public function test_scripture_mixes_inline_and_link_refs_in_order(): void {
+        // A post can carry one inline-eligible ref and one that fell open to the link.
+        $resolved = new ResolvedScripture( array(
+            array(
+                'label'          => 'John 3:16',
+                'linkUrl'        => 'http://x/a',
+                'version'        => 'ESV',
+                'inlineEligible' => true,
+                'inline'         => array(
+                    'translation' => 'ENGWEBP',
+                    'attribution' => 'World English Bible',
+                    'verses'      => array(
+                        array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'For God so loved' ) ) ),
+                    ),
+                ),
+            ),
+            array(
+                'label'          => 'Romans 16:25',
+                'linkUrl'        => 'http://x/b',
+                'version'        => 'ESV',
+                'inlineEligible' => false,
+                'inline'         => null,
+            ),
+        ) );
+
+        $html = ( new Renderer() )->scripture( $this->view(), $resolved );
+
+        // Inline ref renders text; link ref still renders the 3a anchor + badge.
+        $this->assertStringContainsString( 'sermonator-scripture__ref--inline', $html );
+        $this->assertStringContainsString( '<a class="sermonator-scripture__link" href="http://x/b">Romans 16:25</a>', $html );
+        $this->assertStringContainsString( '<span class="sermonator-scripture__version">(ESV)</span>', $html );
+        $this->assertSame( 2, substr_count( $html, '<li class="sermonator-scripture__ref' ) );
+    }
+
     public function test_term_image_grid_empty_input_renders_nothing(): void {
         $this->assertSame( '', ( new Renderer() )->termImageGrid( array(), 'Series', 3 ) );
     }

@@ -71,6 +71,33 @@ final class IdentifiersTest extends TestCase {
         $this->assertContains( Identifiers::META_BIBLE_REFS, Identifiers::metaKeys() );
     }
 
+    public function test_bundle3b_inline_option_constants(): void {
+        $this->assertSame( 'sermonator_bible_inline_enabled', Identifiers::OPTION_BIBLE_INLINE_ENABLED );
+        $this->assertSame( 'sermonator_bible_inline_attestation', Identifiers::OPTION_BIBLE_INLINE_ATTESTATION );
+        $this->assertSame( 'sermonator_bible_inline_confidence_floor', Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR );
+    }
+
+    public function test_bundle3b_cache_schema_version_is_a_positive_int(): void {
+        $this->assertIsInt( Identifiers::BIBLE_CACHE_SCHEMA_VERSION );
+        $this->assertGreaterThanOrEqual( 1, Identifiers::BIBLE_CACHE_SCHEMA_VERSION );
+    }
+
+    public function test_bundle3b_vendor_dir_constant(): void {
+        $this->assertSame( 'sermonator-bible', Identifiers::BIBLE_VENDOR_DIR );
+    }
+
+    public function test_bundle3b_inline_options_are_prefixed_and_unique(): void {
+        $inline = array(
+            Identifiers::OPTION_BIBLE_INLINE_ENABLED,
+            Identifiers::OPTION_BIBLE_INLINE_ATTESTATION,
+            Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR,
+        );
+        foreach ( $inline as $id ) {
+            $this->assertMatchesRegularExpression( '/^sermonator_/', $id, "$id is not prefixed" );
+        }
+        $this->assertSame( count( $inline ), count( array_unique( $inline ) ), 'duplicate inline option' );
+    }
+
     public function test_bundle4_config_option_constants(): void {
         // DISTINCT live keys (note the `_sermon_` infix) — NOT the
         // `sermonator_archive_slug` / `sermonator_default_image_id` migration

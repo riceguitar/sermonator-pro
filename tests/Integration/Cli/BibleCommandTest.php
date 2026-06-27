@@ -148,4 +148,40 @@ final class BibleCommandTest extends WP_UnitTestCase {
 
         $this->assertSame( 1, (int) get_option( ID::OPTION_BIBLE_CACHE_GEN ) );
     }
+
+    // -------------------------------------------------------------------------
+    // vendor (no-network wrapper paths: dry-run / refusal / rollback)
+    // -------------------------------------------------------------------------
+
+    public function test_vendor_default_is_dry_run_and_writes_nothing(): void {
+        // Default ENGWEBP, no --write: a report-only sweep (no network, no disk).
+        $this->command->vendor( array(), array() );
+
+        $output = WpCliShim::output();
+        $this->assertStringContainsString( 'would be vendored', $output );
+        $this->assertStringContainsString( 'Dry run complete', $output );
+    }
+
+    public function test_vendor_refuses_non_public_domain_translation(): void {
+        $this->command->vendor( array(), array( 'translation' => 'BSB', 'write' => true ) );
+
+        $output = WpCliShim::output();
+        $this->assertStringContainsString( 'Warning:', $output );
+        $this->assertStringContainsString( 'public-domain', $output );
+    }
+
+    public function test_vendor_rollback_with_nothing_vendored_reports_zero(): void {
+        $this->command->vendor( array(), array( 'rollback' => true ) );
+
+        $this->assertStringContainsString( 'Success: Removed 0 vendored chapter file(s) for ENGWEBP', WpCliShim::output() );
+    }
+
+    public function test_vendor_write_is_gated_during_active_migration(): void {
+        update_option( ID::OPTION_MIGRATION_STATE, array( 'phase' => 'migrating' ) );
+
+        $this->command->vendor( array(), array( 'write' => true ) );
+
+        $this->assertStringContainsString( 'Warning:', WpCliShim::output() );
+        $this->assertStringContainsString( 'migration is in progress', WpCliShim::output() );
+    }
 }

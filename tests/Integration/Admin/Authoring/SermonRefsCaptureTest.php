@@ -177,4 +177,63 @@ final class SermonRefsCaptureTest extends WP_UnitTestCase {
         $this->assertSame( 'JHN', $refs[0]['bookUSFM'] );
         $this->assertEqualsCanonicalizing( array( 'John' ), $this->bookTermNames( $id ) );
     }
+
+    /**
+     * Task 12 per-ref hardening: a confirmed (confidence:'exact') ref the rewritten
+     * passage no longer mentions is an ORPHAN and must be dropped on the next save, so
+     * its inline verse text can never render for a passage that lost it. With no surviving
+     * confirmed ref the producer re-derives a fresh auto-parse from the new passage.
+     */
+    public function test_orphan_confirmed_ref_dropped_when_passage_rewritten(): void {
+        $id = (int) self::factory()->post->create( array(
+            'post_type'   => ID::POST_TYPE_SERMON,
+            'post_status' => 'publish',
+        ) );
+
+        // Author-confirmed (exact) envelope for John 3:16, passage matches it.
+        update_post_meta( $id, ID::META_BIBLE_PASSAGE, 'John 3:16' );
+        update_post_meta( $id, ID::META_BIBLE_REFS, (string) wp_json_encode( array(
+            'v'    => 1,
+            'refs' => array(
+                array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16, 'verseEnd' => 16, 'chapterEnd' => null, 'raw' => 'John 3:16', 'source' => 'authoring', 'confidence' => 'exact', 'srcVersification' => 'ESV', 'srcVersificationConfidence' => 'authored' ),
+            ),
+        ) ) );
+
+        // Rewrite the passage so it no longer contains John 3:16, then re-save.
+        update_post_meta( $id, ID::META_BIBLE_PASSAGE, 'Romans 5:1' );
+        wp_update_post( array( 'ID' => $id, 'post_title' => 'Rewritten passage' ) );
+
+        $refs = $this->refs( $id );
+        $this->assertCount( 1, $refs );
+        $this->assertSame( 'ROM', $refs[0]['bookUSFM'], 'Orphaned confirmed ref dropped; passage re-derived.' );
+        $this->assertNotSame( 'exact', $refs[0]['confidence'], 'Re-derived ref is an auto-parse, not confirmed.' );
+    }
+
+    /**
+     * Conversely, a confirmed ref whose verse STILL appears in the rewritten passage
+     * survives untouched (the producer no-ops on the still-present envelope).
+     */
+    public function test_confirmed_ref_preserved_when_still_in_passage(): void {
+        $id = (int) self::factory()->post->create( array(
+            'post_type'   => ID::POST_TYPE_SERMON,
+            'post_status' => 'publish',
+        ) );
+
+        update_post_meta( $id, ID::META_BIBLE_PASSAGE, 'John 3:16' );
+        update_post_meta( $id, ID::META_BIBLE_REFS, (string) wp_json_encode( array(
+            'v'    => 1,
+            'refs' => array(
+                array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16, 'verseEnd' => 16, 'chapterEnd' => null, 'raw' => 'John 3:16', 'source' => 'authoring', 'confidence' => 'exact', 'srcVersification' => 'ESV', 'srcVersificationConfidence' => 'authored' ),
+            ),
+        ) ) );
+
+        // Add free text but keep the confirmed verse, then re-save.
+        update_post_meta( $id, ID::META_BIBLE_PASSAGE, 'John 3:16 and following' );
+        wp_update_post( array( 'ID' => $id, 'post_title' => 'Kept passage' ) );
+
+        $refs = $this->refs( $id );
+        $this->assertCount( 1, $refs );
+        $this->assertSame( 'JHN', $refs[0]['bookUSFM'] );
+        $this->assertSame( 'exact', $refs[0]['confidence'], 'Confirmed ref still in the passage is preserved.' );
+    }
 }

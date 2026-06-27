@@ -123,6 +123,138 @@ final class RefValidator {
         return self::DIVERGENT_ZONES;
     }
 
+    /**
+     * Render-time confirmation (spec L9): is EVERY verse number in the ref's
+     * verseStart..verseEnd span physically present in the fetched, normalized
+     * chapter?
+     *
+     * $chapter is the normalized flat shape produced by ChapterNormalizer:
+     * a list of `{number:int, nodes:[...]}` entries, one per verse the public
+     * text actually contains. This is a pure presence check with NO I/O.
+     *
+     * It is the final fail-open valve of the never-fail-WRONG spine, catching
+     * three failure modes that the pure pre-filter cannot see without chapter data:
+     *   1. OUT-OF-RANGE ends — a ref whose verseEnd exceeds the chapter's last
+     *      verse (e.g. asking for v25 of a 23-verse chapter).
+     *   2. Critical-text verse-number GAPS — public-domain editions (WEB/ENGWEBP)
+     *      omit verses present in the source versification (e.g. a missing
+     *      Matthew 16:24-style omission), leaving a hole in the numbering.
+     *   3. EXCISED-but-NUMBERED verses — an edition that keeps the verse NUMBER but
+     *      drops its words (an empty `nodes:[]` verse, or a footnote-only verse such
+     *      as WEB John 5:4 / Matthew 17:21 / 18:11 / Mark 7:16). A bare number with
+     *      no renderable scripture is NOT present for confirmation: counting it would
+     *      let a crossing range falsely confirm and surface a blank verse to a
+     *      congregation — the exact false-positive inline this valve exists to stop.
+     *      Presence therefore requires at least one renderable text/wordsOfJesus node
+     *      (see {@see presentVerseNumbers()}); such verses fail the whole ref open.
+     *
+     * A SINGLE missing verse fails the WHOLE ref (returns false), so the caller
+     * falls open to the 3a link rather than rendering a partial range that would
+     * silently imply a skipped verse. Presence is NOT correspondence: this proves
+     * the words exist, not that they map to the same passage — RENUMBER shifts are
+     * the versification gate's job, not this method's.
+     *
+     * Conservative by construction: a chapter-only ref (no verseStart) or a
+     * cross-chapter ref (chapterEnd set, which cannot be confirmed against a
+     * single chapter) returns false — withhold inline, show the link.
+     *
+     * @param array{verseStart?:?int,verseEnd?:?int,chapterEnd?:?int}                       $ref
+     * @param list<array{number?:int,nodes?:list<array{type?:string,text?:string}>}>        $chapter Normalized flat chapter: one entry per present verse.
+     */
+    public static function rangeWithinChapter( array $ref, array $chapter ): bool {
+        $verseStart = $ref['verseStart'] ?? null;
+        $verseEnd   = $ref['verseEnd'] ?? null;
+        $chapterEnd = $ref['chapterEnd'] ?? null;
+
+        // No specific verse, or a cross-chapter span that a single chapter cannot
+        // possibly confirm: fail open to the link.
+        if ( null === $verseStart || null !== $chapterEnd ) {
+            return false;
+        }
+
+        // A single verse when verseEnd is absent; never widen the span.
+        $end = $verseEnd ?? $verseStart;
+
+        // A descending span is meaningless to confirm: fail open.
+        if ( $end < $verseStart ) {
+            return false;
+        }
+
+        $present = self::presentVerseNumbers( $chapter );
+
+        for ( $verse = $verseStart; $verse <= $end; $verse++ ) {
+            if ( ! isset( $present[ $verse ] ) ) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Collect the set of verse numbers that carry RENDERABLE scripture in a
+     * normalized chapter. Returned as an int-keyed map for O(1) membership tests.
+     *
+     * Presence is keyed on renderable text, NOT on the verse number alone: a verse
+     * emitted with zero nodes, or with footnote-only content (a critical-text
+     * omission an edition may surface as `{number:N, nodes:[]}` or
+     * `{number:N, nodes:[{type:'note',…}]}`), is NOT renderable scripture. Counting
+     * such a verse would let {@see rangeWithinChapter()} falsely confirm a crossing
+     * range and the pure Renderer would then display a blank/missing verse — the
+     * never-fail-WRONG false positive. So a verse is present ONLY when it has at
+     * least one non-empty `text` or `wordsOfJesus` node; otherwise it is absent and
+     * the whole ref fails open to the 3a link (always a free, safe outcome).
+     *
+     * @param list<array{number?:int,nodes?:list<array{type?:string,text?:string}>}> $chapter
+     *
+     * @return array<int,true>
+     */
+    private static function presentVerseNumbers( array $chapter ): array {
+        $present = array();
+
+        foreach ( $chapter as $entry ) {
+            if ( ! is_array( $entry ) || ! isset( $entry['number'] ) || ! is_int( $entry['number'] ) ) {
+                continue;
+            }
+
+            if ( ! self::hasRenderableText( $entry['nodes'] ?? null ) ) {
+                continue;
+            }
+
+            $present[ $entry['number'] ] = true;
+        }
+
+        return $present;
+    }
+
+    /**
+     * Does a verse's normalized node list carry at least one renderable scripture
+     * run — a non-empty `text` or `wordsOfJesus` node? `note` nodes (editorial
+     * footnotes) and an empty list do NOT count: they are not the verse's words.
+     *
+     * @param mixed $nodes The verse's `nodes` list from ChapterNormalizer.
+     */
+    private static function hasRenderableText( $nodes ): bool {
+        if ( ! is_array( $nodes ) ) {
+            return false;
+        }
+
+        foreach ( $nodes as $node ) {
+            if (
+                is_array( $node )
+                && isset( $node['type'] )
+                && ( 'text' === $node['type'] || 'wordsOfJesus' === $node['type'] )
+                && isset( $node['text'] )
+                && is_string( $node['text'] )
+                && '' !== $node['text']
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static function isStructurallyValid( int $chapterStart, ?int $verseStart, ?int $verseEnd, ?int $chapterEnd ): bool {
         if ( $chapterStart < 1 ) {
             return false;
