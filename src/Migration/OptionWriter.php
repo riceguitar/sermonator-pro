@@ -89,18 +89,21 @@ final class OptionWriter {
             ++$written;
         }
 
-        // Schedule a deferred rewrite-rule flush so the CPT's effective archive slug
-        // (which derives from the migrated sermonator_general container via
-        // DisplayDefaults::defaultArchiveSlug(), NOT from the DISTINCT live
-        // OPTION_ARCHIVE_SLUG key) is reflected in WordPress's rewrite rules on the
-        // next admin or cron request. Without this, the activate-without-legacy →
-        // import-legacy-options → migrate ordering leaves the CPT registered under
-        // the migrated slug while the rewrite rules still encode the old slug,
-        // causing 404s until a manual "Save Permalinks". SlugRewriteFlusher's
-        // init@99 handler absorbs the flag and flushes exactly once; nothing is
-        // flushed inline here (the CPT is not yet re-registered under the new slug
-        // on THIS request, so an inline flush would persist stale rules).
-        update_option( Identifiers::OPTION_REWRITE_FLUSH_PENDING, true );
+        // Schedule a deferred rewrite-rule flush ONLY when the migrated effective archive
+        // slug actually diverges from the hard default the CPT was activated under. The
+        // effective slug derives from the migrated sermonator_general container via
+        // DisplayDefaults::defaultArchiveSlug() (NOT the DISTINCT live OPTION_ARCHIVE_SLUG
+        // key the migration never writes). Without this, the activate-without-legacy →
+        // import-legacy-options → migrate ordering leaves the CPT re-registered under the
+        // migrated slug while the rewrite rules still encode 'sermons', 404ing the archive +
+        // single-sermon permalinks until a manual "Save Permalinks". When the slug is
+        // unchanged (the common drop-in case), NO flush is scheduled — preserving the
+        // no-spurious-flush guarantee. SlugRewriteFlusher's init@99 handler absorbs the flag
+        // and flushes exactly once on the next admin/cron request; nothing flushes inline
+        // here (the CPT is not yet re-registered under the new slug on THIS request).
+        if ( \Sermonator\Schema\DisplayDefaults::defaultArchiveSlug() !== \Sermonator\Schema\DisplayDefaults::HARD_ARCHIVE_SLUG ) {
+            update_option( Identifiers::OPTION_REWRITE_FLUSH_PENDING, true );
+        }
 
         return array(
             'written'   => $written,

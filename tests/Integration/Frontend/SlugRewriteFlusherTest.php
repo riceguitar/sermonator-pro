@@ -60,11 +60,15 @@ final class SlugRewriteFlusherTest extends WP_UnitTestCase {
         // ...the DISTINCT live key was never written by the migration...
         $this->assertFalse( get_option( Identifiers::OPTION_ARCHIVE_SLUG, false ) );
 
-        // ...and crucially, no rewrite flush was ever scheduled, because the
-        // flusher's listeners are bound to the live key the migration never touches.
+        // ...and no rewrite flush was scheduled: the flusher's listeners are bound to the
+        // live key the migration never writes, AND the migrated effective slug here is the
+        // hard default 'sermons' (this fixture seeds only a FLAT sermonmanager_archive_slug,
+        // which DisplayDefaults ignores — it reads the sermonmanager_general/sermonator_general
+        // container), so OptionWriter's change-only schedule does not fire. A migration that
+        // genuinely changes the container slug DOES schedule one (see PodcastOptionWriterTest).
         $this->assertFalse(
             $this->flushPending(),
-            'A migration re-run must never schedule an archive-slug rewrite flush.'
+            'A migration that does not change the effective archive slug must not schedule a flush.'
         );
     }
 
