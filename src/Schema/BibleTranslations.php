@@ -19,7 +19,13 @@ namespace Sermonator\Schema;
  *     sites, so each entry carries a `license` status and an `inlineEligible`
  *     flag. Only `inlineEligible` (license-clean) translations may ever have
  *     their verse text rendered. ENGWEBP (World English Bible) is the
- *     unambiguous public-domain default; BSB is license-ambiguous and therefore
+ *     unambiguous public-domain default and — as of Bundle 3 Phase 3b — the
+ *     SINGLE audited inline target (its versification-divergence table is the
+ *     only one enumerated). ENGKJV is public-domain but inline-INELIGIBLE: its
+ *     divergences from the modern critical text are different/opposite and
+ *     UNAUDITED, so rendering its words for an ESV/NASB-sourced church would be
+ *     a false-positive inline — the one unacceptable outcome. It stays link-only
+ *     until separately audited. BSB is license-ambiguous and therefore
  *     inline-INELIGIBLE (link-only).
  *
  *   Axis A — LINK-target version ({@see curatedLinkVersions()}). These are
@@ -53,7 +59,7 @@ final class BibleTranslations {
                 'id'             => 'ENGKJV',
                 'label'          => 'King James Version',
                 'license'        => 'public-domain',
-                'inlineEligible' => true,
+                'inlineEligible' => false,
             ),
             array(
                 'id'             => 'BSB',
@@ -109,5 +115,76 @@ final class BibleTranslations {
      */
     public static function isValidLinkVersionCode( string $code ): bool {
         return (bool) preg_match( '/^[A-Za-z0-9]{1,20}$/', $code );
+    }
+
+    /**
+     * The one versification family Phase 3b models: the modern English-Protestant
+     * tradition (ESV / NIV / NASB / NKJV / NLT / CSB / KJV / WEB / NET, incl. their
+     * anglicised UK editions). ENGWEBP — the single inline target — belongs to it,
+     * so a source link version that normalizes to THIS family is the necessary
+     * (not sufficient) precondition for the {@see \Sermonator\Bible\VersificationGate}
+     * same-family fast path. Any other tradition (Spanish Reina-Valera, the
+     * Septuagint/Vulgate-numbered Catholic/Orthodox canons, or a blank/unknown
+     * code) is deliberately UNmodeled and must fall open to the link.
+     */
+    public const FAMILY_ENGLISH_PROTESTANT = 'eng-protestant';
+
+    /**
+     * The modern English-Protestant link-version codes that map to
+     * {@see FAMILY_ENGLISH_PROTESTANT}, after case-folding and UK-suffix stripping.
+     *
+     * @var list<string>
+     */
+    private const ENGLISH_PROTESTANT_CODES = array(
+        'ESV',
+        'NIV',
+        'NASB',
+        'NKJV',
+        'NLT',
+        'CSB',
+        'KJV',
+        'WEB',
+        'NET',
+    );
+
+    /**
+     * Normalize an axis-A LINK-version code to a versification FAMILY code.
+     *
+     * Folds case, strips anglicised UK suffixes (`NIVUK`, `ESVANGL` → `NIV`,
+     * `ESV`), and maps every recognized modern English-Protestant alias to
+     * {@see FAMILY_ENGLISH_PROTESTANT}. Anything outside that single modeled
+     * tradition — Spanish (`RVR1960`), LXX/Vulgate-numbered canons, or a
+     * blank/unrecognized code — returns the EMPTY STRING.
+     *
+     * This is the conservative, fail-open primitive behind the L4 step of the
+     * 3b inline predicate: an empty family code means `src-versification-
+     * unsupported`, i.e. fall open to the 3a link rather than risk rendering
+     * real-but-wrong verse text. The set is intentionally small; an unmodeled
+     * English version (e.g. AMP, MSG) also returns empty and links, never inlines.
+     *
+     * Pure: no I/O, no WP, deterministic.
+     */
+    public static function familyCode( string $linkVersion ): string {
+        $code = strtoupper( trim( $linkVersion ) );
+
+        if ( '' === $code ) {
+            return '';
+        }
+
+        // Strip a single anglicised-edition suffix (NIVUK, ESVANGL, NETUK, …)
+        // so the underlying base code drives the family lookup.
+        foreach ( array( 'ANGL', 'UK' ) as $suffix ) {
+            $len = strlen( $suffix );
+            if ( strlen( $code ) > $len && substr( $code, -$len ) === $suffix ) {
+                $code = substr( $code, 0, -$len );
+                break;
+            }
+        }
+
+        if ( in_array( $code, self::ENGLISH_PROTESTANT_CODES, true ) ) {
+            return self::FAMILY_ENGLISH_PROTESTANT;
+        }
+
+        return '';
     }
 }
