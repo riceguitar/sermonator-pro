@@ -13,9 +13,15 @@ use Sermonator\Schema\Identifiers as ID;
  *
  * READ ORDER (first hit wins):
  *   1. UPLOADS-VENDORED DISK SNAPSHOT —
- *      `wp-content/uploads/<BIBLE_VENDOR_DIR>/<translation>/<BOOK>/<chapter>.json`
- *      (read + `json_decode`; the file is ALREADY in the normalized render shape,
- *      so it is returned as-is). Local disk only — never network.
+ *      `wp-content/uploads/<BIBLE_VENDOR_DIR>/<translation>/<BOOK>/<chapter>.json`,
+ *      a SCHEMA-STAMPED envelope `{schema:int, chapter:[…normalized render shape…]}`.
+ *      Read + `json_decode`, verify `schema === BIBLE_CACHE_SCHEMA_VERSION` (the disk
+ *      tier's schema-invalidation guard, mirroring the cache-key fold in
+ *      {@see ChapterCache::key()}), then unwrap and return the inner `chapter` list.
+ *      A snapshot vendored under an OLD schema (after a shape-changing bump) MISSES
+ *      on disk and falls through to the cache / re-warm path — so no stale-shaped
+ *      chapter is ever served verbatim (design §3.4 / §3.6). Local disk only — never
+ *      network.
  *   2. {@see ChapterCache} transient (the warmed, gen|schema-keyed cache).
  *   3. ONLY WHEN $warmContext IS true: a live {@see ChapterFetcher} fetch, folded
  *      through {@see ChapterNormalizer}, then written to {@see ChapterCache::set}
@@ -103,10 +109,25 @@ final class ChapterProvider {
     }
 
     /**
-     * Read and decode the vendored per-chapter snapshot, or null when it is
-     * absent, unreadable, undecodable, or not a non-empty list. The file is
-     * authored by the vendor step ALREADY in the normalized render shape, so a
-     * decoded array is returned verbatim.
+     * Read, decode, and SCHEMA-VALIDATE the vendored per-chapter snapshot, or null
+     * when it is absent, unreadable, undecodable, schema-mismatched, or carries no
+     * usable chapter list.
+     *
+     * ON-DISK FORMAT — a schema-stamped envelope (design §3.4; this method PINS the
+     * format the T8 {@see \Sermonator\Migration\BibleChapterVendor} writer must emit):
+     *
+     *     { "schema": <int>, "chapter": [ {number:int, nodes:[{type,text}, …]}, … ] }
+     *
+     * The `schema` member MUST equal {@see ID::BIBLE_CACHE_SCHEMA_VERSION} — the disk
+     * tier's schema-invalidation guard, the on-file analogue of the schema fold in
+     * {@see ChapterCache::key()}. Because disk is checked FIRST, a snapshot vendored
+     * under an OLD schema (after a shape-changing bump) would otherwise shadow a
+     * correctly re-warmed cache entry and be served verbatim at the STALE node shape;
+     * the stamp check makes such a file MISS and fall through to the cache / re-warm
+     * path instead, so "no stale-shaped chapter is ever served" (design §3.4 / §3.6).
+     * On a match the inner `chapter` list — already in the normalized render shape —
+     * is unwrapped and returned. A bare array (legacy / unstamped) or any non-envelope
+     * shape is NOT a definitive hit and likewise falls through.
      *
      * @return list<array{number:int,nodes:list<array{type:string,text:string}>}>|null
      */
@@ -133,9 +154,25 @@ final class ChapterProvider {
 
         $decoded = json_decode( $body, true );
 
+        // Must be a schema-stamped envelope. A non-array, or an array missing the
+        // stamp (a bare/legacy snapshot, corruption, half-written file) is NOT a
+        // definitive hit — fall through to the cache rather than serve it.
+        if ( ! is_array( $decoded ) || ! array_key_exists( 'schema', $decoded ) ) {
+            return null;
+        }
+
+        // SCHEMA-INVALIDATION GUARD: a snapshot stamped under a different (older)
+        // schema is structurally stale. Fall through to the cache / re-warm path
+        // rather than serve it at the wrong node shape. Strict int identity only.
+        if ( ID::BIBLE_CACHE_SCHEMA_VERSION !== $decoded['schema'] ) {
+            return null;
+        }
+
+        $chapterList = $decoded['chapter'] ?? null;
+
         // A non-empty array is a usable snapshot. An empty array or a non-array
         // (corruption / half-written file) is NOT a definitive hit — fall through
-        // to the cache rather than asserting an empty chapter is "available".
-        return ( is_array( $decoded ) && array() !== $decoded ) ? $decoded : null;
+        // rather than asserting an empty chapter is "available".
+        return ( is_array( $chapterList ) && array() !== $chapterList ) ? $chapterList : null;
     }
 }

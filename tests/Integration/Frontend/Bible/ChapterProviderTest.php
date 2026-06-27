@@ -46,12 +46,21 @@ final class ChapterProviderTest extends WP_UnitTestCase {
         );
     }
 
-    private function writeSnapshot( string $translation, string $book, int $chapter, array $normalized ): void {
+    /**
+     * Write a SCHEMA-STAMPED envelope snapshot `{schema, chapter}` (the on-disk
+     * format the provider's disk tier requires). A null $schema stamps the current
+     * {@see ID::BIBLE_CACHE_SCHEMA_VERSION}.
+     */
+    private function writeSnapshot( string $translation, string $book, int $chapter, array $normalized, ?int $schema = null ): void {
         $uploads = wp_upload_dir();
         $dir     = $uploads['basedir'] . '/' . ID::BIBLE_VENDOR_DIR . '/' . $translation . '/' . $book;
         wp_mkdir_p( $dir );
-        $path = $dir . '/' . $chapter . '.json';
-        file_put_contents( $path, (string) json_encode( $normalized ) );
+        $path     = $dir . '/' . $chapter . '.json';
+        $envelope = array(
+            'schema'  => $schema ?? ID::BIBLE_CACHE_SCHEMA_VERSION,
+            'chapter' => $normalized,
+        );
+        file_put_contents( $path, (string) json_encode( $envelope ) );
         $this->written[] = $path;
     }
 
@@ -90,6 +99,45 @@ final class ChapterProviderTest extends WP_UnitTestCase {
         $this->assertNull(
             ChapterProvider::get( 'ENGWEBP', 'JHN', 3, false ),
             'A cache-gen bump must rotate the key so the stale chapter misses.'
+        );
+    }
+
+    /**
+     * SCHEMA-INVALIDATION on disk: a snapshot stamped under a STALE schema is not
+     * served verbatim. Disk is checked first, so without this guard it would shadow
+     * the correctly re-warmed cache; here the stale disk file misses and the warmed
+     * transient (current schema) is returned instead.
+     */
+    public function test_stale_schema_disk_snapshot_falls_through_to_cache(): void {
+        $stale = array(
+            array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'OLD SHAPE' ) ) ),
+        );
+        // Stamp a schema that is NOT the current one.
+        $this->writeSnapshot( 'ENGWEBP', 'JHN', 3, $stale, ID::BIBLE_CACHE_SCHEMA_VERSION + 1 );
+
+        $fresh = $this->normalizedChapter();
+        ChapterCache::set( 'ENGWEBP', 'JHN', 3, $fresh );
+
+        $this->assertSame(
+            $fresh,
+            ChapterProvider::get( 'ENGWEBP', 'JHN', 3, false ),
+            'A stale-schema disk snapshot must miss and let the re-warmed cache win.'
+        );
+    }
+
+    /** A bare/legacy unstamped array on disk falls through (not a schema-stamped envelope). */
+    public function test_unstamped_disk_snapshot_falls_through(): void {
+        $uploads = wp_upload_dir();
+        $dir     = $uploads['basedir'] . '/' . ID::BIBLE_VENDOR_DIR . '/ENGWEBP/JHN';
+        wp_mkdir_p( $dir );
+        $path = $dir . '/3.json';
+        // Bare array, the pre-fix verbatim format — no `schema` member.
+        file_put_contents( $path, (string) json_encode( $this->normalizedChapter() ) );
+        $this->written[] = $path;
+
+        $this->assertNull(
+            ChapterProvider::get( 'ENGWEBP', 'JHN', 3, false ),
+            'An unstamped (non-envelope) disk body is not a definitive hit.'
         );
     }
 

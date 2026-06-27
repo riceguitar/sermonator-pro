@@ -51,11 +51,24 @@ final class ChapterProviderTest extends TestCase {
         parent::tearDown();
     }
 
-    /** Write a vendored, already-normalized chapter JSON to the disk snapshot path. */
+    /** Write a raw vendored snapshot body (any string) to the disk snapshot path. */
     private function writeSnapshot( string $translation, string $book, int $chapter, string $json ): void {
         $dir = $this->basedir . '/sermonator-bible/' . $translation . '/' . $book;
         mkdir( $dir, 0777, true );
         file_put_contents( $dir . '/' . $chapter . '.json', $json );
+    }
+
+    /**
+     * Write a SCHEMA-STAMPED envelope snapshot `{schema, chapter}` — the on-disk
+     * format the provider's disk tier requires. A null $schema stamps the current
+     * {@see \Sermonator\Schema\Identifiers::BIBLE_CACHE_SCHEMA_VERSION}.
+     */
+    private function writeEnvelopeSnapshot( string $translation, string $book, int $chapter, array $normalized, ?int $schema = null ): void {
+        $envelope = array(
+            'schema'  => $schema ?? \Sermonator\Schema\Identifiers::BIBLE_CACHE_SCHEMA_VERSION,
+            'chapter' => $normalized,
+        );
+        $this->writeSnapshot( $translation, $book, $chapter, (string) json_encode( $envelope ) );
     }
 
     private function rrmdir( string $dir ): void {
@@ -84,10 +97,10 @@ final class ChapterProviderTest extends TestCase {
 
     // ── (1) Disk snapshot is the first source ───────────────────────────────
 
-    /** A vendored disk snapshot is read+decoded and returned BEFORE the cache. */
+    /** A vendored disk snapshot is read+decoded, unwrapped, and returned BEFORE the cache. */
     public function test_disk_snapshot_is_read_first_without_touching_cache(): void {
         $normalized = $this->normalizedJohn3();
-        $this->writeSnapshot( 'ENGWEBP', 'JHN', 3, (string) json_encode( $normalized ) );
+        $this->writeEnvelopeSnapshot( 'ENGWEBP', 'JHN', 3, $normalized );
 
         $transientCalled = false;
         Functions\when( 'get_transient' )->alias( function () use ( &$transientCalled ) {
@@ -97,8 +110,54 @@ final class ChapterProviderTest extends TestCase {
 
         $result = ChapterProvider::get( 'ENGWEBP', 'JHN', 3, false );
 
-        $this->assertSame( $normalized, $result );
+        $this->assertSame( $normalized, $result, 'The inner chapter list is unwrapped from the envelope.' );
         $this->assertFalse( $transientCalled, 'Disk hit must short-circuit before the transient cache.' );
+    }
+
+    /**
+     * SCHEMA-INVALIDATION (the fix): a snapshot stamped under a DIFFERENT (stale)
+     * schema is NOT served verbatim — the disk tier misses and falls through to the
+     * cache, mirroring the cache-key schema fold. Without this guard a node-shape
+     * bump would serve a structurally-stale chapter to the pure Renderer.
+     */
+    public function test_disk_snapshot_with_stale_schema_falls_through_to_cache(): void {
+        $stale = array(
+            array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'OLD SHAPE' ) ) ),
+        );
+        $current = \Sermonator\Schema\Identifiers::BIBLE_CACHE_SCHEMA_VERSION;
+        $this->writeEnvelopeSnapshot( 'ENGWEBP', 'JHN', 3, $stale, $current + 1 );
+
+        // The correctly-warmed cache entry must win over the stale disk snapshot.
+        $fresh = $this->normalizedJohn3();
+        Functions\when( 'get_transient' )->justReturn( $fresh );
+
+        $result = ChapterProvider::get( 'ENGWEBP', 'JHN', 3, false );
+
+        $this->assertSame( $fresh, $result, 'A stale-schema disk file must not shadow the re-warmed cache.' );
+        $this->assertNotSame( $stale, $result, 'The stale-shaped snapshot must never be served.' );
+    }
+
+    /**
+     * A bare/legacy unstamped array on disk (no `schema` envelope member) is NOT a
+     * definitive hit; the disk tier falls through rather than serving an
+     * un-schema-verified body.
+     */
+    public function test_disk_snapshot_without_schema_stamp_falls_through(): void {
+        // A bare normalized array, as the pre-fix verbatim contract would have written.
+        $this->writeSnapshot( 'ENGWEBP', 'JHN', 3, (string) json_encode( $this->normalizedJohn3() ) );
+
+        $fresh = $this->normalizedJohn3();
+        Functions\when( 'get_transient' )->justReturn( $fresh );
+
+        $this->assertSame( $fresh, ChapterProvider::get( 'ENGWEBP', 'JHN', 3, false ) );
+    }
+
+    /** An envelope whose inner chapter list is empty is NOT a definitive hit; it falls through. */
+    public function test_envelope_with_empty_chapter_falls_through(): void {
+        $this->writeEnvelopeSnapshot( 'ENGWEBP', 'JHN', 3, array() );
+        Functions\when( 'get_transient' )->justReturn( false );
+
+        $this->assertNull( ChapterProvider::get( 'ENGWEBP', 'JHN', 3, false ) );
     }
 
     /** A corrupt (undecodable) disk file is ignored and the read falls through. */
