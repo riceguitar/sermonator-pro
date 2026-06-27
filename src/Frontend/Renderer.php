@@ -17,7 +17,8 @@ final class Renderer {
         if ( $v->biblePassage !== '' ) {
             $rows .= $this->row( 'passage', __( 'Scripture', 'sermonator' ), esc_html( $v->biblePassage ) );
         }
-        $rows .= $this->termRow( 'preacher', __( 'Preacher', 'sermonator' ), $v->preachers );
+        $preacherLabel = $v->preacherLabel !== '' ? $v->preacherLabel : __( 'Preacher', 'sermonator' );
+        $rows         .= $this->termRow( 'preacher', $preacherLabel, $v->preachers );
         $rows .= $this->termRow( 'series', __( 'Series', 'sermonator' ), $v->series );
 
         $date = $this->dateLabel( $v );
@@ -109,10 +110,22 @@ final class Renderer {
 
 
     public function featuredImage( SermonView $v ): string {
-        if ( $v->imageId <= 0 ) {
+        if ( $v->imageId > 0 ) {
+            // Real post thumbnail (responsive srcset via the post-thumbnail API).
+            $img = get_the_post_thumbnail( $v->id, 'large', array( 'class' => 'sermonator-single__image', 'loading' => 'eager' ) );
+        } elseif ( $v->effectiveImageId > 0 ) {
+            // No thumbnail: render the configured site-wide default image (legacy
+            // `default_image` parity). The id is resolved impurely in TemplateData
+            // ({@see EffectiveImage}) so this method stays free of get_option.
+            $img = wp_get_attachment_image(
+                $v->effectiveImageId,
+                'large',
+                false,
+                array( 'class' => 'sermonator-single__image', 'loading' => 'eager' )
+            );
+        } else {
             return '';
         }
-        $img = get_the_post_thumbnail( $v->id, 'large', array( 'class' => 'sermonator-single__image', 'loading' => 'eager' ) );
         return is_string( $img ) && $img !== '' ? '<figure class="sermonator-single__media">' . $img . '</figure>' : '';
     }
 
@@ -240,6 +253,91 @@ final class Renderer {
         }
         $heading = $label !== '' ? '<span class="sermonator-subscribe__label">' . esc_html( $label ) . '</span>' : '';
         return '<div class="sermonator-subscribe">' . $heading . $buttons . '</div>';
+    }
+
+    /**
+     * A grid of linked taxonomy-term images (used by the sermon-images block). Pure: takes
+     * already-resolved {name,url,imageHtml,description} entries built OUTSIDE the renderer
+     * (the block does the get_terms / OPTION_TERM_IMAGES[tt_id] / wp_get_attachment_image
+     * resolution). `imageHtml` is core wp_get_attachment_image() output — already-safe HTML
+     * passed through verbatim; the name is escaped (esc_html), the link esc_url'd, and the
+     * term description (only when `$showDescription`) run through wp_kses_post (a curated term
+     * description may carry safe inline HTML). `$showTitle` gates the per-item name. Empty
+     * input → '' (empty-state).
+     *
+     * @param list<array{name:string,url:string,imageHtml:string,description:string}> $items
+     */
+    public function termImageGrid( array $items, string $label = '', int $columns = 3, bool $showTitle = true, bool $showDescription = false ): string {
+        if ( $items === array() ) {
+            return '';
+        }
+        $columns = max( 1, min( 6, $columns ) );
+
+        $cells = '';
+        foreach ( $items as $item ) {
+            $name = $showTitle
+                ? '<span class="sermonator-image-grid__name">' . esc_html( $item['name'] ) . '</span>'
+                : '';
+            $description = ( $showDescription && ( $item['description'] ?? '' ) !== '' )
+                ? '<div class="sermonator-image-grid__description">' . wp_kses_post( $item['description'] ) . '</div>'
+                : '';
+            $inner = $item['imageHtml'] . $name . $description;
+            $cells .= '<li class="sermonator-image-grid__item">'
+                . ( $item['url'] !== ''
+                    ? '<a href="' . esc_url( $item['url'] ) . '">' . $inner . '</a>'
+                    : $inner )
+                . '</li>';
+        }
+
+        $heading = $label !== ''
+            ? '<h2 class="sermonator-image-grid__label">' . esc_html( $label ) . '</h2>'
+            : '';
+        return '<div class="sermonator-image-grid-wrap">' . $heading
+            . '<ul class="sermonator-image-grid" data-columns="' . esc_attr( (string) $columns ) . '">'
+            . $cells . '</ul></div>';
+    }
+
+    /**
+     * The latest series as a single image + title + description card (used by the
+     * latest-series block). Pure: takes ONE already-resolved
+     * {name,url,imageHtml,description} entry built OUTSIDE the renderer. `imageHtml` is core
+     * wp_get_attachment_image() output passed through as already-safe; the title is escaped
+     * (esc_html), the link esc_url'd, and the term description run through wp_kses_post (a
+     * curated term description may carry safe inline HTML). Empty input (or an entry with no
+     * series name) → '' (empty-state).
+     *
+     * @param array{name:string,url:string,imageHtml:string,description:string} $item
+     */
+    public function latestSeries( array $item, bool $showTitle = true, bool $showDescription = true ): string {
+        if ( ( $item['name'] ?? '' ) === '' ) {
+            return '';
+        }
+
+        $image = $item['imageHtml'];
+        if ( $image !== '' ) {
+            $media = $item['url'] !== ''
+                ? '<a class="sermonator-latest-series__media" href="' . esc_url( $item['url'] ) . '">' . $image . '</a>'
+                : '<figure class="sermonator-latest-series__media">' . $image . '</figure>';
+        } else {
+            $media = '';
+        }
+
+        $title = '';
+        if ( $showTitle ) {
+            $name   = esc_html( $item['name'] );
+            $titleInner = $item['url'] !== ''
+                ? '<a href="' . esc_url( $item['url'] ) . '">' . $name . '</a>'
+                : $name;
+            $title = '<h2 class="sermonator-latest-series__title">' . $titleInner . '</h2>';
+        }
+
+        $description = '';
+        if ( $showDescription && ( $item['description'] ?? '' ) !== '' ) {
+            $description = '<div class="sermonator-latest-series__description">'
+                . wp_kses_post( $item['description'] ) . '</div>';
+        }
+
+        return '<div class="sermonator-latest-series">' . $media . $title . $description . '</div>';
     }
 
     /**

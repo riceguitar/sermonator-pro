@@ -15,9 +15,9 @@ A migrated page that shows a *different* sermon set than it did under Sermon Man
 | Legacy surface | Tier A guarantee (now) | Tier B faithful behavior (deferred) | Fail-visible fallback |
 |---|---|---|---|
 | `[sermons]`, `[sermons_sm]` | Tag resolves; renders the standard Sermonator sermon list (no raw `[sermons]` text) | Honor `order`/`orderby` (incl. `date_preached`), `filter_by`/`filter_value`, `year`/`month`/`before`/`after`, `hide_*`, `include`/`exclude`, `per_page` | Safe unfiltered list + editor notice when any unsupported attribute is present |
-| `[list_sermons]` | Resolves; renders the safe sermon list | Term list for the requested taxonomy (Bundle 4 block) | Safe list + editor notice |
-| `[latest_series]` | Resolves; renders the safe sermon list | Latest-series image + title + description (Bundle 4 block) | Safe list + editor notice |
-| `[sermon_images]` | Resolves; renders the safe sermon list | Term image grid (Bundle 4 block) | Safe list + editor notice |
+| `[list_sermons]` | Resolves; renders the **faithful taxonomy term-list block** (`TaxonomyFilterBlock`) + reworded per-tag editor notice (legacy→new taxonomy mapping unvalidated; defaults to the Series taxonomy) | Honor the legacy `tax`/`order`/`orderby`/`display` attributes against a validated taxonomy map | Empty term list (block returns nothing) + editor notice |
+| `[latest_series]` | Resolves; renders the **faithful latest-series card** (`LatestSeriesBlock`: most-recently-preached series image + title + description, optional `serviceType`) + reworded per-tag editor notice (provisional "latest" semantics unvalidated) | Latest-series resolution validated against the SM source; per-attribute mapping | Empty card (block returns nothing) + editor notice |
+| `[sermon_images]` | Resolves; renders the **faithful term-image grid** (`SermonImagesBlock`, `OPTION_TERM_IMAGES` keyed by `term_taxonomy_id`) + reworded per-tag editor notice | Per-attribute (`taxonomy`/`columns`/`size`/`order`) mapping validated against the SM source | Safe sermon list + editor notice when no artwork resolves (never a blank grid) |
 | `[list_podcasts]` | Resolves; renders subscribe links (existing `podcast-subscribe` capability) | Same, with per-service attributes | Subscribe links for the default podcast |
 | Legacy feed URL `?feed=rss2&post_type=wpfc_sermon[&id=<legacy_id>]` | Resolves 200 to the Sermonator feed; legacy podcast id mapped to the migrated `sermonator_podcast` | Per-podcast taxonomy/audio-video filtering identical to legacy | Default podcast feed if the legacy id can't be mapped |
 
@@ -41,3 +41,4 @@ Without this, faithful details land in each bundle's own spec and this document 
 | Date | Bundle | Change |
 |---|---|---|
 | 2026-06-26 | Bundle 1 (Switch-safe Tier A) | Contract created. Tier A defaults + fail-visible rule established; feed-URL/GUID continuity guarantee recorded; `LegacyFeedSnapshot` is the GUID source of truth. |
+| 2026-06-26 | Bundle 4 (Config & display) | `[list_sermons]`/`[latest_series]`/`[sermon_images]` shims upgraded from the wrong-type safe sermon list to their **faithful Bundle 4 display blocks** (`TaxonomyFilterBlock` term list / `LatestSeriesBlock` card / `SermonImagesBlock` tt_id-keyed image grid). A **reworded per-tag editor "needs review" notice is KEPT** (legacy→new taxonomy mapping + provisional "latest" semantics are unvalidated against the absent SM source) — the surface stays fail-visible. `[sermon_images]` keeps the safe-list-on-empty fallback; `[sermons]`/`[sermons_sm]` unchanged (Bundle 2). |

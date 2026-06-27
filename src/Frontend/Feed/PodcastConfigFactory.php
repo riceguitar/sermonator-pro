@@ -5,17 +5,25 @@ declare(strict_types=1);
 namespace Sermonator\Frontend\Feed;
 
 use Sermonator\Schema\Identifiers as ID;
+use Sermonator\Schema\PodcastMetaSchema;
 
 /**
  * Builds a {@see PodcastConfig} from a sermonator_podcast post: its
  * `sermonator_podcast_settings` (migrated from the legacy Pro podcast settings, with known
  * keys read defensively), the post fields, and the featured image — with sensible fallbacks
  * so an incompletely-configured podcast still produces a valid feed.
+ *
+ * The recognized identity keys come from the shared {@see PodcastMetaSchema::keys()} catalog —
+ * the SAME allowlist the write path sanitizes against — so the reader and the writer can never
+ * drift on which keys exist. Raw stored meta is intersected against the catalog before use, so a
+ * stray/unknown key can never leak into the channel even on an unsanitized legacy row.
  */
 final class PodcastConfigFactory {
     public function fromPost( int $podcastId, string $feedUrl ): PodcastConfig {
         $settings = get_post_meta( $podcastId, ID::META_PODCAST_SETTINGS, true );
-        $settings = is_array( $settings ) ? $settings : array();
+        $settings = is_array( $settings )
+            ? array_intersect_key( $settings, array_flip( PodcastMetaSchema::keys() ) )
+            : array();
         $get      = static fn( string $key, string $default = '' ): string =>
             isset( $settings[ $key ] ) && is_scalar( $settings[ $key ] ) ? (string) $settings[ $key ] : $default;
 

@@ -15,6 +15,19 @@ final class TemplateDataTest extends TestCase {
         parent::setUp();
         Monkey\setUp();
         Functions\when( 'is_wp_error' )->justReturn( false );
+        // TemplateData resolves the preacher-row label via get_option (with an
+        // explicit DisplayDefaults fallback); the seed resolver also reads the
+        // legacy/migrated containers. Returning the caller's default keeps these
+        // term/meta-focused tests independent of the label wiring.
+        Functions\when( 'get_option' )->alias(
+            static fn( string $name, $default = false ) => $default
+        );
+        // These term/meta-focused tests exercise the public render path: the
+        // EffectiveImage URL→id resolution is gated to is_admin()||wp_doing_cron(),
+        // so a front-end context (both false) keeps the fallback image off this
+        // path without a DB scan/write.
+        Functions\when( 'is_admin' )->justReturn( false );
+        Functions\when( 'wp_doing_cron' )->justReturn( false );
     }
 
     protected function tearDown(): void {

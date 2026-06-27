@@ -51,7 +51,21 @@ final class RendererTest extends TestCase {
             bulletinUrl: $over['bulletinUrl'] ?? '',
             notes: $over['notes'] ?? '',
             preachers: $over['preachers'] ?? array( array( 'name' => 'Pastor John', 'url' => 'http://x/p' ) ),
+            preacherLabel: $over['preacherLabel'] ?? '',
+            effectiveImageId: $over['effectiveImageId'] ?? 0,
         );
+    }
+
+    public function test_meta_uses_threaded_preacher_label(): void {
+        $html = ( new Renderer() )->meta( $this->view( array( 'preacherLabel' => 'Speaker' ) ) );
+        $this->assertStringContainsString( '<dt>Speaker</dt>', $html );
+        $this->assertStringNotContainsString( '<dt>Preacher</dt>', $html );
+    }
+
+    public function test_meta_falls_back_to_preacher_when_label_empty(): void {
+        // Empty threaded label (the SermonView default) → the hardcoded 'Preacher' fallback.
+        $html = ( new Renderer() )->meta( $this->view( array( 'preacherLabel' => '' ) ) );
+        $this->assertStringContainsString( '<dt>Preacher</dt>', $html );
     }
 
     public function test_meta_includes_passage_and_preacher(): void {
@@ -159,6 +173,16 @@ final class RendererTest extends TestCase {
         $this->assertStringContainsString( '<img src="http://x/img.jpg" alt="">', $html );
     }
 
+    public function test_featured_image_renders_default_when_no_thumbnail(): void {
+        // No real thumbnail (imageId 0) but a resolved default image id: the
+        // Renderer renders the configured default via the attachment API (legacy
+        // default_image parity), never the post-thumbnail API.
+        Functions\when( 'wp_get_attachment_image' )->justReturn( '<img src="http://x/default.jpg" alt="">' );
+        $html = ( new Renderer() )->featuredImage( $this->view( array( 'effectiveImageId' => 77 ) ) );
+        $this->assertStringContainsString( 'sermonator-single__media', $html );
+        $this->assertStringContainsString( '<img src="http://x/default.jpg" alt="">', $html );
+    }
+
     public function test_bulletin_empty_when_no_url(): void {
         $this->assertSame( '', ( new Renderer() )->bulletin( $this->view() ) );
     }
@@ -223,6 +247,202 @@ final class RendererTest extends TestCase {
 
         $this->assertSame( 2, substr_count( $html, 'sermonator-scripture__ref' ) );
         $this->assertStringContainsString( 'Matthew 5:1-7:29', $html );
+    }
+
+    public function test_term_image_grid_empty_input_renders_nothing(): void {
+        $this->assertSame( '', ( new Renderer() )->termImageGrid( array(), 'Series', 3 ) );
+    }
+
+    public function test_term_image_grid_renders_linked_images_with_label_and_columns(): void {
+        $items = array(
+            array(
+                'name'        => 'Grace',
+                'url'         => 'http://x/series/grace',
+                'imageHtml'   => '<img src="http://x/grace.jpg" alt="Grace">',
+                'description' => '',
+            ),
+            array(
+                'name'        => 'Hope',
+                'url'         => '',
+                'imageHtml'   => '<img src="http://x/hope.jpg" alt="Hope">',
+                'description' => '',
+            ),
+        );
+        $html = ( new Renderer() )->termImageGrid( $items, 'Series', 4 );
+
+        $this->assertStringContainsString( '<ul class="sermonator-image-grid" data-columns="4">', $html );
+        $this->assertStringContainsString( 'sermonator-image-grid__label', $html );
+        $this->assertStringContainsString( 'Series', $html );
+        // Core attachment HTML is passed through verbatim (already-safe).
+        $this->assertStringContainsString( '<img src="http://x/grace.jpg" alt="Grace">', $html );
+        // Linked item links to its term url; the unlinked item is plain.
+        $this->assertStringContainsString( '<a href="http://x/series/grace">', $html );
+        $this->assertSame( 2, substr_count( $html, 'sermonator-image-grid__item' ) );
+    }
+
+    public function test_term_image_grid_clamps_columns(): void {
+        $items = array( array( 'name' => 'A', 'url' => '', 'imageHtml' => '', 'description' => '' ) );
+        $this->assertStringContainsString(
+            'data-columns="6"',
+            ( new Renderer() )->termImageGrid( $items, '', 99 )
+        );
+        $this->assertStringContainsString(
+            'data-columns="1"',
+            ( new Renderer() )->termImageGrid( $items, '', 0 )
+        );
+    }
+
+    public function test_term_image_grid_escapes_name_and_url(): void {
+        Functions\when( 'esc_html' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+        Functions\when( 'esc_url' )->alias(
+            static fn( $s ) => str_replace( array( '"', '<', '>' ), array( '%22', '%3C', '%3E' ), (string) $s )
+        );
+
+        $items = array(
+            array(
+                'name'        => 'Evil <script>alert(1)</script>',
+                'url'         => 'http://x/"><script>',
+                // Already-safe core HTML — passed through untouched.
+                'imageHtml'   => '<img src="http://x/i.jpg" alt="">',
+                'description' => '',
+            ),
+        );
+        $html = ( new Renderer() )->termImageGrid( $items, 'Series', 3 );
+
+        $this->assertStringNotContainsString( '<script>', $html );
+        $this->assertStringNotContainsString( '"><script>', $html );
+        $this->assertStringContainsString( '&lt;script&gt;', $html );
+        // The attachment HTML still passed through verbatim.
+        $this->assertStringContainsString( '<img src="http://x/i.jpg" alt="">', $html );
+    }
+
+    public function test_term_image_grid_respects_show_title_and_description_toggles(): void {
+        // wp_kses_post keeps safe inline HTML, strips disallowed tags.
+        Functions\when( 'wp_kses_post' )->alias(
+            static fn( $s ) => preg_replace( '#<script\b[^>]*>.*?</script>#is', '', (string) $s )
+        );
+
+        $items = array(
+            array(
+                'name'        => 'Grace',
+                'url'         => 'http://x/series/grace',
+                'imageHtml'   => '<img src="http://x/grace.jpg" alt="Grace">',
+                'description' => 'On <em>grace</em>.',
+            ),
+        );
+
+        // Default: title shown, description hidden.
+        $default = ( new Renderer() )->termImageGrid( $items, '', 3 );
+        $this->assertStringContainsString( 'sermonator-image-grid__name', $default );
+        $this->assertStringNotContainsString( 'sermonator-image-grid__description', $default );
+
+        // showTitle=false hides the per-item name.
+        $noTitle = ( new Renderer() )->termImageGrid( $items, '', 3, false, false );
+        $this->assertStringNotContainsString( 'sermonator-image-grid__name', $noTitle );
+        // The image still renders.
+        $this->assertStringContainsString( '<img src="http://x/grace.jpg" alt="Grace">', $noTitle );
+
+        // showDescription=true emits the wp_kses_post'd description.
+        $withDesc = ( new Renderer() )->termImageGrid( $items, '', 3, true, true );
+        $this->assertStringContainsString( 'sermonator-image-grid__description', $withDesc );
+        $this->assertStringContainsString( 'On <em>grace</em>.', $withDesc );
+    }
+
+    public function test_term_image_grid_kses_description_and_skips_empty(): void {
+        Functions\when( 'wp_kses_post' )->alias(
+            static fn( $s ) => preg_replace( '#<script\b[^>]*>.*?</script>#is', '', (string) $s )
+        );
+
+        $items = array(
+            // An item with an empty description emits no description wrapper even when shown.
+            array(
+                'name'        => 'Empty',
+                'url'         => '',
+                'imageHtml'   => '<img src="http://x/e.jpg" alt="">',
+                'description' => '',
+            ),
+            array(
+                'name'        => 'Dirty',
+                'url'         => '',
+                'imageHtml'   => '<img src="http://x/d.jpg" alt="">',
+                'description' => 'Keep <strong>this</strong><script>alert(1)</script>',
+            ),
+        );
+        $html = ( new Renderer() )->termImageGrid( $items, '', 3, true, true );
+
+        // Exactly one description wrapper (the empty one is skipped).
+        $this->assertSame( 1, substr_count( $html, 'sermonator-image-grid__description' ) );
+        // Disallowed tags are stripped; curated inline HTML survives.
+        $this->assertStringNotContainsString( '<script>', $html );
+        $this->assertStringContainsString( 'Keep <strong>this</strong>', $html );
+    }
+
+    public function test_latest_series_empty_input_renders_nothing(): void {
+        $r = new Renderer();
+        $this->assertSame( '', $r->latestSeries( array(), true, true ) );
+        $this->assertSame(
+            '',
+            $r->latestSeries(
+                array( 'name' => '', 'url' => 'http://x/s', 'imageHtml' => '<img>', 'description' => 'd' ),
+                true,
+                true
+            )
+        );
+    }
+
+    public function test_latest_series_renders_image_title_and_description(): void {
+        $item = array(
+            'name'        => 'Advent',
+            'url'         => 'http://x/series/advent',
+            'imageHtml'   => '<img src="http://x/advent.jpg" alt="Advent">',
+            'description' => 'A season of waiting.',
+        );
+        $html = ( new Renderer() )->latestSeries( $item, true, true );
+
+        $this->assertStringContainsString( 'sermonator-latest-series', $html );
+        $this->assertStringContainsString( '<img src="http://x/advent.jpg" alt="Advent">', $html );
+        $this->assertStringContainsString( '<a href="http://x/series/advent">Advent</a>', $html );
+        $this->assertStringContainsString( 'A season of waiting.', $html );
+    }
+
+    public function test_latest_series_respects_show_title_and_description_toggles(): void {
+        $item = array(
+            'name'        => 'Advent',
+            'url'         => 'http://x/series/advent',
+            'imageHtml'   => '<img src="http://x/advent.jpg" alt="Advent">',
+            'description' => 'A season of waiting.',
+        );
+        $html = ( new Renderer() )->latestSeries( $item, false, false );
+
+        $this->assertStringNotContainsString( 'sermonator-latest-series__title', $html );
+        $this->assertStringNotContainsString( 'sermonator-latest-series__description', $html );
+        // The image still renders even with both labels suppressed.
+        $this->assertStringContainsString( '<img src="http://x/advent.jpg" alt="Advent">', $html );
+    }
+
+    public function test_latest_series_escapes_title_url_and_kses_description(): void {
+        Functions\when( 'esc_html' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+        Functions\when( 'esc_url' )->alias(
+            static fn( $s ) => str_replace( array( '"', '<', '>' ), array( '%22', '%3C', '%3E' ), (string) $s )
+        );
+        // wp_kses_post strips disallowed tags (e.g. <script>) but keeps safe inline HTML.
+        Functions\when( 'wp_kses_post' )->alias(
+            static fn( $s ) => preg_replace( '#<script\b[^>]*>.*?</script>#is', '', (string) $s )
+        );
+
+        $item = array(
+            'name'        => 'Evil <script>alert(1)</script>',
+            'url'         => 'http://x/"><script>',
+            'imageHtml'   => '<img src="http://x/i.jpg" alt="">',
+            'description' => 'Safe <em>desc</em><script>alert(2)</script>',
+        );
+        $html = ( new Renderer() )->latestSeries( $item, true, true );
+
+        $this->assertStringNotContainsString( '<script>', $html );
+        $this->assertStringNotContainsString( '"><script>', $html );
+        $this->assertStringContainsString( '&lt;script&gt;', $html );
+        // Curated inline HTML in the description survives wp_kses_post.
+        $this->assertStringContainsString( 'Safe <em>desc</em>', $html );
     }
 
     public function test_scripture_escapes_label_url_and_badge(): void {

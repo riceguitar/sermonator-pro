@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Sermonator\Frontend;
 
+use Sermonator\Schema\DisplayDefaults;
 use Sermonator\Schema\Identifiers as ID;
 
 /**
@@ -16,6 +17,7 @@ final class TemplateData {
         $str = static fn( string $key ): string => (string) get_post_meta( $postId, $key, true );
 
         $rawDate = $str( ID::META_DATE );
+        $imageId = (int) $str( '_thumbnail_id' );
 
         return new SermonView(
             id:                $postId,
@@ -29,7 +31,7 @@ final class TemplateData {
             videoEmbed:        $str( ID::META_VIDEO_EMBED ),
             videoUrl:          $str( ID::META_VIDEO_URL ),
             views:             (int) $str( ID::META_VIEWS ),
-            imageId:           (int) $str( '_thumbnail_id' ),
+            imageId:           $imageId,
             bulletinUrl:       $str( ID::META_BULLETIN ),
             notes:             $str( ID::META_NOTES ),
             preachers:         $this->terms( $postId, ID::TAX_PREACHER ),
@@ -37,6 +39,23 @@ final class TemplateData {
             topics:            $this->terms( $postId, ID::TAX_TOPIC ),
             books:             $this->terms( $postId, ID::TAX_BOOK ),
             serviceTypes:      $this->terms( $postId, ID::TAX_SERVICE_TYPE ),
+            preacherLabel:     $this->preacherLabel(),
+            effectiveImageId:  ( new EffectiveImage() )->resolve( $imageId ),
+        );
+    }
+
+    /**
+     * Resolve the singular preacher meta-row label, read here (impurely) so the
+     * pure {@see Renderer} never touches `get_option`. Mirrors {@see \Sermonator\Model\Registrar}:
+     * the live {@see ID::OPTION_PREACHER_LABEL} option with an EXPLICIT
+     * {@see DisplayDefaults::preacherLabel()} fallback — `register_setting()`'s
+     * registered default is absent on the front end, so the explicit fallback is
+     * the only thing that seeds the value on this path.
+     */
+    private function preacherLabel(): string {
+        return (string) get_option(
+            ID::OPTION_PREACHER_LABEL,
+            DisplayDefaults::preacherLabel()
         );
     }
 

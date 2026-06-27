@@ -13,6 +13,8 @@ use Sermonator\Frontend\Blocks\NotesBlock;
 use Sermonator\Frontend\Blocks\SermonCardBlock;
 use Sermonator\Frontend\Blocks\SermonGridBlock;
 use Sermonator\Frontend\Blocks\TaxonomyFilterBlock;
+use Sermonator\Frontend\Blocks\SermonImagesBlock;
+use Sermonator\Frontend\Blocks\LatestSeriesBlock;
 use Sermonator\Frontend\Blocks\PodcastSubscribeBlock;
 use Sermonator\Frontend\Bible\ScriptureRenderHook;
 use Sermonator\Frontend\Feed\PodcastFeed;
@@ -59,6 +61,8 @@ final class FrontendServiceProvider {
         ( new SermonCardBlock() )->register();
         ( new SermonGridBlock() )->register();
         ( new TaxonomyFilterBlock() )->register();
+        ( new SermonImagesBlock() )->register();
+        ( new LatestSeriesBlock() )->register();
         ( new PodcastSubscribeBlock() )->register();
 
         ( new BlockTemplates() )->register();

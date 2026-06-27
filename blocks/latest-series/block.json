@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/latest-series",
+  "title": "Latest Series",
+  "category": "widgets",
+  "icon": "images-alt2",
+  "description": "The most-recently-preached sermon series as an image card with its title and description. \"Latest\" semantics are provisional and may need review.",
+  "textdomain": "sermonator",
+  "attributes": {
+    "size": { "type": "string", "default": "large" },
+    "showTitle": { "type": "boolean", "default": true },
+    "showDescription": { "type": "boolean", "default": true },
+    "serviceType": { "type": "string", "default": "" }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}

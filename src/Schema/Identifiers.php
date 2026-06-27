@@ -67,6 +67,32 @@ final class Identifiers {
     public const OPTION_BIBLE_REFS_BACKFILL_LOG = 'sermonator_bible_refs_backfill_log';
 
     /**
+     * Bundle 4 (Config & display) live option keys. On the shared
+     * {@see self::OPTION_GROUP_SETTINGS} group.
+     *
+     * `archive_slug` and `default_image_id` use DISTINCT live keys (note the
+     * `_sermon_` infix) — NOT the `sermonator_archive_slug` /
+     * `sermonator_default_image_id` migration prefix-swap artifacts. The
+     * migration's OptionMapper prefix-swaps every `sermonmanager_*` row and
+     * OptionWriter overwrites it verbatim on a supported (pre-Finalize) re-run;
+     * keeping the live keys distinct means a migration re-run only ever touches
+     * the artifact rows, never an admin's saved display config (and never fires a
+     * spurious rewrite flush). {@see \Sermonator\Schema\DisplayDefaults} seeds the
+     * live keys from those artifacts. `preacher_label` is the lone 1:1 key (a
+     * single cosmetic string; residual re-run reset is recorded in the design).
+     */
+    public const OPTION_ARCHIVE_SLUG            = 'sermonator_sermon_archive_slug';
+    public const OPTION_DEFAULT_IMAGE_ID        = 'sermonator_sermon_default_image_id';
+    public const OPTION_PREACHER_LABEL          = 'sermonator_preacher_label';
+
+    /**
+     * Persistent flag set by SlugRewriteFlusher ONLY on a real archive-slug value
+     * change; an `init@99` handler scoped to admin/cron flushes rewrite rules
+     * exactly once then clears it, so a front-end visitor never pays the flush.
+     */
+    public const OPTION_REWRITE_FLUSH_PENDING   = 'sermonator_rewrite_flush_pending';
+
+    /**
      * Durable legacy-podcast-id -> new-podcast-id map, the post-Finalize-safe
      * resolver for legacy podcast feed URLs. Unlike the Crosswalk LEGACY_POST_ID
      * back-ref meta (which the Finalizer strips), this option must survive Finalize

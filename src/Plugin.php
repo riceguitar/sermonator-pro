@@ -44,6 +44,22 @@ final class Plugin {
         ( new \Sermonator\Model\Capabilities() )->grant();
         ( new \Sermonator\Admin\Authoring\AuthoringServiceProvider() )->hook();
         ( new \Sermonator\Admin\SettingsRegistrar() )->hook();
+        ( new \Sermonator\Admin\DisplaySettingsRegistrar() )->hook();
+        // Deferred, change-only rewrite flush for the live archive-slug option.
+        // Wired unconditionally (like SettingsRegistrar): the add/update write
+        // listeners must catch a save in any context, while the init@99 flush
+        // self-scopes to admin/cron inside the handler so a front-end visitor
+        // never pays the flush. The live key is DISTINCT from the migration
+        // prefix-swap artifact, so a verbatim migration re-run never fires it.
+        ( new \Sermonator\Frontend\SlugRewriteFlusher() )->hook();
+        // Podcast-settings post-meta governance (auth_callback manage_options +
+        // sanitize-at-write allowlist). Registered on init in ALL contexts — NOT in
+        // the admin-only registerAdmin() — because the governance must guard the
+        // front-end/cron feed read path and the migration's own add_post_meta()
+        // writes, neither of which run under is_admin(). SettingsPage (Task 8) is
+        // add_submenu_page-scoped and cannot host this. show_in_rest=false closes
+        // the REST vector; register_post_meta is idempotent (a second call overwrites).
+        add_action( 'init', static fn() => \Sermonator\Schema\PodcastMetaSchema::register() );
         // Bible parse-coverage ground-truth audit. All-contexts on purpose: the daily
         // recompute cron (EVENT_HOOK) and the on-save recompute (save_post_<sermon>)
         // must fire outside admin, and the site_status_tests filter is a harmless pure
@@ -83,6 +99,16 @@ final class Plugin {
         ( new \Sermonator\Admin\MigrationController() )->hook();
         ( new \Sermonator\Admin\MigrationWizard() )->hook();
         ( new \Sermonator\Admin\LegacyDataNotice() )->hook();
+        // Settings-page Form 2 (podcast identity) admin-post.php handler. Admin-context
+        // only: the admin_post_* hook fires solely on admin-post.php, and the handler is
+        // phase-gated + nonce/cap-guarded before it writes through to the podcast meta.
+        ( new \Sermonator\Admin\PodcastIdentityController() )->hook();
+        // The one opinionated settings page (Bible + Display via Settings API Form 1,
+        // Podcast identity via admin-post Form 2). Admin-context only: add_submenu_page +
+        // add_settings_* + screen-scoped asset enqueue all belong to admin requests. It
+        // registers no option (Form 1's options are owned by SettingsRegistrar +
+        // DisplaySettingsRegistrar) and writes nothing itself.
+        ( new \Sermonator\Admin\SettingsPage() )->hook();
     }
 
     /**

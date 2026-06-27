@@ -89,6 +89,22 @@ final class OptionWriter {
             ++$written;
         }
 
+        // Schedule a deferred rewrite-rule flush ONLY when the migrated effective archive
+        // slug actually diverges from the hard default the CPT was activated under. The
+        // effective slug derives from the migrated sermonator_general container via
+        // DisplayDefaults::defaultArchiveSlug() (NOT the DISTINCT live OPTION_ARCHIVE_SLUG
+        // key the migration never writes). Without this, the activate-without-legacy →
+        // import-legacy-options → migrate ordering leaves the CPT re-registered under the
+        // migrated slug while the rewrite rules still encode 'sermons', 404ing the archive +
+        // single-sermon permalinks until a manual "Save Permalinks". When the slug is
+        // unchanged (the common drop-in case), NO flush is scheduled — preserving the
+        // no-spurious-flush guarantee. SlugRewriteFlusher's init@99 handler absorbs the flag
+        // and flushes exactly once on the next admin/cron request; nothing flushes inline
+        // here (the CPT is not yet re-registered under the new slug on THIS request).
+        if ( \Sermonator\Schema\DisplayDefaults::defaultArchiveSlug() !== \Sermonator\Schema\DisplayDefaults::HARD_ARCHIVE_SLUG ) {
+            update_option( Identifiers::OPTION_REWRITE_FLUSH_PENDING, true );
+        }
+
         return array(
             'written'   => $written,
             'backed_up' => $backedUp,

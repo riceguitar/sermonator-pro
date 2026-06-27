@@ -995,6 +995,48 @@ final class PodcastOptionWriterTest extends WP_UnitTestCase {
         );
     }
 
+    // --- SlugRewriteFlusher integration ------------------------------------------
+
+    /**
+     * After OptionWriter::migrate() the OPTION_REWRITE_FLUSH_PENDING flag must be
+     * set so SlugRewriteFlusher::maybeFlush() absorbs the migrated effective-slug
+     * change on the next admin/cron request. Without this flag a site that activates
+     * the plugin, then migrates (so the CPT re-registers under the slug embedded in
+     * sermonator_general), would 404 the archive + single-sermon permalinks until a
+     * manual "Save Permalinks" click.
+     */
+    public function test_migrate_sets_rewrite_flush_pending_flag(): void {
+        $this->fixture->setOption( 'sermonmanager_general', array( 'archive_slug' => 'messages' ) );
+
+        ( new OptionWriter() )->migrate();
+
+        $this->assertTrue(
+            (bool) get_option( Identifiers::OPTION_REWRITE_FLUSH_PENDING, false ),
+            'OptionWriter::migrate() must set OPTION_REWRITE_FLUSH_PENDING so the slug-driven rewrite flush is deferred to the next admin/cron request.'
+        );
+    }
+
+    /**
+     * The flag is also set on an idempotent re-run (migrate → migrate) — the second
+     * call must not silently drop it, so a self-heal re-run of the options phase still
+     * schedules the deferred flush.
+     */
+    public function test_migrate_rerun_keeps_rewrite_flush_pending_flag(): void {
+        $this->fixture->setOption( 'sermonmanager_general', array( 'archive_slug' => 'messages' ) );
+
+        $writer = new OptionWriter();
+        $writer->migrate();
+        // Clear the flag between runs to simulate it having been consumed.
+        delete_option( Identifiers::OPTION_REWRITE_FLUSH_PENDING );
+
+        $writer->migrate();
+
+        $this->assertTrue(
+            (bool) get_option( Identifiers::OPTION_REWRITE_FLUSH_PENDING, false ),
+            'A second OptionWriter::migrate() call must also set the flush-pending flag.'
+        );
+    }
+
     // ---
 
     public function test_legacy_options_untouched_byte_equal(): void {

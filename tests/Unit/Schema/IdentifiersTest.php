@@ -70,4 +70,22 @@ final class IdentifiersTest extends TestCase {
     public function test_meta_keys_include_bible_refs(): void {
         $this->assertContains( Identifiers::META_BIBLE_REFS, Identifiers::metaKeys() );
     }
+
+    public function test_bundle4_config_option_constants(): void {
+        // DISTINCT live keys (note the `_sermon_` infix) — NOT the
+        // `sermonator_archive_slug` / `sermonator_default_image_id` migration
+        // prefix-swap artifacts a re-run would clobber. `preacher_label` is 1:1.
+        $this->assertSame( 'sermonator_sermon_archive_slug', Identifiers::OPTION_ARCHIVE_SLUG );
+        $this->assertSame( 'sermonator_sermon_default_image_id', Identifiers::OPTION_DEFAULT_IMAGE_ID );
+        $this->assertSame( 'sermonator_preacher_label', Identifiers::OPTION_PREACHER_LABEL );
+        $this->assertSame( 'sermonator_rewrite_flush_pending', Identifiers::OPTION_REWRITE_FLUSH_PENDING );
+    }
+
+    public function test_bundle4_live_keys_are_not_the_migration_artifacts(): void {
+        // The provenance-boundary invariant: the live keys must differ from the
+        // prefix-swap artifact keys DisplayDefaults seeds them from, or a
+        // migration re-run's OptionWriter would overwrite a saved admin edit.
+        $this->assertNotSame( Identifiers::OPTION_PREFIX . 'archive_slug', Identifiers::OPTION_ARCHIVE_SLUG );
+        $this->assertNotSame( Identifiers::OPTION_PREFIX . 'default_image_id', Identifiers::OPTION_DEFAULT_IMAGE_ID );
+    }
 }
