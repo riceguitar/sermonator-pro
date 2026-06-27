@@ -266,6 +266,24 @@ final class SettingsRegistrar {
             return false;
         }
 
+        // No-op re-save guard (adversarial-review fix): WordPress runs this sanitize_callback
+        // on EVERY save of the shared {@see Identifiers::OPTION_GROUP_SETTINGS} group — a
+        // checked checkbox is always re-submitted, and update_option() runs the registered
+        // sanitize_callback BEFORE its old==new short-circuit. Without this guard, an unrelated
+        // settings save (e.g. only the link version) while inline is ALREADY enabled would, on
+        // every save: re-run the full corpus audit; re-stamp OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN
+        // (erasing the enable-moment baseline T-K's drift warning reconciles against); thrash the
+        // warmed-chapter cache via bumpCacheGen(); and — worst — SILENTLY flip inline OFF if the
+        // corpus had drifted since enable (heterogeneous / inline_eligible==0 / wrong-text>0).
+        // The hard/soft gates, recon stamp, and cache-gen bump must run ONLY on the genuine
+        // false->true enable transition; post-enable corpus drift is a Site-Health WARNING (T-K),
+        // never a side effect of saving an unrelated field. Reading the stored value first makes
+        // this independent of the add/update_option_ hook wiring (the intended explicit bump on
+        // the real transition is preserved below).
+        if ( self::toBool( get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false ) ) ) {
+            return true;
+        }
+
         $translation = $this->currentInlineTranslation();
 
         // Hard-gate (design §3.4): the offline snapshot must be fully vendored + warmed,
@@ -329,6 +347,17 @@ final class SettingsRegistrar {
     public function sanitizeAttestation( $value ): bool {
         if ( ! self::toBool( $value ) ) {
             return false;
+        }
+
+        // No-op re-save guard (adversarial-review fix), mirroring sanitizeInlineEnabled: the
+        // shared settings group re-submits the checked attestation box on EVERY save, and the
+        // sanitize_callback runs before update_option()'s old==new short-circuit. Without this,
+        // an unrelated save while attestation is ALREADY true re-runs the full corpus audit and
+        // SILENTLY withdraws attestation if the corpus has since drifted heterogeneous. Post-attest
+        // drift is surfaced via the audit/Site Health, never auto-withdrawn on an unrelated save;
+        // the heterogeneity hard-disable below applies only to the genuine false->true transition.
+        if ( self::toBool( get_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false ) ) ) {
+            return true;
         }
 
         if ( ! empty( ( $this->inlineAudit )()['heterogeneous'] ) ) {

@@ -268,6 +268,85 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         $this->assertSame( 3, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
     }
 
+    // --- Task G fix: no-op re-save while ALREADY enabled ----------------------
+
+    public function test_resave_while_enabled_does_not_restamp_or_rebump_or_disable(): void {
+        // Adversarial-review fix: WordPress re-submits the checked enable box on EVERY save of the
+        // shared settings group and runs the sanitize_callback before update_option()'s old==new
+        // short-circuit. A re-save while inline is ALREADY enabled must be inert: it must NOT
+        // re-stamp the reconciliation generation, NOT re-bump the cache generation, and NOT
+        // silently disable inline even when the corpus has since drifted heterogeneous.
+        $this->vendorCompleteSnapshot();
+        $this->seedEligibleSermon();
+
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, true );
+        $this->assertTrue(
+            (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false ),
+            'Precondition: the genuine false->true enable must be honored.'
+        );
+
+        $stampAtEnable = (int) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 );
+        $genAtEnable   = (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN, 0 );
+        $this->assertGreaterThan( 0, $stampAtEnable, 'Precondition: the enable stamped a recon generation.' );
+
+        // Drift the corpus AFTER enable: add a second source-versification family bucket so a
+        // fresh audit would now report heterogeneous (and would refuse a first-time enable).
+        $this->seedSermon( 'Psalm 23:1', array(
+            'bookUSFM' => 'PSA', 'chapterStart' => 23, 'verseStart' => 1,
+            'verseEnd' => null, 'chapterEnd' => null, 'raw' => 'Psalm 23:1',
+            'confidence' => 'exact', 'srcVersificationConfidence' => 'authored',
+        ) );
+
+        // Re-submit the (unchanged) enabled=true value, simulating an unrelated group save.
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, true );
+
+        $this->assertTrue(
+            (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false ),
+            'A re-save while enabled must NOT silently disable inline on post-enable corpus drift.'
+        );
+        $this->assertSame(
+            $stampAtEnable,
+            (int) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 ),
+            'A re-save while enabled must NOT re-stamp the reconciliation generation (the T-K drift baseline).'
+        );
+        $this->assertSame(
+            $genAtEnable,
+            (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN, 0 ),
+            'A re-save while enabled must NOT re-bump the cache generation (no warm-cache thrash).'
+        );
+        $this->assertEmpty(
+            get_settings_errors( Identifiers::OPTION_BIBLE_INLINE_ENABLED ),
+            'A no-op re-save while enabled must surface no settings error.'
+        );
+    }
+
+    public function test_resave_while_attested_does_not_withdraw_on_drift(): void {
+        // Mirror of the enable guard for attestation: a re-save while attestation is ALREADY true
+        // must not re-run the audit and must not silently withdraw the attestation when the corpus
+        // has since drifted heterogeneous.
+        $this->seedEligibleSermon();
+
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, true );
+        $this->assertTrue(
+            (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false ),
+            'Precondition: the genuine false->true attestation must be honored on a homogeneous corpus.'
+        );
+
+        // Drift heterogeneous after attesting.
+        $this->seedSermon( 'Psalm 23:1', array(
+            'bookUSFM' => 'PSA', 'chapterStart' => 23, 'verseStart' => 1,
+            'verseEnd' => null, 'chapterEnd' => null, 'raw' => 'Psalm 23:1',
+            'confidence' => 'exact', 'srcVersificationConfidence' => 'authored',
+        ) );
+
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, true );
+
+        $this->assertTrue(
+            (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false ),
+            'A re-save while attested must NOT silently withdraw attestation on post-attest drift.'
+        );
+    }
+
     // --- Phase 3b: attestation + confidence-floor sanitize -------------------
 
     public function test_attestation_persists_as_boolean(): void {

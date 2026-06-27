@@ -480,6 +480,95 @@ final class SettingsRegistrarTest extends TestCase {
         $this->assertFalse( $audited, 'The soft audit gate must not run when the snapshot is incomplete.' );
     }
 
+    public function test_inline_enable_resave_while_already_enabled_is_a_noop(): void {
+        // Adversarial-review fix: the shared settings group re-submits the checked enable box on
+        // EVERY save, and the sanitize_callback runs before update_option()'s old==new short-circuit.
+        // While inline is ALREADY enabled, a re-save must NOT re-run the snapshot probe, NOT re-run
+        // the corpus audit, NOT re-stamp the reconciliation generation, and NOT re-bump the cache
+        // generation — it just keeps the stored true.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_BIBLE_INLINE_ENABLED ? true : $default;
+            }
+        );
+        Functions\expect( 'update_option' )->never();
+        Functions\expect( 'add_settings_error' )->never();
+
+        $probed  = false;
+        $audited = false;
+        $registrar = new SettingsRegistrar(
+            static function ( string $translation ) use ( &$probed ): bool {
+                $probed = true;
+                return true;
+            },
+            static function () use ( &$audited ): array {
+                $audited = true;
+                return self::passingInlineAudit();
+            }
+        );
+
+        $this->assertTrue( $registrar->sanitizeInlineEnabled( '1' ) );
+        $this->assertTrue( $registrar->sanitizeInlineEnabled( true ) );
+        $this->assertFalse( $probed, 'A re-save while already enabled must not re-probe the snapshot.' );
+        $this->assertFalse( $audited, 'A re-save while already enabled must not re-run the corpus audit.' );
+    }
+
+    public function test_inline_enable_resave_does_not_disable_on_corpus_drift(): void {
+        // The critical safety property: an UNRELATED settings save while inline is already enabled
+        // must NOT silently flip inline OFF even if the corpus has since drifted (heterogeneous,
+        // zero eligible, or unmodeled wrong-text) AND even if the snapshot probe would now fail.
+        // The short-circuit returns true BEFORE any gate runs; drift is a Site-Health warning (T-K).
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_BIBLE_INLINE_ENABLED ? true : $default;
+            }
+        );
+        Functions\expect( 'add_settings_error' )->never();
+        Functions\expect( 'update_option' )->never();
+
+        $registrar = new SettingsRegistrar(
+            // Snapshot would now FAIL the hard gate …
+            static fn( string $translation ): bool => false,
+            // … and the corpus would now FAIL every soft-gate signal.
+            static fn(): array => self::passingInlineAudit( array(
+                'inline_eligible'           => 0,
+                'unmodeled_pair_wrong_text' => 5,
+                'heterogeneous'             => true,
+            ) )
+        );
+
+        $this->assertTrue(
+            $registrar->sanitizeInlineEnabled( '1' ),
+            'A re-save while enabled must keep inline ON despite post-enable corpus drift.'
+        );
+    }
+
+    public function test_attestation_resave_while_already_attested_is_a_noop(): void {
+        // Mirror of the enable guard: re-saving the (already true) attestation box on an unrelated
+        // settings save must NOT re-run the corpus audit nor silently withdraw attestation if the
+        // corpus has since drifted heterogeneous.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_BIBLE_INLINE_ATTESTATION ? true : $default;
+            }
+        );
+        Functions\expect( 'add_settings_error' )->never();
+
+        $audited = false;
+        $registrar = new SettingsRegistrar(
+            null,
+            static function () use ( &$audited ): array {
+                $audited = true;
+                // Even a now-heterogeneous corpus must not withdraw the standing attestation here.
+                return self::passingInlineAudit( array( 'heterogeneous' => true ) );
+            }
+        );
+
+        $this->assertTrue( $registrar->sanitizeAttestation( '1' ) );
+        $this->assertTrue( $registrar->sanitizeAttestation( true ) );
+        $this->assertFalse( $audited, 'A re-save while already attested must not re-run the corpus audit.' );
+    }
+
     /**
      * Drive sanitizeInlineEnabled with a snapshot-complete site and the given audit, and
      * assert the enable is refused (sanitized to false) with the soft-gate settings error.
