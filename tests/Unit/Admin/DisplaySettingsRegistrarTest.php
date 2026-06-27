@@ -38,6 +38,12 @@ final class DisplaySettingsRegistrarTest extends TestCase {
             static fn( string $name, $default = false ) => $default
         );
         Functions\when( 'get_post_type' )->justReturn( false );
+        // Default stubs for output-only WP functions that the sanitize callbacks
+        // call on rejection (individual tests that need to assert call counts /
+        // arguments override these with expect() instead).
+        Functions\when( '__' )->returnArg();
+        Functions\when( 'add_settings_error' )->justReturn( null );
+        Functions\when( 'esc_html' )->alias( static fn( string $v ): string => $v );
     }
 
     protected function tearDown(): void {
@@ -68,6 +74,24 @@ final class DisplaySettingsRegistrarTest extends TestCase {
         $this->assertSame( 'messages', $this->registrar()->sanitizeArchiveSlug( '!!!' ) );
     }
 
+    public function test_slug_sanitize_empty_adds_settings_error(): void {
+        // On rejection the admin must receive a settings error so options.php does
+        // not display "Settings saved." while silently keeping the old value.
+        $errors = array();
+        Functions\when( 'add_settings_error' )->alias(
+            static function ( string $setting, string $code, string $message, string $type = 'error' ) use ( &$errors ): void {
+                $errors[] = array( 'setting' => $setting, 'code' => $code, 'type' => $type );
+            }
+        );
+
+        $this->registrar()->sanitizeArchiveSlug( '   ' );
+
+        $this->assertNotEmpty( $errors, 'An empty submission must call add_settings_error()' );
+        $this->assertSame( Identifiers::OPTION_ARCHIVE_SLUG, $errors[0]['setting'] );
+        $this->assertSame( 'sermonator_slug_empty', $errors[0]['code'] );
+        $this->assertSame( 'error', $errors[0]['type'] );
+    }
+
     public function test_slug_sanitize_rejects_reserved_term_to_stored_value(): void {
         Functions\when( 'get_option' )->alias(
             static function ( string $name, $default = false ) {
@@ -85,6 +109,23 @@ final class DisplaySettingsRegistrarTest extends TestCase {
         }
     }
 
+    public function test_slug_sanitize_reserved_adds_settings_error(): void {
+        Functions\when( 'get_option' )->alias(
+            static fn( string $name, $default = false ) => $default
+        );
+
+        $codes = array();
+        Functions\when( 'add_settings_error' )->alias(
+            static function ( string $setting, string $code ) use ( &$codes ): void {
+                $codes[] = $code;
+            }
+        );
+
+        $this->registrar()->sanitizeArchiveSlug( 'feed' );
+
+        $this->assertContains( 'sermonator_slug_reserved', $codes, 'A reserved slug submission must call add_settings_error() with sermonator_slug_reserved code' );
+    }
+
     public function test_slug_sanitize_rejects_page_collision_to_stored_value(): void {
         Functions\when( 'get_page_by_path' )->justReturn( (object) array( 'ID' => 42 ) );
         Functions\when( 'get_option' )->alias(
@@ -94,6 +135,24 @@ final class DisplaySettingsRegistrarTest extends TestCase {
         );
 
         $this->assertSame( 'sermons', $this->registrar()->sanitizeArchiveSlug( 'about' ) );
+    }
+
+    public function test_slug_sanitize_page_collision_adds_settings_error(): void {
+        Functions\when( 'get_page_by_path' )->justReturn( (object) array( 'ID' => 42 ) );
+        Functions\when( 'get_option' )->alias(
+            static fn( string $name, $default = false ) => $default
+        );
+
+        $codes = array();
+        Functions\when( 'add_settings_error' )->alias(
+            static function ( string $setting, string $code ) use ( &$codes ): void {
+                $codes[] = $code;
+            }
+        );
+
+        $this->registrar()->sanitizeArchiveSlug( 'about' );
+
+        $this->assertContains( 'sermonator_slug_page_collision', $codes, 'A page-colliding slug submission must call add_settings_error() with sermonator_slug_page_collision code' );
     }
 
     public function test_slug_rejection_falls_back_to_display_default_when_nothing_stored(): void {

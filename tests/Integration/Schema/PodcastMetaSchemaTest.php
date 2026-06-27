@@ -147,19 +147,47 @@ final class PodcastMetaSchemaTest extends WP_UnitTestCase {
     // --- shared catalog keeps reader + writer in agreement -------------------
 
     public function test_factory_reads_only_catalog_keys_from_persisted_meta(): void {
-        // Persist directly (bypassing the registered sanitizer via low-level add) so we prove the
-        // factory's own catalog intersection drops a stray key even on an unsanitized legacy row.
-        update_post_meta( $this->podcastId, ID::META_PODCAST_SETTINGS, array(
-            'author'      => 'Example Church',
-            'summary'     => 'Weekly teaching.',
-            'owner_email' => 'podcast@example.com',
-        ) );
+        // Persist a STRAY/unknown key by writing directly to wp_postmeta via $wpdb,
+        // bypassing the registered sanitize_callback entirely. update_post_meta() would
+        // run the sanitize filter (which itself preserves but hardens unknown keys without
+        // emitting them to the feed), so this path is the only one that exercises the
+        // factory's READ-SIDE catalog intersection: the defense that drops an unknown key
+        // even on a completely unsanitized legacy row before it can reach the public feed.
+        global $wpdb;
+        $wpdb->insert(
+            $wpdb->postmeta,
+            array(
+                'post_id'    => $this->podcastId,
+                'meta_key'   => ID::META_PODCAST_SETTINGS,
+                'meta_value' => maybe_serialize( array(
+                    'author'      => 'Example Church',
+                    'summary'     => 'Weekly teaching.',
+                    'owner_email' => 'podcast@example.com',
+                    'stray_key'   => '<script>feed_injection_attempt</script>',
+                ) ),
+            ),
+            array( '%d', '%s', '%s' )
+        );
+        // Bust the meta cache so get_post_meta() reads the freshly-inserted raw row.
+        wp_cache_delete( $this->podcastId, 'post_meta' );
 
         $config = ( new PodcastConfigFactory() )->fromPost( $this->podcastId, 'http://example.com/feed/' );
 
+        // Catalog keys are resolved correctly through the factory.
         $this->assertSame( 'Example Church', $config->author );
         $this->assertSame( 'Weekly teaching.', $config->summary );
         $this->assertSame( 'podcast@example.com', $config->ownerEmail );
+
+        // The stray/unknown key must NOT reach the PodcastConfig output — the factory's
+        // array_intersect_key() against the shared catalog drops it before any property
+        // is set, so the injected value can never appear in the feed channel.
+        foreach ( get_object_vars( $config ) as $configValue ) {
+            $this->assertNotSame(
+                '<script>feed_injection_attempt</script>',
+                $configValue,
+                'Stray meta key value must not appear in PodcastConfig output (catalog intersection at read must drop it).'
+            );
+        }
     }
 
     public function test_catalog_keys_match_factory_expectations(): void {
@@ -169,7 +197,4 @@ final class PodcastMetaSchemaTest extends WP_UnitTestCase {
         }
     }
 
-    private function metaKey(): string {
-        return ID::META_PODCAST_SETTINGS;
-    }
 }

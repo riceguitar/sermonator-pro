@@ -138,7 +138,41 @@ final class DisplaySettingsRegistrar {
     public function sanitizeArchiveSlug( $value ): string {
         $slug = sanitize_title( is_string( $value ) ? $value : '' );
 
-        if ( '' === $slug || $this->isReservedSlug( $slug ) || $this->collidesWithPage( $slug ) ) {
+        if ( '' === $slug ) {
+            add_settings_error(
+                Identifiers::OPTION_ARCHIVE_SLUG,
+                'sermonator_slug_empty',
+                __( 'Archive slug not saved: the submitted value is empty or contains only invalid characters. The current slug is kept.', 'sermonator' ),
+                'error'
+            );
+            return $this->storedArchiveSlug();
+        }
+
+        if ( $this->isReservedSlug( $slug ) ) {
+            add_settings_error(
+                Identifiers::OPTION_ARCHIVE_SLUG,
+                'sermonator_slug_reserved',
+                sprintf(
+                    /* translators: %s: the submitted slug value */
+                    __( 'Archive slug not saved: "%s" is a WordPress-reserved term and would break core routing. The current slug is kept.', 'sermonator' ),
+                    esc_html( $slug )
+                ),
+                'error'
+            );
+            return $this->storedArchiveSlug();
+        }
+
+        if ( $this->collidesWithPage( $slug ) ) {
+            add_settings_error(
+                Identifiers::OPTION_ARCHIVE_SLUG,
+                'sermonator_slug_page_collision',
+                sprintf(
+                    /* translators: %s: the submitted slug value */
+                    __( 'Archive slug not saved: "%s" collides with an existing page URL. The current slug is kept.', 'sermonator' ),
+                    esc_html( $slug )
+                ),
+                'error'
+            );
             return $this->storedArchiveSlug();
         }
 

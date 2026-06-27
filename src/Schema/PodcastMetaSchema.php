@@ -113,10 +113,12 @@ final class PodcastMetaSchema {
     }
 
     /**
-     * Register the podcast-settings post meta with auth + sanitize governance. Intended to be
-     * hooked on `init` (mirroring the sermon meta registration) — see the class-level @todo: this
-     * is not yet wired in production; Bundle 4 Task 7/8 owns that. Idempotent: WordPress treats a
-     * second registration of the same key as an overwrite.
+     * Register the podcast-settings post meta with auth + sanitize governance. Hooked on `init`
+     * unconditionally in {@see \Sermonator\Plugin::boot()} (mirroring the sermon meta registration
+     * via AuthoringServiceProvider), so it runs in admin, front-end, cron, and CLI contexts — the
+     * governance guards the feed read path and the migration's own add_post_meta(), neither of which
+     * runs under is_admin(). Idempotent: WordPress treats a second registration of the same key as
+     * an overwrite.
      */
     public static function register(): void {
         register_post_meta(

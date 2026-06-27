@@ -12,8 +12,11 @@ use Sermonator\Schema\Identifiers as ID;
  * (Bundle 4, spec §1.7 / Task 5): the REAL post thumbnail when one is set,
  * otherwise the configured site-wide default image — restoring legacy
  * `default_image` parity (Sermon Manager rendered a fallback when a sermon had no
- * thumbnail). The single resolver is reused by BOTH the single-sermon
- * featured-image fallback and the term images grid, so the two never drift.
+ * thumbnail). The resolver is consumed by {@see \Sermonator\Frontend\TemplateData}
+ * for the single-sermon featured-image fallback and by admin settings resolution.
+ * (Term-images grid entries are resolved directly from
+ * {@see \Sermonator\Schema\Identifiers::OPTION_TERM_IMAGES}[tt_id] per taxonomy
+ * term — they do not go through this class.)
  *
  * IMPURITY IS DELIBERATELY HERE, NOT IN THE RENDERER. The default id is read from
  * the live {@see ID::OPTION_DEFAULT_IMAGE_ID}; a STORED value is honored verbatim

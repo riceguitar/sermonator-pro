@@ -333,10 +333,10 @@ final class SettingsPage {
             echo wp_get_attachment_image( $current, 'thumbnail' ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- core builds safe markup.
         }
         echo '</div>';
-        echo '<input type="hidden" id="' . esc_attr( Identifiers::OPTION_DEFAULT_IMAGE_ID ) . '" name="' . esc_attr( Identifiers::OPTION_DEFAULT_IMAGE_ID ) . '" value="' . esc_attr( (string) $current ) . '">';
+        echo '<input type="number" min="0" style="width:8em;" class="sermonator-default-image-id" id="' . esc_attr( Identifiers::OPTION_DEFAULT_IMAGE_ID ) . '" name="' . esc_attr( Identifiers::OPTION_DEFAULT_IMAGE_ID ) . '" value="' . esc_attr( (string) $current ) . '">';
         echo '<button type="button" class="button" id="sermonator-default-image-select">' . esc_html__( 'Select image', 'sermonator' ) . '</button> ';
         echo '<button type="button" class="button button-link-delete" id="sermonator-default-image-remove"' . ( $hasImg ? '' : ' hidden' ) . '>' . esc_html__( 'Remove image', 'sermonator' ) . '</button>';
-        echo '<p class="description">' . esc_html__( 'Shown when a sermon (or series) has no image of its own. Without JavaScript, enter an attachment ID.', 'sermonator' ) . '</p>';
+        echo '<p class="description">' . esc_html__( 'Shown when a sermon (or series) has no image of its own. Enter an attachment ID, or use the button to pick one.', 'sermonator' ) . '</p>';
         echo '</div>';
     }
 
