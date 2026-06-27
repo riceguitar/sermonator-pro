@@ -518,7 +518,8 @@ final class BibleCommandTest extends WP_UnitTestCase {
 
         $live = $this->seedInlineRollup( array( 'refs_total' => 5, 'inline_eligible' => 5 ) );
 
-        $this->command->audit( array(), array( 'inline' => true ) );
+        // Reconcile is an explicit opt-in now (plain `audit --inline` is read-only).
+        $this->command->audit( array(), array( 'inline' => true, 'reconcile' => true ) );
 
         // The stamp is re-written to the current (safe) corpus signature → drift clears.
         $this->assertSame(
@@ -540,7 +541,8 @@ final class BibleCommandTest extends WP_UnitTestCase {
             'heterogeneous' => true,
         ) );
 
-        $this->command->audit( array(), array( 'inline' => true ) );
+        // Reconcile is explicitly requested, but the unsafe (heterogeneous) corpus is refused.
+        $this->command->audit( array(), array( 'inline' => true, 'reconcile' => true ) );
 
         // The stamp is NOT advanced — a re-audit must never silently bless an unsafe corpus.
         $this->assertSame( $stamp, get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ) );
