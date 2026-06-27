@@ -49,19 +49,19 @@ final class DefaultImageTest extends WP_UnitTestCase {
     }
 
     /** Create a real attachment in the media library and return its id. */
-    private function newAttachment(): int {
+    private function newAttachment( string $filename = 'site-default.jpg' ): int {
         return (int) self::factory()->attachment->create_object(
-            'default.jpg',
+            $filename,
             0,
             array( 'post_mime_type' => 'image/jpeg', 'post_type' => 'attachment' )
         );
     }
 
     public function test_real_thumbnail_wins_over_configured_default(): void {
-        $defaultId = $this->newAttachment();
+        $defaultId = $this->newAttachment( 'site-default.jpg' );
         update_option( Identifiers::OPTION_DEFAULT_IMAGE_ID, $defaultId );
 
-        $thumbId = $this->newAttachment();
+        $thumbId = $this->newAttachment( 'post-thumb.jpg' );
         $postId  = $this->newSermon();
         set_post_thumbnail( $postId, $thumbId );
 

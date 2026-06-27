@@ -133,7 +133,10 @@ final class SettingsPageTest extends WP_UnitTestCase {
         $after = array_keys( $wp_registered_settings );
         $this->assertSame( $before, $after, 'SettingsPage must not register (or re-register) any option.' );
 
-        $group = $allowed_options[ Identifiers::OPTION_GROUP_SETTINGS ] ?? array();
+        // WP 5.5+ populates $new_allowed_options (the staging area) when register_setting()
+        // is called; $allowed_options is only populated when options.php processes a form
+        // submission, which never happens in a unit test.
+        $group = $new_allowed_options[ Identifiers::OPTION_GROUP_SETTINGS ] ?? array();
         $this->assertContains( Identifiers::OPTION_BIBLE_LINK_VERSION, $group );
         $this->assertContains( Identifiers::OPTION_BIBLE_INLINE_TRANSLATION, $group );
         $this->assertContains( Identifiers::OPTION_ARCHIVE_SLUG, $group );
@@ -146,12 +149,24 @@ final class SettingsPageTest extends WP_UnitTestCase {
     // -------------------------------------------------------------------------
 
     public function test_render_emits_both_forms_with_correct_actions(): void {
-        ( new SettingsPage() )->registerSections();
-        $html = $this->renderToString( new SettingsPage() );
+        // A finalized migration makes the podcast section editable (Form 2 renders its
+        // fields + nonce rather than the read-only "configure after migration" notice).
+        // Use ONE instance: the section callbacks close over $this->podcastReadOnly, which
+        // render() resolves — registering on one instance and rendering on another desyncs it.
+        update_option( Identifiers::OPTION_MIGRATION_STATE, array( 'phase' => 'finalized' ) );
+        $page = new SettingsPage();
+        $page->registerSections();
+        $html = $this->renderToString( $page );
 
         // Form 1 → options.php (Settings API).
         $this->assertStringContainsString( 'action="options.php"', $html );
-        $this->assertStringContainsString( 'name="' . Identifiers::OPTION_GROUP_SETTINGS . '"', $html, 'settings_fields hidden option-group input present.' );
+        // settings_fields() outputs <input type='hidden' name='option_page' value='$group' />
+        // — WP core uses SINGLE quotes, so match quote-agnostically.
+        $this->assertMatchesRegularExpression(
+            '/name=[\'"]option_page[\'"]\s+value=[\'"]' . preg_quote( Identifiers::OPTION_GROUP_SETTINGS, '/' ) . '[\'"]/',
+            $html,
+            'settings_fields hidden option-group input present.'
+        );
 
         // Form 2 → admin-post.php with the controller action + nonce.
         $this->assertStringContainsString( 'admin-post.php', $html );
@@ -183,8 +198,11 @@ final class SettingsPageTest extends WP_UnitTestCase {
         $this->fixture->createSermon();              // legacy data present
         ( new MigrationState() )->set( 'detected' ); // phase != finalized
 
-        ( new SettingsPage() )->registerSections();
-        $html = $this->renderToString( new SettingsPage() );
+        // Use the SAME instance for registerSections() and render(): section callbacks
+        // close over $this so they must share the instance that resolves podcastReadOnly.
+        $page = new SettingsPage();
+        $page->registerSections();
+        $html = $this->renderToString( $page );
 
         $this->assertStringContainsString( 'after the migration completes', $html );
         // Read-only: podcast inputs are disabled and there is no podcast submit button.
@@ -214,8 +232,11 @@ final class SettingsPageTest extends WP_UnitTestCase {
         ) );
         update_option( Identifiers::OPTION_DEFAULT_PODCAST, $podcastId );
 
-        ( new SettingsPage() )->registerSections();
-        $html = $this->renderToString( new SettingsPage() );
+        // Use the SAME instance for registerSections() and render(): section callbacks
+        // close over $this so they must share the instance that resolves podcastSettings.
+        $page = new SettingsPage();
+        $page->registerSections();
+        $html = $this->renderToString( $page );
 
         $this->assertStringContainsString( 'value="Grace Sermons"', $html );
         $this->assertStringContainsString( 'value="pastor@example.com"', $html );
@@ -256,8 +277,11 @@ final class SettingsPageTest extends WP_UnitTestCase {
         $this->fixture->createSermon();              // legacy data present
         ( new MigrationState() )->set( 'detected' ); // phase != finalized
 
-        ( new SettingsPage() )->registerSections();
-        $html = $this->renderToString( new SettingsPage() );
+        // Use the SAME instance for registerSections() and render(): section callbacks
+        // close over $this so they must share the instance that resolves podcastReadOnly.
+        $page = new SettingsPage();
+        $page->registerSections();
+        $html = $this->renderToString( $page );
 
         $this->assertStringNotContainsString(
             '<input type="hidden" name="explicit" value="0">',

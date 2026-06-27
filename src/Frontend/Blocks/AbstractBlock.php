@@ -21,6 +21,13 @@ abstract class AbstractBlock {
     abstract public function render( array $attributes, string $content, \WP_Block $block ): string;
 
     public function register(): void {
+        // Idempotent: init can fire more than once (e.g. a re-dispatch in tests, or another
+        // plugin re-running it), and a second register_block_type() for an already-registered
+        // name triggers a _doing_it_wrong() notice. Guard so re-registration is a safe no-op.
+        if ( \WP_Block_Type_Registry::get_instance()->is_registered( $this->name() ) ) {
+            return;
+        }
+
         $slug = (string) preg_replace( '#^sermonator/#', '', $this->name() );
         register_block_type(
             dirname( SERMONATOR_FILE ) . '/blocks/' . $slug,

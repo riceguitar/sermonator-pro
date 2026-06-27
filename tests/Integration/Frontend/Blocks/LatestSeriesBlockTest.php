@@ -89,7 +89,10 @@ final class LatestSeriesBlockTest extends WP_UnitTestCase {
 
         $this->assertStringContainsString( 'sermonator-latest-series', $html );
         $this->assertStringContainsString( 'Latest Series', $html );
-        $this->assertStringContainsString( 'wp-image-' . $attId, $html );
+        // Check for the image URL rather than the wp-image-{id} CSS class: the class is
+        // an editor/content artifact whose presence depends on WP version and environment.
+        // The src URL is what actually proves the correct attachment was rendered.
+        $this->assertStringContainsString( (string) wp_get_attachment_image_url( $attId, 'large' ), $html );
         $this->assertStringNotContainsString( 'Old Series', $html );
     }
 

@@ -119,9 +119,19 @@ final class DisplaySettingsRegistrarTest extends WP_UnitTestCase {
     }
 
     public function test_register_does_not_register_the_bible_options(): void {
-        // Baseline: only DisplaySettingsRegistrar has run (setUp); SettingsRegistrar
-        // — the sole owner of the two Bible options — has NOT run in this test.
-        global $wp_registered_settings;
+        // Reset all settings globals to neutralise any boot-wired registrations that
+        // fired on admin_init during the test bootstrap (SettingsRegistrar is hooked
+        // on admin_init, which may run in the wp-env integration context). After the
+        // reset, register DisplaySettingsRegistrar once so $before reflects exactly
+        // the three Display keys — no Bible keys, no other churn.
+        global $wp_registered_settings, $new_allowed_options, $allowed_options;
+        $wp_registered_settings = array();
+        $new_allowed_options    = array();
+        $allowed_options        = array();
+
+        ( new DisplaySettingsRegistrar() )->register();
+
+        // Baseline: only the three Display keys are present (no Bible keys).
         $before = array_keys( (array) $wp_registered_settings );
 
         // Re-running register() is idempotent for our three keys and must never

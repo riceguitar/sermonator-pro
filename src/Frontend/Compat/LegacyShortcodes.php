@@ -171,21 +171,21 @@ final class LegacyShortcodes {
     /** Per-tag review notice for [list_sermons] — the legacy→new taxonomy mapping is unvalidated. */
     public static function listSermonsNotice(): string {
         return self::wrapNotice(
-            esc_html__( 'This term list was migrated from a Sermon Manager [list_sermons] tag and defaults to the Sermon Series taxonomy. Confirm it targets the taxonomy the original tag used before relying on it.', 'sermonator' )
+            esc_html__( 'This term list was migrated from a Sermon Manager list_sermons shortcode and defaults to the Sermon Series taxonomy. Confirm it targets the taxonomy the original shortcode used before relying on it.', 'sermonator' )
         );
     }
 
     /** Per-tag review notice for [latest_series] — provisional "latest" + serviceType semantics. */
     public static function latestSeriesNotice(): string {
         return self::wrapNotice(
-            esc_html__( 'This "latest series" was migrated from a Sermon Manager [latest_series] tag and is resolved as the most-recently-preached sermon\'s series (optionally scoped by service type). Confirm it matches the series the original tag highlighted.', 'sermonator' )
+            esc_html__( 'This "latest series" was migrated from a Sermon Manager latest_series shortcode and is resolved as the most-recently-preached sermon\'s series (optionally scoped by service type). Confirm it matches the series the original shortcode highlighted.', 'sermonator' )
         );
     }
 
     /** Per-tag review notice for [sermon_images] — empty-data falls back to a default listing. */
     public static function sermonImagesNotice(): string {
         return self::wrapNotice(
-            esc_html__( 'This series-image grid was migrated from a Sermon Manager [sermon_images] tag. Review it before relying on the original artwork; when no migrated images are found it falls back to a default sermon listing.', 'sermonator' )
+            esc_html__( 'This series-image grid was migrated from a Sermon Manager sermon_images shortcode. Review it before relying on the original artwork; when no migrated images are found it falls back to a default sermon listing.', 'sermonator' )
         );
     }
 

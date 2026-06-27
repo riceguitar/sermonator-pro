@@ -126,14 +126,19 @@ final class PodcastMetaSchemaTest extends WP_UnitTestCase {
         $subscriber = (int) self::factory()->user->create( array( 'role' => 'subscriber' ) );
         $admin      = (int) self::factory()->user->create( array( 'role' => 'administrator' ) );
 
+        // The registered auth_callback is consumed by map_meta_cap() for the edit_post_meta
+        // primitive cap (the documented, subtype-aware path) — not a globally-named
+        // auth_post_meta_<key> filter, which register_post_meta scopes to the object subtype.
         wp_set_current_user( $subscriber );
         $this->assertFalse(
-            (bool) apply_filters( "auth_post_meta_{$this->metaKey()}", false, ID::META_PODCAST_SETTINGS, $this->podcastId, $subscriber, 'edit_post_meta', array() )
+            current_user_can( 'edit_post_meta', $this->podcastId, ID::META_PODCAST_SETTINGS ),
+            'A subscriber must not be allowed to edit the podcast-settings meta.'
         );
 
         wp_set_current_user( $admin );
         $this->assertTrue(
-            (bool) apply_filters( "auth_post_meta_{$this->metaKey()}", false, ID::META_PODCAST_SETTINGS, $this->podcastId, $admin, 'edit_post_meta', array() )
+            current_user_can( 'edit_post_meta', $this->podcastId, ID::META_PODCAST_SETTINGS ),
+            'An administrator (manage_options) must be allowed to edit the podcast-settings meta.'
         );
 
         wp_set_current_user( 0 );

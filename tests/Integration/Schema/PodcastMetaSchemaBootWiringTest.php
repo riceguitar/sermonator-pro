@@ -20,6 +20,16 @@ use Sermonator\Schema\PodcastMetaSchema;
  * NOT run in this environment (no Docker / wp-env) — authored to run under wp-env later.
  */
 final class PodcastMetaSchemaBootWiringTest extends WP_UnitTestCase {
+    protected function setUp(): void {
+        parent::setUp();
+        // WP_UnitTestCase resets $wp_meta_keys between tests. Re-dispatch 'init' so
+        // Plugin::boot()'s init@10 closure (the ONLY path under test — we never call
+        // PodcastMetaSchema::register() directly) re-populates the registry. All init
+        // callbacks (CPT registration, block registration, etc.) are idempotent, so
+        // the extra dispatch does not pollute the test environment.
+        do_action( 'init' );
+    }
+
     /**
      * The plugin booted at bootstrap; its init@10 handler must have called register_post_meta for
      * the podcast settings key. Proven WITHOUT calling register() here — purely the boot wiring.

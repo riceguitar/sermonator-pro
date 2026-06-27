@@ -66,7 +66,10 @@ final class SermonImagesBlockTest extends WP_UnitTestCase {
 
         $this->assertStringContainsString( 'sermonator-image-grid', $html );
         $this->assertStringContainsString( 'Grace Abounding', $html );
-        $this->assertStringContainsString( 'wp-image-' . $attId, $html );
+        // Check for the image URL rather than the wp-image-{id} CSS class: the class is
+        // an editor/content artifact whose presence depends on WP version and environment.
+        // The src URL is what actually proves the correct attachment was rendered.
+        $this->assertStringContainsString( (string) wp_get_attachment_image_url( $attId, 'medium' ), $html );
         $this->assertStringNotContainsString( 'sermonator-compat-notice', $html );
     }
 
