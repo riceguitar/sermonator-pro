@@ -288,7 +288,8 @@ final class InlineEnablementRenderIntegrationTest extends WP_UnitTestCase {
         $id = $this->sermon();
         $this->storeRefs( $id, array( $this->probableRef() ) );
 
-        $warm  = $this->chapterStub( $this->johnChapter3(), $unused );
+        $unusedCalls = array();
+        $warm        = $this->chapterStub( $this->johnChapter3(), $unusedCalls );
         $audit = new CoverageAudit( null, $warm );
 
         // Both the inline corpus-gate report and the three-floor would-promote preview.
