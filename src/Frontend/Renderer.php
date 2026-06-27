@@ -11,6 +11,13 @@ namespace Sermonator\Frontend;
  * missing value never renders an empty row or the literal "0".
  */
 final class Renderer {
+    /**
+     * Above this verse count an inline passage is wrapped in a native, collapsible
+     * `<details>` so a long reading never dominates the page; shorter readings render
+     * expanded inline. Purely presentational — never gates whether text shows.
+     */
+    private const INLINE_DETAILS_VERSE_THRESHOLD = 4;
+
     public function meta( SermonView $v ): string {
         $rows = '';
 
@@ -49,14 +56,23 @@ final class Renderer {
      * feature can never ship a regression. meta() is UNCHANGED — this is an
      * additive section, NOT a meta-row mutation.
      *
-     * Phase 3a is LINK mode: per ref, an `<a>` to the axis-A link version
-     * (Bible Gateway) plus a visible version badge (e.g. "(ESV)") that exists
-     * ONLY on this resolved path. Every leaf is escaped here (esc_html / esc_url);
-     * the markup is constructed tag-by-tag — never wp_kses, which is for
-     * untrusted stored HTML, not values we build ourselves.
+     * Per ref, the {@see BibleResolver} hands us EITHER:
+     *   - `inline === null` (Phase 3a LINK): an `<a>` to the axis-A link version
+     *     (Bible Gateway) plus a visible version badge (e.g. "(ESV)"). When EVERY
+     *     ref is null this method is BYTE-IDENTICAL to the shipped 3a output, so the
+     *     inline feature can never ship a link-mode regression (pinned in tests).
+     *   - `inline === {translation, attribution, verses:[{number, nodes:[{type,text}]}]}`
+     *     (Phase 3b INLINE): a verse-text section with a translation attribution badge.
+     *
+     * Every leaf — link label/url/version AND every inline verse node — is escaped
+     * here with esc_html / esc_url / esc_attr. The inline nodes are TYPED values WE
+     * construct ({@see ResolvedScripture} carries no raw HTML), so esc_html on each
+     * leaf is the correct, stricter choice and we build the `<sup>`/`<span>` markup
+     * tag-by-tag. We NEVER call wp_kses here — that is for untrusted STORED HTML, not
+     * for values we assemble ourselves.
      */
     public function scripture( SermonView $v, ?ResolvedScripture $s ): string {
-        unset( $v ); // Part of the pure contract (SermonView in); unused in link mode.
+        unset( $v ); // Part of the pure contract (SermonView in); unused.
 
         if ( $s === null || $s->isEmpty() ) {
             return '';
@@ -64,18 +80,116 @@ final class Renderer {
 
         $items = '';
         foreach ( $s->refs() as $ref ) {
-            $items .= '<li class="sermonator-scripture__ref">'
-                . '<a class="sermonator-scripture__link" href="' . esc_url( $ref['linkUrl'] ) . '">'
-                . esc_html( $ref['label'] )
-                . '</a>'
-                . ' <span class="sermonator-scripture__version">(' . esc_html( $ref['version'] ) . ')</span>'
-                . '</li>';
+            $inline = $ref['inline'] ?? null;
+
+            if ( is_array( $inline ) && isset( $inline['verses'] ) && is_array( $inline['verses'] ) && $inline['verses'] !== array() ) {
+                $items .= $this->scriptureInlineItem( $ref, $inline );
+            } else {
+                // 3a LINK path — kept verbatim so the all-null case stays byte-identical.
+                $items .= '<li class="sermonator-scripture__ref">'
+                    . '<a class="sermonator-scripture__link" href="' . esc_url( $ref['linkUrl'] ) . '">'
+                    . esc_html( $ref['label'] )
+                    . '</a>'
+                    . ' <span class="sermonator-scripture__version">(' . esc_html( $ref['version'] ) . ')</span>'
+                    . '</li>';
+            }
         }
 
         return '<section class="sermonator-scripture">'
             . '<h2 class="sermonator-scripture__heading">' . esc_html__( 'Scripture', 'sermonator' ) . '</h2>'
             . '<ul class="sermonator-scripture__list">' . $items . '</ul>'
             . '</section>';
+    }
+
+    /**
+     * Render ONE ref's Phase 3b inline verse-text payload: the reference label, an
+     * attribution badge (e.g. "(World English Bible)"), and each verse as a
+     * `<span class="sermonator-scripture__verse">` with a numbered `<sup>` plus its
+     * typed nodes. Long passages are wrapped in a collapsible native `<details>`.
+     *
+     * Every leaf is esc_html-escaped (the payload carries typed text, never HTML).
+     *
+     * @param array{label:string,linkUrl:string,version:string,inlineEligible:bool} $ref
+     * @param array{translation:string,attribution:string,verses:list<array{number:int,nodes:list<array{type:string,text:string}>}>} $inline
+     */
+    private function scriptureInlineItem( array $ref, array $inline ): string {
+        $label       = esc_html( (string) ( $ref['label'] ?? '' ) );
+        $attribution = isset( $inline['attribution'] ) ? (string) $inline['attribution'] : '';
+        $badge       = $attribution !== ''
+            ? ' <span class="sermonator-scripture__attribution">(' . esc_html( $attribution ) . ')</span>'
+            : '';
+
+        $verses = '';
+        $count  = 0;
+        foreach ( $inline['verses'] as $verse ) {
+            if ( ! is_array( $verse ) ) {
+                continue;
+            }
+            $verses .= $this->scriptureVerse( $verse );
+            ++$count;
+        }
+
+        $header = '<span class="sermonator-scripture__label">' . $label . '</span>' . $badge;
+        $body   = '<div class="sermonator-scripture__text">' . $verses . '</div>';
+
+        if ( $count > self::INLINE_DETAILS_VERSE_THRESHOLD ) {
+            // Collapse a long reading so it never dominates the page.
+            $inner = '<details class="sermonator-scripture__details">'
+                . '<summary class="sermonator-scripture__summary">' . $header . '</summary>'
+                . $body
+                . '</details>';
+        } else {
+            $inner = $header . $body;
+        }
+
+        return '<li class="sermonator-scripture__ref sermonator-scripture__ref--inline">' . $inner . '</li>';
+    }
+
+    /**
+     * Render one inline verse: a `<sup>` verse number followed by its typed nodes.
+     *
+     * @param array{number?:int,nodes?:list<array{type:string,text:string}>} $verse
+     */
+    private function scriptureVerse( array $verse ): string {
+        $number = isset( $verse['number'] ) ? (string) (int) $verse['number'] : '';
+        $num    = $number !== ''
+            ? '<sup class="sermonator-scripture__num">' . esc_html( $number ) . '</sup>'
+            : '';
+
+        $nodes = '';
+        if ( isset( $verse['nodes'] ) && is_array( $verse['nodes'] ) ) {
+            foreach ( $verse['nodes'] as $node ) {
+                if ( is_array( $node ) ) {
+                    $nodes .= $this->scriptureNode( $node );
+                }
+            }
+        }
+
+        return '<span class="sermonator-scripture__verse">' . $num . $nodes . '</span>';
+    }
+
+    /**
+     * Render one typed inline node, escaping its text leaf with esc_html (NEVER
+     * wp_kses): `wordsOfJesus` → a styled `<span>`, `note` → a `<sup>`, and `text`
+     * (or any unknown type, conservatively) → the plain escaped text. An unknown type
+     * can therefore never emit raw markup — it degrades to escaped plain text.
+     *
+     * @param array{type?:string,text?:string} $node
+     */
+    private function scriptureNode( array $node ): string {
+        $type = isset( $node['type'] ) && is_string( $node['type'] ) ? $node['type'] : 'text';
+        $text = isset( $node['text'] ) && is_string( $node['text'] ) ? $node['text'] : '';
+        $safe = esc_html( $text );
+
+        switch ( $type ) {
+            case 'wordsOfJesus':
+                return '<span class="sermonator-scripture__woj">' . $safe . '</span>';
+            case 'note':
+                return '<sup class="sermonator-scripture__note">' . $safe . '</sup>';
+            case 'text':
+            default:
+                return $safe;
+        }
     }
 
     public function audioPlayer( SermonView $v ): string {
