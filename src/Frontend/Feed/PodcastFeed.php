@@ -71,18 +71,53 @@ final class PodcastFeed {
         }
 
         $config = $factory->fromPost( $podcastId, $feedUrl );
-        $items  = $this->items();
 
-        // Fail-visible (rollback story 1 + the Legacy Compatibility Contract): per-podcast
-        // item filtering is an explicit Tier B deferral, so on a MULTI-podcast site this feed
-        // carries the resolved podcast's channel identity but the full site-wide sermon set
-        // (over-inclusion). Surface that discrepancy — exactly like sermonator_feed_truncated —
-        // so it is observable to the admin/migration report, never silently-different content.
-        if ( $this->publishedPodcastCount() > 1 ) {
+        // Per-podcast feed SCOPE (spec §2.8, the bundle's never-fail-WRONG budget). The resolved
+        // scope is fed to SermonQuery via its EXISTING `taxonomies` arg (buildTaxQuery: relation=AND
+        // across taxonomies, IN within — byte-identical to Pro's filter_the_query). This is the
+        // IRREVERSIBLE, subscriber-facing surface: a wrong scope floods new GUIDs or vanishes
+        // episodes for live Apple/Spotify subscribers, so the fallbacks below are deliberate.
+        $resolver = new PodcastScopeResolver();
+        $scope    = $this->feedScope( $podcastId, $resolver );
+
+        $items = $this->items( $scope );
+
+        // (c) Empty EFFECTIVE scope on a MULTI-podcast site: the feed carries THIS podcast's channel
+        // identity but the full site-wide sermon set (over-inclusion). Keep the existing fail-visible
+        // signal — observable to the admin/migration report, never silently-different content. NOT
+        // fired when a clean scope was applied (a, earned silence) and NOT layered on the
+        // incomplete-crosswalk signal (b, which feedScope() already fired) — the two are exclusive.
+        if ( $scope === array()
+            && ! $resolver->hasIncompleteScope( $podcastId )
+            && $this->publishedPodcastCount() > 1 ) {
             do_action( 'sermonator_feed_unscoped_multipodcast', $podcastId, count( $items ) );
         }
 
         echo ( new FeedBuilder() )->build( $config, $items ); // phpcs:ignore WordPress.Security.EscapeOutput
+    }
+
+    /**
+     * Apply the spec §2.8 never-fail-WRONG decision table for ONE podcast and return the SermonQuery
+     * `taxonomies` scope to use — `[]` meaning "today's EXACT unscoped query". The fail-visible
+     * incomplete signal is fired here as a side effect. Decoupled from render() so this irreversible,
+     * subscriber-facing decision is unit-testable WITHOUT the WP_Query/feed-render stack.
+     *
+     *  - (b) an open `missing_podcast_term_crosswalk` flag (Pro HAD scope but a scoped term did not
+     *    resolve at migration) → NEVER serve that dead/unresolved-term scope (it would silently EMPTY
+     *    a live Apple/Spotify subscription). Fall back to UNSCOPED and fire
+     *    `sermonator_feed_scope_incomplete`.
+     *  - (a) a clean, non-empty scope → apply it, EARNED silence (no signal).
+     *  - (d) an empty scope → `[]`; items() omits the taxonomies arg entirely, so the common
+     *    single-podcast case is byte-for-byte the pre-Bundle-2 unscoped query.
+     *
+     * @return array<string,list<int>>
+     */
+    private function feedScope( int $podcastId, PodcastScopeResolver $resolver ): array {
+        if ( $resolver->hasIncompleteScope( $podcastId ) ) {
+            do_action( 'sermonator_feed_scope_incomplete', $podcastId );
+            return array();
+        }
+        return $resolver->forPodcast( $podcastId );
     }
 
     /** Number of published podcasts (capped at 2 — callers only need to know if >1). */
@@ -96,8 +131,14 @@ final class PodcastFeed {
         return count( $ids );
     }
 
-    /** @return list<FeedItem> */
-    private function items(): array {
+    /**
+     * @param array<string,list<int>> $scope Per-taxonomy NEW-term-id scope from
+     *        {@see PodcastScopeResolver::forPodcast()}. An EMPTY scope ([]) means today's EXACT
+     *        UNSCOPED query: the `taxonomies` arg is OMITTED ENTIRELY (not passed as []) so the
+     *        single-podcast default path is byte-for-byte identical to the pre-Bundle-2 query.
+     * @return list<FeedItem>
+     */
+    private function items( array $scope = array() ): array {
         // Pin page 1 EXPLICITLY. The feed never paginates — it caps at MAX_ITEMS and fires
         // sermonator_feed_truncated for the tail. SermonQuery::run() defaults a missing `page`
         // to the registered, PUBLIC `sermon_page` query var (the embedded-list read-path pin),
@@ -106,7 +147,11 @@ final class PodcastFeed {
         // data) and larger archives would serve 301-600 instead of the latest 300. That is exactly
         // the never-fail-WRONG the contract forbids on this flagship read-only surface, so the feed
         // is isolated from the request's pagination var.
-        $result   = ( new SermonQuery() )->run( array( 'perPage' => self::MAX_ITEMS, 'page' => 1 ) );
+        $queryArgs = array( 'perPage' => self::MAX_ITEMS, 'page' => 1 );
+        if ( $scope !== array() ) {
+            $queryArgs['taxonomies'] = $scope;
+        }
+        $result   = ( new SermonQuery() )->run( $queryArgs );
         $resolver = new EnclosureResolver();
         $guids    = new LegacyEpisodeGuid();
 
