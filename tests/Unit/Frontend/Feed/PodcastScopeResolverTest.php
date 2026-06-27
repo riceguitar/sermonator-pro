@@ -156,4 +156,36 @@ final class PodcastScopeResolverTest extends TestCase {
 
         $this->assertFalse( ( new PodcastScopeResolver() )->hasIncompleteScope( 100 ) );
     }
+
+    /**
+     * Contract pin: the dead-term flag prefix is the SOLE cross-subsystem token
+     * linking the writer's STAMP to the resolver's MATCH. If this value ever
+     * drifts, a feed scoped to an unresolved/legacy term would be served to live
+     * subscribers with no observable signal — the irreversible failure the
+     * invariant exists to prevent. Both sides reference this one constant, so this
+     * test fails (not a live feed) if the token is edited.
+     */
+    public function test_missing_term_flag_prefix_contract_token_is_stable(): void {
+        $this->assertSame(
+            'missing_podcast_term_crosswalk:',
+            Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX
+        );
+    }
+
+    /**
+     * Round-trip: a flag built EXACTLY as {@see \Sermonator\Migration\PodcastWriter}
+     * emits it (the shared prefix constant + a legacy term id) MUST be recognized by
+     * the resolver's matcher. This is the regression guard against the write side and
+     * the read side silently disagreeing on the flag format.
+     */
+    public function test_resolver_matches_the_flag_format_the_writer_emits(): void {
+        $writerEmittedFlag = Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX . 777;
+
+        $this->stubMeta(
+            array( ID::TAX_PREACHER => array( 12 ) ),
+            array( 'slug_changed', $writerEmittedFlag )
+        );
+
+        $this->assertTrue( ( new PodcastScopeResolver() )->hasIncompleteScope( 100 ) );
+    }
 }

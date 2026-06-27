@@ -447,7 +447,7 @@ final class PodcastWriter {
             }
             // Unresolved positive id — never a silent drop. Leave the legacy id in
             // place and flag it so COMPLETE is withheld and the id self-heals later.
-            $flags[] = 'missing_podcast_term_crosswalk:' . (int) $value;
+            $flags[] = Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX . (int) $value;
         }
 
         return $value;
@@ -659,7 +659,7 @@ final class PodcastWriter {
      */
     private function hasOpenTermCrosswalkFlag( array $flags ): bool {
         foreach ( $flags as $flag ) {
-            if ( str_starts_with( (string) $flag, 'missing_podcast_term_crosswalk:' ) ) {
+            if ( str_starts_with( (string) $flag, Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX ) ) {
                 return true;
             }
         }
@@ -678,7 +678,7 @@ final class PodcastWriter {
         return array_values( array_filter(
             $flags,
             static function ( $flag ): bool {
-                return ! str_starts_with( (string) $flag, 'missing_podcast_term_crosswalk:' );
+                return ! str_starts_with( (string) $flag, Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX );
             }
         ) );
     }

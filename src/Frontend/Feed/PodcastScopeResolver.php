@@ -40,13 +40,6 @@ use Sermonator\Schema\Identifiers;
  */
 final class PodcastScopeResolver {
     /**
-     * The flag prefix {@see \Sermonator\Migration\PodcastWriter} records (in
-     * {@see Crosswalk::MIGRATION_FLAGS}) when a Pro feed carried scope but a scoped
-     * term did not resolve through the crosswalk at migration time.
-     */
-    private const MISSING_TERM_FLAG_PREFIX = 'missing_podcast_term_crosswalk:';
-
-    /**
      * The per-taxonomy NEW term-id scope for one podcast, shaped for
      * {@see \Sermonator\Frontend\SermonQuery}'s `taxonomies` arg.
      *
@@ -89,7 +82,7 @@ final class PodcastScopeResolver {
             return false;
         }
         foreach ( $flags as $flag ) {
-            if ( str_starts_with( (string) $flag, self::MISSING_TERM_FLAG_PREFIX ) ) {
+            if ( str_starts_with( (string) $flag, Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX ) ) {
                 return true;
             }
         }
