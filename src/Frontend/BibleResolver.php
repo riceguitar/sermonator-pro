@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Sermonator\Frontend;
 
+use Sermonator\Bible\DerivedExactClassifier;
 use Sermonator\Bible\RefValidator;
 use Sermonator\Bible\TranslationRegistry;
 use Sermonator\Bible\VersificationGate;
@@ -95,16 +96,25 @@ final class BibleResolver {
     private const BIBLEGATEWAY_BASE = 'https://www.biblegateway.com/passage/?search=';
 
     /**
-     * Confidence tiers an inline ref may carry, ranked HIGH → LOW. A ref clears the L2
-     * floor only when its tier rank is >= the configured floor's rank (and is a known,
-     * non-zero tier). `ambiguous` (and any unknown/absent value) ranks 0 — never inline.
+     * STORED confidence tiers a ref may legitimately carry, ranked HIGH → LOW (design
+     * §3.4). This vocabulary is **disjoint** from the L2 floor vocabulary
+     * `{exact,derived-exact,derived-exact-perseg}`: a ref is NEVER stamped `derived-exact`
+     * — that is a RENDER-TIME property derived by the shared
+     * {@see DerivedExactClassifier}, not a persisted tier. So a PRE-STAMPED (smuggled)
+     * `confidence:derived-exact` is NOT a recognized stored tier → ranks 0 → clears
+     * nothing (de-store enforcement; closes the import/bulk-promote bypass).
+     *
+     *   - `exact`    — the author-confirmed chip; the top stored tier, clears EVERY floor.
+     *   - `probable` — the auto-parse tier the render-time classifier may PROMOTE to
+     *                  inline-eligible under a `derived-exact*` floor.
+     *   - `ambiguous`— (and any unknown/absent value) ranks 0; never inline.
      *
      * @var array<string,int>
      */
-    private const CONFIDENCE_RANK = array(
-        'exact'         => 3,
-        'derived-exact' => 2,
-        'probable'      => 1,
+    private const STORED_CONFIDENCE_RANK = array(
+        'exact'     => 2,
+        'probable'  => 1,
+        'ambiguous' => 0,
     );
 
     /**
@@ -129,6 +139,11 @@ final class BibleResolver {
         $attested        = (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false );
         $floor           = self::confidenceFloor();
         $chapterResolver = $chapterResolver ?? array( ChapterProvider::class, 'get' );
+
+        // The per-post envelope ref count — computed ONCE and threaded into every per-ref
+        // L2 promotion check. It is the singleton constraint for the STRICT `derived-exact`
+        // floor (a compound passage's segments never promote even when individually clean).
+        $refCount = count( $refs );
 
         $resolved = array();
 
@@ -176,6 +191,7 @@ final class BibleResolver {
                     $inlineTranslation,
                     $attested,
                     $floor,
+                    $refCount,
                     $chapterResolver
                 );
             }
@@ -205,6 +221,7 @@ final class BibleResolver {
      * @param string                                                   $inlineTranslation Inline target id (e.g. ENGWEBP).
      * @param bool                                                     $attested          L6 admin attestation state.
      * @param string                                                   $floor             L2 confidence floor.
+     * @param int                                                      $refCount          Per-post envelope ref count (the STRICT singleton constraint).
      * @param callable(string,string,int,bool):(array<int,mixed>|null) $chapterResolver   L8 disk/cache-only chapter reader.
      *
      * @return array{translation:string,attribution:string,verses:list<array{number:int,nodes:list<array{type:string,text:string}>}>}|null
@@ -216,6 +233,7 @@ final class BibleResolver {
         string $inlineTranslation,
         bool $attested,
         string $floor,
+        int $refCount,
         callable $chapterResolver
     ): ?array {
         // L1 — pure structural inline-shape (NOT the 3a unary divergent table; the
@@ -225,8 +243,12 @@ final class BibleResolver {
             return self::fallOpen( $passage, 'not-inline-eligible' );
         }
 
-        // L2 — confidence floor (default `exact`; an author-confirmed chip).
-        if ( ! self::confidenceClears( $ref, $floor ) ) {
+        // L2 — confidence floor (default `exact`; an author-confirmed chip). A stored
+        // `probable` ref may be PROMOTED to inline-eligible here by the shared render-time
+        // classifier (re-parse-identity + the floor's sibling-count policy) — never a
+        // stored re-stamp. The axis-1 VersificationGate (L4–L7) + rangeWithinChapter (L9)
+        // still run unchanged AFTER and independently withhold any wrong-versification ref.
+        if ( ! self::confidenceClears( $ref, $floor, $refCount ) ) {
             return self::fallOpen( $passage, 'low-confidence' );
         }
 
@@ -303,17 +325,43 @@ final class BibleResolver {
     }
 
     /**
-     * L2 — does the ref's `confidence` tier rank at or above the configured floor?
-     * Unknown/absent tiers rank 0 and never clear (never-fail-WRONG).
+     * L2 — does the ref clear the configured confidence floor (design §2–§3.4)? The tier
+     * is **de-stored**: a stored `derived-exact` is NOT a recognized tier — promotion is a
+     * RENDER-TIME decision computed here, never a persisted stamp.
+     *
+     *   - stored `exact`    → the author-confirmed chip; the top stored tier, clears EVERY
+     *                         floor (`exact` / `derived-exact` / `derived-exact-perseg`);
+     *   - stored `probable` → clears a `derived-exact*` floor ONLY when the shared
+     *                         {@see DerivedExactClassifier::promotes()} promotes it
+     *                         (re-parse-identity + the floor's sibling-count policy); under
+     *                         the `exact` floor `promotes()` is false by construction;
+     *   - anything else     → `ambiguous`, absent, OR a SMUGGLED pre-stamped
+     *                         `derived-exact` (not a stored tier) → clears NOTHING.
+     *
+     * Promotion only lets a ref REACH the unchanged axis-1 VersificationGate (L4–L7) +
+     * `rangeWithinChapter` (L9) that run AFTER; it can never surface a wrong verse.
      *
      * @param array<string,mixed> $ref
+     * @param string              $floor    One of `exact` | `derived-exact` | `derived-exact-perseg`.
+     * @param int                 $refCount Per-post envelope ref count (the STRICT singleton constraint).
      */
-    private static function confidenceClears( array $ref, string $floor ): bool {
-        $floorRank = self::CONFIDENCE_RANK[ $floor ] ?? self::CONFIDENCE_RANK['exact'];
-        $refConf   = isset( $ref['confidence'] ) && is_string( $ref['confidence'] ) ? $ref['confidence'] : '';
-        $refRank   = self::CONFIDENCE_RANK[ $refConf ] ?? 0;
+    private static function confidenceClears( array $ref, string $floor, int $refCount ): bool {
+        $refConf = isset( $ref['confidence'] ) && is_string( $ref['confidence'] ) ? $ref['confidence'] : '';
+        $refRank = self::STORED_CONFIDENCE_RANK[ $refConf ] ?? 0;
 
-        return $refRank > 0 && $refRank >= $floorRank;
+        // `exact` — the top stored tier — clears every floor outright.
+        if ( $refRank >= self::STORED_CONFIDENCE_RANK['exact'] ) {
+            return true;
+        }
+
+        // `probable` — the only PROMOTABLE stored tier — defers entirely to the shared
+        // render-time classifier (which returns false for the `exact` floor).
+        if ( $refRank >= self::STORED_CONFIDENCE_RANK['probable'] ) {
+            return DerivedExactClassifier::promotes( $ref, $floor, $refCount );
+        }
+
+        // `ambiguous` / absent / a pre-stamped `derived-exact`: never clears.
+        return false;
     }
 
     /**
@@ -331,14 +379,23 @@ final class BibleResolver {
     }
 
     /**
-     * The configured L2 confidence floor, validated to a known tier (default + fallback
-     * `exact`, the most conservative).
+     * The configured L2 confidence FLOOR, validated to a known floor (default + fallback
+     * `exact`, the most conservative — promotes nothing). The floor vocabulary
+     * `{exact,derived-exact,derived-exact-perseg}` is disjoint from the stored-confidence
+     * vocabulary; an unknown/legacy value (e.g. a stale `probable` floor) normalizes to
+     * `exact`.
      */
     private static function confidenceFloor(): string {
-        $stored = get_option( Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR, 'exact' );
-        $stored = is_string( $stored ) ? $stored : 'exact';
+        $stored = get_option( Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR, DerivedExactClassifier::FLOOR_EXACT );
+        $stored = is_string( $stored ) ? $stored : DerivedExactClassifier::FLOOR_EXACT;
 
-        return isset( self::CONFIDENCE_RANK[ $stored ] ) ? $stored : 'exact';
+        $valid = array(
+            DerivedExactClassifier::FLOOR_EXACT,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG,
+        );
+
+        return in_array( $stored, $valid, true ) ? $stored : DerivedExactClassifier::FLOOR_EXACT;
     }
 
     /**
