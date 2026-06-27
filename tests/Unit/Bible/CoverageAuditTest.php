@@ -555,6 +555,98 @@ final class CoverageAuditTest extends TestCase {
     }
 
     // ----------------------------------------------------------------------------------
+    // T-K — Site Health DRIFT WARNING: the live audit generation advanced past the one
+    // the enable reconciled against (corpus changed since enable → re-audit).
+    // ----------------------------------------------------------------------------------
+
+    /** A green-coverage rollup carrying an inline subreport stamped at $liveGen. */
+    private function seedInlineRollupAt( int $liveGen ): void {
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => array(
+                'generated_at'              => $liveGen,
+                'refs_total'                => 4,
+                'inline_eligible'           => 4,
+                'inline_eligible_pct'       => 100.0,
+                'withheld'                  => array(),
+                'unmodeled_pair_wrong_text' => 0,
+                'families'                  => array( 'eng-protestant' => 4 ),
+                'dominant_family'           => 'eng-protestant',
+                'heterogeneous'             => false,
+            ),
+        );
+    }
+
+    public function test_site_health_drift_warns_when_live_audit_gen_passed_the_enable_stamp(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 1000;
+        $this->seedInlineRollupAt( 2000 ); // live gen advanced past the enable stamp.
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        // An actionable advisory downgrades the headline from green.
+        $this->assertSame( 'recommended', $result['status'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_live_audit_gen_equals_the_enable_stamp(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 2000;
+        $this->seedInlineRollupAt( 2000 ); // equal → reconciled against the live corpus.
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        $this->assertSame( 'good', $result['status'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_live_audit_gen_is_behind_the_stamp(): void {
+        // The persisted rollup predates the enable's fresh reconciliation audit — not drift.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 3000;
+        $this->seedInlineRollupAt( 2000 );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        $this->assertSame( 'good', $result['status'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_inline_is_disabled(): void {
+        // No enable ever happened: a live gen past a stale stamp is not a drift to surface.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = false;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 1000;
+        $this->seedInlineRollupAt( 2000 );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_never_enabled_no_stamp(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ] = true; // enabled but no recon stamp.
+        $this->seedInlineRollupAt( 2000 );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
+
+    public function test_site_health_drift_warning_does_not_write(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 1000;
+        $this->seedInlineRollupAt( 2000 );
+        $before = $this->options;
+
+        $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertSame( $before, $this->options );
+    }
+
+    // ----------------------------------------------------------------------------------
     // T-E — would-promote PREVIEW (three floors, assume-attested ceiling, sample)
     // ----------------------------------------------------------------------------------
 

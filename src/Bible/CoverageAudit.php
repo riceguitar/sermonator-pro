@@ -861,6 +861,12 @@ final class CoverageAudit {
         $green  = ( 0 === $withPassage ) || ( $coverage >= self::GREEN_THRESHOLD );
         $status = $green ? 'good' : 'recommended';
 
+        // T-K — corpus-drift advisory: an actionable warning downgrades the headline.
+        $drift = $this->driftWarning( $stats );
+        if ( '' !== $drift ) {
+            $status = 'recommended';
+        }
+
         $label = 0 === $withPassage
             ? __( 'No sermon scripture references to resolve', 'sermonator' )
             : __( 'Sermon scripture references resolve to links', 'sermonator' );
@@ -887,6 +893,7 @@ final class CoverageAudit {
         }
 
         $description .= $this->inlineDescription( $stats );
+        $description .= $drift;
 
         return array(
             'label'       => $label,
@@ -947,6 +954,64 @@ final class CoverageAudit {
         }
 
         return $out;
+    }
+
+    /**
+     * The Site-Health CORPUS-DRIFT advisory (design §3.6, decision 6 / spec T-K), built
+     * PURELY from already-persisted options (no recompute, no write — the same pure-reader
+     * boundary the rest of {@see self::siteHealthResult()} honors). It fires when, with
+     * inline rendering ENABLED, the LIVE audit generation (the persisted rollup's `inline`
+     * sub-report `generated_at`) has advanced PAST the reconciliation generation stamped at
+     * enable-time ({@see ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN}, written by the enable
+     * soft-gate in {@see \Sermonator\Admin\SettingsRegistrar::sanitizeInlineEnabled()}).
+     *
+     * A later, post-enable advance of the audit generation means the corpus changed (an
+     * import / new sermons) AFTER the operator reconciled + enabled — so a freshly imported
+     * sub-corpus could have drifted heterogeneous or onto an unmodeled versification pair
+     * that the enable-moment reconciliation never saw. The advisory tells the operator to
+     * re-audit; it NEVER disables inline (instant rollback stays the floor/attestation lever).
+     *
+     * Empty string (silent) unless ALL hold: inline is enabled; a reconciliation stamp
+     * exists (> 0 — an enable actually happened); and the live generation is STRICTLY
+     * GREATER than the stamp. Equal (reconciled against the live corpus) or behind (the
+     * persisted rollup predates the enable's fresh reconciliation audit) → silent.
+     *
+     * @param array<string,mixed> $stats The persisted rollup (already read by the caller).
+     */
+    private function driftWarning( array $stats ): string {
+        // Only meaningful once inline rendering is ENABLED (a reconciliation occurred).
+        if ( ! self::inlineEnabled() ) {
+            return '';
+        }
+
+        // The generation the enable reconciled against. Absent/0 → no enable happened → silent.
+        $stampedGen = (int) get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 );
+        if ( $stampedGen <= 0 ) {
+            return '';
+        }
+
+        // The LIVE audit generation: the persisted inline sub-report's `generated_at`, the
+        // same value shape the enable soft-gate stamped from its fresh inlineReport(). A
+        // pre-3b rollup (no inline key) reads 0 → never falsely drifts.
+        $inline  = isset( $stats['inline'] ) && is_array( $stats['inline'] ) ? $stats['inline'] : array();
+        $liveGen = isset( $inline['generated_at'] ) ? (int) $inline['generated_at'] : 0;
+
+        if ( $liveGen <= $stampedGen ) {
+            return '';
+        }
+
+        return '<p>' . esc_html__(
+            'WARNING: the sermon corpus has changed since inline scripture was enabled. Inline rendering was reconciled against an older corpus; a later import or new sermons may have introduced a different versification tradition or an unmodeled versification pair that the enable-time reconciliation never checked. Re-run "wp sermonator bible audit --inline" and re-confirm the warnings before relying on inline coverage.',
+            'sermonator'
+        ) . '</p>';
+    }
+
+    /**
+     * Whether inline verse rendering is currently enabled (pure read). Drift is only
+     * surfaced for an enabled site — a stale stamp under a disabled feature is not drift.
+     */
+    private static function inlineEnabled(): bool {
+        return (bool) get_option( ID::OPTION_BIBLE_INLINE_ENABLED, false );
     }
 
     /**

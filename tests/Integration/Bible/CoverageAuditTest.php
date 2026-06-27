@@ -225,4 +225,80 @@ final class CoverageAuditTest extends WP_UnitTestCase {
         $this->assertSame( 1, $report['withheld']['src-heterogeneous'] );
         $this->assertSame( 0, $report['withheld']['src-versification-unsupported'] );
     }
+
+    // ----------------------------------------------------------------------------------
+    // T-K — Site Health CORPUS-DRIFT advisory.
+    //
+    // NOT run in this environment (no Docker / wp-env) — authored to run under wp-env.
+    // Drives the REAL options API + the Site Health filter wiring: the warning fires when
+    // the persisted live audit generation has advanced PAST the reconciliation generation
+    // stamped at enable-time (a later import/new sermons since the operator reconciled +
+    // enabled), and is silent when the two generations are equal. Pure read — never writes.
+    // ----------------------------------------------------------------------------------
+
+    /** A green-coverage rollup whose inline sub-report is stamped at $liveGen. */
+    private function seedRollupAtGen( int $liveGen ): void {
+        update_option( ID::OPTION_BIBLE_STATS, array(
+            'generated_at'   => $liveGen,
+            'total'          => 4,
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => array(
+                'generated_at'              => $liveGen,
+                'refs_total'                => 4,
+                'inline_eligible'           => 4,
+                'inline_eligible_pct'       => 100.0,
+                'withheld'                  => array(),
+                'unmodeled_pair_wrong_text' => 0,
+                'families'                  => array( 'eng-protestant' => 4 ),
+                'dominant_family'           => 'eng-protestant',
+                'heterogeneous'             => false,
+            ),
+        ) );
+    }
+
+    public function test_site_health_drift_fires_when_live_gen_passed_the_enable_stamp(): void {
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 1000 );
+        $this->seedRollupAtGen( 2000 ); // corpus re-audited past the enable reconciliation.
+
+        $audit = new CoverageAudit();
+        $audit->hook();
+        $tests  = apply_filters( 'site_status_tests', array( 'direct' => array(), 'async' => array() ) );
+        $before = get_option( ID::OPTION_BIBLE_STATS );
+
+        $result = call_user_func( $tests['direct'][ CoverageAudit::SITE_HEALTH_TEST ]['test'] );
+
+        $this->assertStringContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        $this->assertSame( 'recommended', $result['status'] );
+        // Pure read — the Site Health test must not recompute or persist.
+        $this->assertSame( $before, get_option( ID::OPTION_BIBLE_STATS ) );
+    }
+
+    public function test_site_health_drift_is_silent_when_live_gen_equals_the_enable_stamp(): void {
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 2000 );
+        $this->seedRollupAtGen( 2000 ); // reconciled against the live corpus → no drift.
+
+        $audit = new CoverageAudit();
+        $audit->hook();
+        $tests = apply_filters( 'site_status_tests', array( 'direct' => array(), 'async' => array() ) );
+
+        $result = call_user_func( $tests['direct'][ CoverageAudit::SITE_HEALTH_TEST ]['test'] );
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        $this->assertSame( 'good', $result['status'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_inline_disabled(): void {
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED, false );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 1000 );
+        $this->seedRollupAtGen( 2000 );
+
+        $result = ( new CoverageAudit() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
 }
