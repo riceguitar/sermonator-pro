@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Sermonator\Cli;
 
+use Sermonator\Migration\BibleChapterVendor;
 use Sermonator\Migration\BibleRefsBackfill;
+use Sermonator\Schema\BibleTranslations;
 use Sermonator\Schema\Identifiers as ID;
 
 /**
@@ -14,10 +16,11 @@ use Sermonator\Schema\Identifiers as ID;
  *
  *   wp sermonator bible backfill [--write] [--rollback] [--limit=<n>]
  *   wp sermonator bible flush
+ *   wp sermonator bible vendor [--translation=<id>] [--write] [--force] [--limit=<n>] [--rollback]
  *
- * Phase 3a is LINK-MODE only. The Phase 3b inline-text subcommands
- * (`bible vendor` / `bible warm`) are intentionally NOT registered here yet — see the
- * TODO below.
+ * Phase 3a was LINK-MODE only. Phase 3b Task 8 adds the `vendor` subcommand (vendor the
+ * public-domain ENGWEBP per-chapter text to the uploads snapshot, reversibly). The `warm`
+ * subcommand (prime the transient chapter cache) lands with Task 9 — see the TODO below.
  */
 final class BibleCommand {
     /**
@@ -106,7 +109,147 @@ final class BibleCommand {
         \WP_CLI::success( sprintf( 'Flushed bible chapter cache (generation %d -> %d).', $current, $next ) );
     }
 
-    // TODO(Phase 3b): `vendor` (vendor ENGWEBP per-chapter PD text) and `warm` (prime the
-    // chapter cache from disk/live) subcommands land with the inline-text layer — see spec
-    // Tasks 7 + 11. Phase 3a is LINK-MODE only: NO vendoring, NO live fetch, NO inline text.
+    /**
+     * Vendor the public-domain ENGWEBP per-chapter text to the uploads snapshot
+     * (`wp-content/uploads/sermonator-bible/<TRANSLATION>/<BOOK>/<chapter>.json`), the
+     * off-render-path source the front end reads with ZERO network I/O. Delegates to
+     * {@see BibleChapterVendor}, which owns every guardrail: ENGWEBP-only (refuses a
+     * non-PD / inline-ineligible translation), fill-missing + idempotent, migration-gated,
+     * structurally reversible (rollback deletes the snapshot dir), and never-fail-wrong
+     * (a failed chapter is simply left un-vendored → it stays a 3a link).
+     *
+     * Default-safe: with no flags this is a DRY RUN — it counts what WOULD be fetched,
+     * touching neither the network nor the disk. A real fetch+write requires `--write`.
+     * After any run it also prints the OFFLINE count-diff audit (candidate divergent-zone
+     * additions for human review — never auto-committed).
+     *
+     * ## OPTIONS
+     *
+     * [--translation=<id>]
+     * : Inline target translation id (default ENGWEBP). Must be public-domain AND an
+     *   audited inline target, else the command refuses.
+     *
+     * [--write]
+     * : Persist the snapshot (otherwise dry-run: report counts only).
+     *
+     * [--force]
+     * : Re-vendor chapters already present on disk (otherwise fill-missing only).
+     *
+     * [--limit=<n>]
+     * : Process at most N missing chapters this run (re-run to drain the rest; idempotent).
+     *
+     * [--rollback]
+     * : Delete the entire snapshot directory for the translation (exact reverse of vendoring).
+     *
+     * ## EXAMPLES
+     *
+     *     wp sermonator bible vendor
+     *     wp sermonator bible vendor --write
+     *     wp sermonator bible vendor --write --limit=200
+     *     wp sermonator bible vendor --rollback
+     *
+     * @param array<int,string>    $args
+     * @param array<string,string> $assoc_args
+     */
+    public function vendor( array $args, array $assoc_args ): void {
+        $translation = isset( $assoc_args['translation'] ) && '' !== (string) $assoc_args['translation']
+            ? (string) $assoc_args['translation']
+            : BibleTranslations::DEFAULT_INLINE;
+
+        $service = new BibleChapterVendor();
+
+        if ( ! empty( $assoc_args['rollback'] ) ) {
+            $result = $service->rollback( $translation );
+            if ( $result['gated'] ) {
+                \WP_CLI::warning( 'A migration is in progress — rollback is gated. Finalize or roll back the migration first.' );
+                return;
+            }
+            if ( null !== $result['error'] ) {
+                \WP_CLI::warning( $result['error'] );
+                return;
+            }
+            \WP_CLI::success( sprintf( 'Removed %d vendored chapter file(s) for %s.', $result['removed'], $translation ) );
+            return;
+        }
+
+        // Mirror BibleRefsBackfill: dry-run is the DEFAULT; a real write is opt-in via --write.
+        $dryRun = empty( $assoc_args['write'] );
+        $force  = ! empty( $assoc_args['force'] );
+        $limit  = isset( $assoc_args['limit'] ) ? (int) $assoc_args['limit'] : 0;
+
+        $result = $service->vendor( $translation, $dryRun, $force, $limit );
+
+        if ( null !== $result['refused'] ) {
+            \WP_CLI::warning( $result['refused'] );
+            return;
+        }
+        if ( $result['gated'] ) {
+            \WP_CLI::warning( 'A migration is in progress — vendoring is gated. Finalize or roll back the migration first (dry-run remains available).' );
+            return;
+        }
+        if ( null !== $result['error'] ) {
+            \WP_CLI::warning( $result['error'] );
+            return;
+        }
+
+        $status = $result['status'];
+        \WP_CLI::log( sprintf(
+            'Snapshot %s: %d/%d chapters present%s. This run: %d processed, %d written, %d failed, %d already-present.',
+            $translation,
+            $status['present'],
+            $status['total'],
+            $status['complete'] ? ' (COMPLETE)' : '',
+            $result['processed'],
+            $result['written'],
+            $result['failed'],
+            $result['skipped']
+        ) );
+
+        $this->reportCountDiff( $service->auditCountDiff( $translation ) );
+
+        \WP_CLI::success(
+            $dryRun
+                ? sprintf( 'Dry run complete — %d chapter(s) would be vendored (pass --write to persist).', $result['processed'] )
+                : sprintf( 'Vendored %d chapter(s) for %s.', $result['written'], $translation )
+        );
+    }
+
+    /**
+     * Print the OFFLINE count-diff audit: candidate divergent-zone additions the operator
+     * should triage. NEVER auto-committed — these are proposals only (design §3.4).
+     *
+     * @param array{comparisons:int,proposed:list<array{book:string,chapter:int,webCount:int,referenceCount:int}>,alreadyModeled:list<array{book:string,chapter:int,webCount:int,referenceCount:int}>} $audit
+     */
+    private function reportCountDiff( array $audit ): void {
+        if ( 0 === $audit['comparisons'] ) {
+            \WP_CLI::log( 'Count-diff audit: no vendored chapters to compare yet.' );
+            return;
+        }
+
+        if ( array() === $audit['proposed'] ) {
+            \WP_CLI::log( sprintf(
+                'Count-diff audit: %d chapter(s) compared; no unmodeled verse-count divergences.',
+                $audit['comparisons']
+            ) );
+            return;
+        }
+
+        \WP_CLI::warning( sprintf(
+            'Count-diff audit: %d UNMODELED verse-count divergence(s) found — candidate VersificationGate divergent-zone additions (review manually; NEVER auto-committed):',
+            count( $audit['proposed'] )
+        ) );
+        foreach ( $audit['proposed'] as $entry ) {
+            \WP_CLI::log( sprintf(
+                '  - %s %d: WEB present=%d, reference=%d',
+                $entry['book'],
+                $entry['chapter'],
+                $entry['webCount'],
+                $entry['referenceCount']
+            ) );
+        }
+    }
+
+    // TODO(Phase 3b Task 9): `warm` (prime the transient chapter cache on save + a chunked
+    // CLI backfill) lands with BibleWarmer — migration-gated, fill-missing, reversible
+    // (reverse == `flush` gen bump / TTL expiry). Vendoring (above) is its disk-snapshot peer.
 }
