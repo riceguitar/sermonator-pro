@@ -59,7 +59,7 @@ final class PrevalenceCounterTest extends WP_UnitTestCase {
         // Embedded [sermons] density: a 2-attr embed, a bare embed, and a decoy that must NOT match.
         $this->makePost( 'Intro [sermons per_page="5" orderby="date"] outro' );
         $this->makePost( 'Just [sermons] here' );
-        $this->makePost( 'A [list_sermons] and [sermon_images] — neither is [sermons].' );
+        $this->makePost( 'A [list_sermons] and [sermon_images] — neither is the sermons list.' );
 
         $stats = ( new PrevalenceCounter() )->run();
 
@@ -80,6 +80,23 @@ final class PrevalenceCounterTest extends WP_UnitTestCase {
 
         // Page-builder block ships zero findings in this fixture (no builder pages).
         $this->assertSame( 0, $stats['page_builder']['pages'] );
+    }
+
+    /**
+     * Locks in the intended (and correct) production behavior: a real `[sermons]` token in prose
+     * IS a sermons embed and MUST be counted, while sibling shortcodes whose names merely contain
+     * `sermons` ({@see `[list_sermons]`}/{@see `[sermon_images]`}) are NOT. This is the inverse of
+     * the §63 decoy fixture and guards against a regex over-/under-match regression.
+     */
+    public function test_real_sermons_token_in_prose_is_counted(): void {
+        $this->makePost( 'Prose with a stray [sermons] token mid-paragraph counts.' );
+        $this->makePost( 'A [list_sermons] and [sermon_images] do not count.' );
+
+        $shortcodes = ( new PrevalenceCounter() )->tally()['shortcodes'];
+
+        $this->assertSame( 1, $shortcodes['posts'] );
+        $this->assertSame( 0, $shortcodes['with_attributes'] );
+        $this->assertSame( 0, $shortcodes['max_attributes'] );
     }
 
     public function test_shortcode_attribute_density_parses_real_atts(): void {
