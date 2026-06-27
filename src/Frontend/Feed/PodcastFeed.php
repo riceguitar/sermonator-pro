@@ -98,7 +98,15 @@ final class PodcastFeed {
 
     /** @return list<FeedItem> */
     private function items(): array {
-        $result   = ( new SermonQuery() )->run( array( 'perPage' => self::MAX_ITEMS ) );
+        // Pin page 1 EXPLICITLY. The feed never paginates — it caps at MAX_ITEMS and fires
+        // sermonator_feed_truncated for the tail. SermonQuery::run() defaults a missing `page`
+        // to the registered, PUBLIC `sermon_page` query var (the embedded-list read-path pin),
+        // so omitting it here would let a stray/hostile `?sermon_page=N` on the feed URL silently
+        // serve a DIFFERENT episode set — page 2 of a <=300-sermon site is empty (offset past the
+        // data) and larger archives would serve 301-600 instead of the latest 300. That is exactly
+        // the never-fail-WRONG the contract forbids on this flagship read-only surface, so the feed
+        // is isolated from the request's pagination var.
+        $result   = ( new SermonQuery() )->run( array( 'perPage' => self::MAX_ITEMS, 'page' => 1 ) );
         $resolver = new EnclosureResolver();
         $guids    = new LegacyEpisodeGuid();
 
