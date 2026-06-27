@@ -194,4 +194,314 @@ final class BibleResolverTest extends TestCase {
         $this->assertSame( 'ESV', $this->resolvedHook[0]['version'] );
         $this->assertSame( 'JHN', $this->resolvedHook[0]['ref']['bookUSFM'] );
     }
+
+    // ---------------------------------------------------------------------------
+    // Phase 3b — the inline path (L1–L9, per-ref fail-open to the link).
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Re-stub get_option to drive the 3b inline options on top of the axis-A link
+     * version (still ESV). Any option not in the map returns its caller default — so an
+     * absent OPTION_BIBLE_INLINE_ENABLED reads false (the 3a default).
+     *
+     * @param array<string,mixed> $opts
+     */
+    private function stubOptions( array $opts ): void {
+        Functions\when( 'get_option' )->alias( function ( $name, $default = false ) use ( $opts ) {
+            if ( Identifiers::OPTION_BIBLE_LINK_VERSION === $name ) {
+                return 'ESV';
+            }
+            return array_key_exists( $name, $opts ) ? $opts[ $name ] : $default;
+        } );
+    }
+
+    /**
+     * Turn inline rendering ON with a chosen confidence floor and attestation state.
+     *
+     * @param array<string,mixed> $extra
+     */
+    private function enableInline( string $floor = 'exact', bool $attested = false, array $extra = array() ): void {
+        $this->stubOptions( array_merge( array(
+            Identifiers::OPTION_BIBLE_INLINE_ENABLED          => true,
+            Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR => $floor,
+            Identifiers::OPTION_BIBLE_INLINE_ATTESTATION      => $attested,
+        ), $extra ) );
+    }
+
+    /**
+     * A render-context chapter resolver spy: records every (translation,book,chapter,
+     * warmContext) call and returns a canned chapter. Proves the off-render-path
+     * invariant (warmContext is ALWAYS false).
+     *
+     * @param list<array{number:int,nodes:list<array{type:string,text:string}>}>|null $chapter
+     *
+     * @return callable(string,string,int,bool):(array<int,mixed>|null)
+     */
+    private function chapterSpy( ?array $chapter, array &$calls ): callable {
+        return function ( $translation, $book, $chapterNum, $warmContext ) use ( $chapter, &$calls ) {
+            $calls[] = array( $translation, $book, $chapterNum, $warmContext );
+            return $chapter;
+        };
+    }
+
+    /**
+     * A single author-confirmed (exact, authored, ESV-sourced) inline-shaped ref —
+     * John 3:16 — that clears L1–L7 so the later layers (or the option gate) are what's
+     * under test.
+     *
+     * @param array<string,mixed> $overrides
+     *
+     * @return array<string,mixed>
+     */
+    private function exactRef( array $overrides = array() ): array {
+        return array_merge( array(
+            'bookUSFM'                   => 'JHN',
+            'chapterStart'               => 3,
+            'verseStart'                 => 16,
+            'verseEnd'                   => null,
+            'chapterEnd'                 => null,
+            'raw'                        => 'John 3:16',
+            'confidence'                 => 'exact',
+            'srcVersification'           => 'ESV',
+            'srcVersificationConfidence' => 'authored',
+        ), $overrides );
+    }
+
+    /** A normalized chapter containing John 3:16 with a renderable text node. */
+    private function chapterWithVerse16(): array {
+        return array(
+            array( 'number' => 15, 'nodes' => array( array( 'type' => 'text', 'text' => 'whoever believes…' ) ) ),
+            array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'For God so loved the world,' ) ) ),
+            array( 'number' => 17, 'nodes' => array( array( 'type' => 'text', 'text' => 'For God did not send…' ) ) ),
+        );
+    }
+
+    public function test_inline_disabled_falls_open_to_link_with_no_fallback(): void {
+        // OPTION_BIBLE_INLINE_ENABLED unset -> false: pure 3a, byte-identical.
+        $this->stubOptions( array() );
+        $this->stubMeta( $this->envelope( array( $this->exactRef() ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertInstanceOf( ResolvedScripture::class, $resolved );
+        $refs = $resolved->refs();
+        $this->assertNull( $refs[0]['inline'] );
+        // No inline attempt at all -> the chapter resolver is never even consulted.
+        $this->assertSame( array(), $calls );
+        // Disabled is NOT a fall-open: it must not fire the observability hook.
+        $this->assertCount( 0, $this->fallbackHook );
+        $this->assertCount( 1, $this->resolvedHook );
+    }
+
+    public function test_inline_success_builds_typed_payload_off_render_path(): void {
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array( $this->exactRef() ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertInstanceOf( ResolvedScripture::class, $resolved );
+        $inline = $resolved->refs()[0]['inline'];
+
+        $this->assertIsArray( $inline );
+        $this->assertSame( 'ENGWEBP', $inline['translation'] );
+        $this->assertSame( 'World English Bible', $inline['attribution'] );
+        // ONLY verse 16 is sliced out of the chapter (not 15 / 17).
+        $this->assertCount( 1, $inline['verses'] );
+        $this->assertSame( 16, $inline['verses'][0]['number'] );
+        $this->assertSame( 'text', $inline['verses'][0]['nodes'][0]['type'] );
+        $this->assertSame( 'For God so loved the world,', $inline['verses'][0]['nodes'][0]['text'] );
+
+        // OFF-RENDER-PATH proof: the chapter was read with warmContext === false.
+        $this->assertCount( 1, $calls );
+        $this->assertSame( array( 'ENGWEBP', 'JHN', 3, false ), $calls[0] );
+        // A successful inline still resolves (and fires NO fallback).
+        $this->assertCount( 0, $this->fallbackHook );
+        $this->assertCount( 1, $this->resolvedHook );
+    }
+
+    public function test_inline_verse_range_slices_full_span(): void {
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'verseStart' => 16, 'verseEnd' => 17, 'raw' => 'John 3:16-17' ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $inline = $resolved->refs()[0]['inline'];
+        $this->assertIsArray( $inline );
+        $this->assertSame( array( 16, 17 ), array_column( $inline['verses'], 'number' ) );
+    }
+
+    public function test_inline_low_confidence_falls_open(): void {
+        // Floor is exact; a `probable` ref must fall open with reason low-confidence.
+        $this->enableInline( 'exact' );
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'confidence' => 'probable' ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'low-confidence', $this->fallbackHook[0]['reason'] );
+        // L2 fails BEFORE L8 -> the chapter resolver is never reached.
+        $this->assertSame( array(), $calls );
+    }
+
+    public function test_inline_widened_floor_admits_probable(): void {
+        // Admin widened the floor to `probable`: the same ref now inlines.
+        $this->enableInline( 'probable' );
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'confidence' => 'probable' ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertIsArray( $resolved->refs()[0]['inline'] );
+        $this->assertCount( 0, $this->fallbackHook );
+    }
+
+    public function test_inline_translation_ineligible_falls_open(): void {
+        // Force the inline target to ENGKJV (inline-INELIGIBLE) via the trusted filter.
+        Functions\when( 'apply_filters' )->alias( function ( $tag, $value ) {
+            return 'sermonator_bible_translation' === $tag ? 'ENGKJV' : $value;
+        } );
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array( $this->exactRef() ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'translation-ineligible', $this->fallbackHook[0]['reason'] );
+        $this->assertSame( array(), $calls );
+    }
+
+    public function test_inline_src_versification_unsupported_falls_open(): void {
+        // A Spanish Reina-Valera source normalizes to NO modeled family (L4).
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'srcVersification' => 'RVR1960' ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'src-versification-unsupported', $this->fallbackHook[0]['reason'] );
+    }
+
+    public function test_inline_unattested_site_default_falls_open(): void {
+        // A site-default-provenance ref (no `authored` stamp) with attestation OFF (L6).
+        $this->enableInline( 'exact', false );
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'srcVersificationConfidence' => 'site-default' ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'src-versification-unattested', $this->fallbackHook[0]['reason'] );
+    }
+
+    public function test_inline_attestation_admits_site_default(): void {
+        // Same ref, attestation ON -> L6 passes and it inlines.
+        $this->enableInline( 'exact', true );
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'srcVersificationConfidence' => 'site-default' ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+        $this->assertIsArray( $resolved->refs()[0]['inline'] );
+        $this->assertCount( 0, $this->fallbackHook );
+    }
+
+    public function test_inline_versification_divergent_zone_falls_open(): void {
+        // Romans 16 is an enumerated English↔English renumber zone (L7).
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array(
+                'bookUSFM'     => 'ROM',
+                'chapterStart' => 16,
+                'verseStart'   => 25,
+                'raw'          => 'Romans 16:25',
+            ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'versification-divergent', $this->fallbackHook[0]['reason'] );
+        // L7 fails BEFORE the render-time chapter read.
+        $this->assertSame( array(), $calls );
+    }
+
+    public function test_inline_chapter_unavailable_falls_open(): void {
+        // Cleared L1–L7, but the chapter is not warmed/vendored (L8) -> null chapter.
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array( $this->exactRef() ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( null, $calls ) );
+
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'chapter-unavailable', $this->fallbackHook[0]['reason'] );
+        // Still queried OFF the render path (warmContext false), and only once.
+        $this->assertSame( array( array( 'ENGWEBP', 'JHN', 3, false ) ), $calls );
+    }
+
+    public function test_inline_verse_out_of_range_fails_whole_ref_open(): void {
+        // The chapter is present but lacks verse 16 (a critical-text gap) -> L9 fails.
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array( $this->exactRef() ) ) );
+
+        $shortChapter = array(
+            array( 'number' => 14, 'nodes' => array( array( 'type' => 'text', 'text' => '…' ) ) ),
+            array( 'number' => 15, 'nodes' => array( array( 'type' => 'text', 'text' => '…' ) ) ),
+        );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $shortChapter, $calls ) );
+
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'verse-out-of-range', $this->fallbackHook[0]['reason'] );
+    }
+
+    public function test_inline_chapter_only_ref_is_not_inline_shaped(): void {
+        // L1: a whole-chapter cite (no verseStart) can never inline.
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array(
+            array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => null, 'verseEnd' => null, 'chapterEnd' => null, 'raw' => 'John 3', 'confidence' => 'exact' ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'not-inline-eligible', $this->fallbackHook[0]['reason'] );
+        $this->assertSame( array(), $calls );
+    }
+
+    public function test_inline_fell_open_ref_still_resolves_as_a_link(): void {
+        // A fall-open ref fires BOTH fallback (the reason) AND resolved (it is a link).
+        $this->enableInline();
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'srcVersification' => 'RVR1960' ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( null, $calls ) );
+        $ref      = $resolved->refs()[0];
+
+        $this->assertNull( $ref['inline'] );
+        $this->assertSame( 'John 3:16', $ref['label'] );
+        $this->assertSame( 'ESV', $ref['version'] );
+        $this->assertCount( 1, $this->fallbackHook );
+        $this->assertCount( 1, $this->resolvedHook );
+    }
 }
