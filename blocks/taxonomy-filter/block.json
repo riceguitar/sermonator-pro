@@ -12,6 +12,22 @@
     "showCount": { "type": "boolean", "default": true },
     "hideEmpty": { "type": "boolean", "default": true }
   },
+  "variations": [
+    {
+      "name": "sermon-list",
+      "title": "Sermon List",
+      "description": "A list of links to your sermon series — the classic \"list sermons\" layout. A preset of the Sermon Taxonomy List block.",
+      "icon": "list-view",
+      "keywords": [ "list sermons", "list_sermons", "sermons", "series", "sermon list" ],
+      "scope": [ "inserter" ],
+      "attributes": {
+        "taxonomy": "sermonator_series",
+        "showCount": true,
+        "hideEmpty": true
+      },
+      "isActive": [ "taxonomy" ]
+    }
+  ],
   "supports": {
     "html": false
   },
