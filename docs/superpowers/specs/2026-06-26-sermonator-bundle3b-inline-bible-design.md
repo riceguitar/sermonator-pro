@@ -68,3 +68,10 @@ Unit (Brain Monkey): `VersificationGate` never-render-wrong-text + divergence-ga
 14. **T14** `CoverageAudit` extension + `bible audit --inline` (withheld-by-reason, inline-eligible%, unmodeled-pair counter) + Site Health.
 15. **T15** `SettingsRegistrar`: 3 new options; `OPTION_BIBLE_INLINE_ENABLED` un-enableable until vendored+warmed; attestation + floor controls; cache-gen bump.
 16. **T16** CORPUS GATE (operational): run `bible audit --inline` over the real migrated corpus; set precision/recall floors + MODELED_PAIRS/attestation defaults from the numbers. Go/no-go for enabling 3b at scale.
+
+## 8. T16 corpus-gate result (run 2026-06-27 on the migrated test corpus)
+`wp sermonator bible audit --inline` over the real corpus (855 parsed references):
+- **inline-eligible: 0%** at the default `exact` confidence floor.
+- Withheld: **651 low-confidence** (backfilled `probable` refs — never author-confirmed), **204 not-inline-eligible** (chapter-only / cross-chapter / structural). Zero withheld for versification reasons (no wrong-text exposure).
+
+**Decision:** ship Phase 3b with inline **DISABLED by default** (the un-enableable-until-vendored gate already enforces this). The data confirms the designed conservative posture: legacy backfilled refs are `probable`, so they stay LINKS (never wrong inline text). Inline lights up for (a) new sermons whose refs the author **confirms** via the confirm-chip panel (→ `exact`), or (b) an admin who reviews the misparse risk and opts into the `derived-exact` floor (the 651 low-confidence tail is the candidate pool). No mass-enable for legacy content without one of those — exactly the never-fail-wrong trade (recall sacrificed, correctness absolute).
