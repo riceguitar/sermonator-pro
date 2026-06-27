@@ -173,4 +173,23 @@ final class PageBuilderScannerTest extends TestCase {
         // Sanity: it really did detect something (so "no writes" isn't vacuously true).
         $this->assertNotEmpty( $findings );
     }
+
+    /**
+     * hook() must register BOTH fail-visible surfaces. This is the contract Plugin::boot()
+     * relies on; the matching integration test asserts boot() actually CALLS hook() in
+     * production (the dark-ship regression). A fast Brain Monkey guard so a missing
+     * registration is caught without Docker.
+     */
+    public function test_hook_registers_both_fail_visible_surfaces(): void {
+        Functions\expect( 'add_filter' )
+            ->once()
+            ->with( 'site_status_tests', \Mockery::type( 'array' ) );
+        Functions\expect( 'add_action' )
+            ->once()
+            ->with( 'admin_notices', \Mockery::type( 'array' ) );
+
+        ( new PageBuilderScanner() )->hook();
+
+        $this->addToAssertionCount( 1 );
+    }
 }

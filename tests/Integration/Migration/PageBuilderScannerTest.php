@@ -147,6 +147,84 @@ final class PageBuilderScannerTest extends WP_UnitTestCase {
         $this->assertSame( 'good', $result['status'] );
     }
 
+    /**
+     * Production-wiring guard. The other tests construct a PageBuilderScanner and invoke its
+     * methods directly, so they stay green even if NOTHING in production wires it — which is
+     * exactly how T10 shipped dark (the scanner's hook() was never called from Plugin::boot()).
+     * This asserts the LIVE filter registered by Plugin::boot() during plugin load (see
+     * tests/bootstrap-integration.php), with NO manual hook() here — so a regression that drops
+     * the wiring fails loudly instead of false-greening. Boot is idempotent (static guard).
+     */
+    public function test_plugin_boot_registers_the_site_health_test_in_production(): void {
+        // No $scanner->hook() here on purpose — this must be wired by Plugin::boot().
+        \Sermonator\Plugin::boot();
+
+        $tests = apply_filters( 'site_status_tests', array( 'direct' => array(), 'async' => array() ) );
+
+        $this->assertArrayHasKey(
+            PageBuilderScanner::SITE_HEALTH_TEST,
+            $tests['direct'],
+            'Plugin::boot() must wire PageBuilderScanner so the Site Health test is registered in production.'
+        );
+        $this->assertIsCallable( $tests['direct'][ PageBuilderScanner::SITE_HEALTH_TEST ]['test'] );
+    }
+
+    /**
+     * End-to-end "surfaced in BOTH" guard for the wizard report. Boot wires the admin_notices
+     * action; on the migration-wizard screen the registered callback must EMIT the findings
+     * report. Asserts the real action output (not a direct renderReport() call), so dropping the
+     * admin_notices wiring from Plugin::boot() — or breaking the screen scope — fails loudly.
+     */
+    public function test_plugin_boot_wizard_admin_notice_emits_report_on_wizard_screen(): void {
+        $id = $this->makePost(
+            '',
+            array( '_elementor_data' => '[{"settings":{"shortcode":"[sermons]"}}]' ),
+            'publish',
+            'Sermons Landing'
+        );
+
+        \Sermonator\Plugin::boot();
+
+        // Simulate being on the migration-wizard admin screen so maybeRenderWizardNotice() fires.
+        set_current_screen( 'toplevel_page_' . \Sermonator\Admin\MigrationWizard::PAGE_SLUG );
+
+        ob_start();
+        do_action( 'admin_notices' );
+        $html = (string) ob_get_clean();
+
+        $this->assertStringContainsString(
+            'sermonator-page-builder-findings',
+            $html,
+            'Plugin::boot() must wire admin_notices so the wizard report is emitted on the wizard screen.'
+        );
+        $this->assertStringContainsString( (string) $id, $html );
+
+        set_current_screen( 'front' );
+    }
+
+    /**
+     * The wizard admin notice must NOT leak onto unrelated admin screens (admin_notices fires on
+     * every admin page). Confirms the screen-scope guard inside maybeRenderWizardNotice().
+     */
+    public function test_wizard_admin_notice_is_silent_off_the_wizard_screen(): void {
+        $this->makePost(
+            '',
+            array( '_elementor_data' => '[{"settings":{"shortcode":"[sermons]"}}]' )
+        );
+
+        \Sermonator\Plugin::boot();
+
+        set_current_screen( 'dashboard' );
+
+        ob_start();
+        do_action( 'admin_notices' );
+        $html = (string) ob_get_clean();
+
+        $this->assertStringNotContainsString( 'sermonator-page-builder-findings', $html );
+
+        set_current_screen( 'front' );
+    }
+
     public function test_render_report_escapes_and_lists_findings(): void {
         $this->makePost(
             '',
