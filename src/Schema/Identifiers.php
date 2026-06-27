@@ -122,6 +122,18 @@ final class Identifiers {
     public const OPTION_PREACHER_LABEL          = 'sermonator_preacher_label';
 
     /**
+     * Legacy Sermon Manager archive ordering defaults, migrated VERBATIM by
+     * OptionWriter's wholesale `sermonmanager_*`→`sermonator_*` prefix-swap (see
+     * MappingContract::mapOptionName). The Bundle 2 `[sermons]` shim consults these
+     * as the default `order`/`orderby` and to resolve `orderby=date` exactly as
+     * SM's display_sermons() did (date→published ONLY when archive_orderby==='date',
+     * else preached). SM's own defaults when the option is ABSENT: orderby
+     * `date_preached`, order `desc` (class-sm-settings-display.php:69/80).
+     */
+    public const OPTION_ARCHIVE_ORDERBY         = 'sermonator_archive_orderby';
+    public const OPTION_ARCHIVE_ORDER           = 'sermonator_archive_order';
+
+    /**
      * Persistent flag set by SlugRewriteFlusher ONLY on a real archive-slug value
      * change; an `init@99` handler scoped to admin/cron flushes rewrite rules
      * exactly once then clears it, so a front-end visitor never pays the flush.

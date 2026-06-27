@@ -36,6 +36,16 @@ final class LegacyIdentifiers {
 
     public const OPTION_PREFIX         = 'sermonmanager_';
     public const OPTION_DEFAULT_PODCAST = 'wpfc_sm_default_podcast';
+    /**
+     * Legacy archive ordering settings (stored by SM as WP options
+     * `sermonmanager_archive_orderby` / `sermonmanager_archive_order`, read via
+     * SermonManager::getOption()). Migrated wholesale by the OPTION_PREFIX swap.
+     * SM defaults when absent: orderby `date_preached`, order `desc`.
+     */
+    public const OPTION_ARCHIVE_ORDERBY = 'sermonmanager_archive_orderby';
+    public const OPTION_ARCHIVE_ORDER   = 'sermonmanager_archive_order';
+    public const ARCHIVE_ORDERBY_DEFAULT = 'date_preached';
+    public const ARCHIVE_ORDER_DEFAULT   = 'desc';
     public const META_PODCAST_SETTINGS  = 'sm_podcast_settings';
     public const OPTION_TERM_IMAGES      = 'sermon_image_plugin';
     public const OPTION_TERM_IMAGES_SETTINGS = 'sermon_image_plugin_settings';
