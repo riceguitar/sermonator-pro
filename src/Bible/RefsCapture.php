@@ -43,6 +43,39 @@ final class RefsCapture {
     public const UNPARSEABLE_SENTINEL = '1';
 
     /**
+     * The ONLY confidence tiers a producer may ever PERSIST (design §3.4, "de-store the
+     * tier"). The stored-confidence vocabulary is DISJOINT from the render-time floor
+     * vocabulary `{derived-exact, derived-exact-perseg}` owned by
+     * {@see DerivedExactClassifier}:
+     *  - `exact`     — the author confirmed the structured chips (the confirm-chip REST
+     *                  path is the ONLY producer of this tier).
+     *  - `probable`  — a heuristic free-text parse the validator fully cleared.
+     *  - `ambiguous` — a ref the validator could not fully clear.
+     *
+     * "derived-exact" is a RENDER-TIME promotion computed by {@see DerivedExactClassifier},
+     * NEVER persisted. A pre-stamped `derived-exact*` confidence would smuggle past the
+     * classifier and clear the inline floor without the re-parse-identity check — so no
+     * producer may ever emit it. {@see self::normalizeStoredConfidence()} is the single
+     * enforcement point both producers route through.
+     */
+    public const STORED_CONFIDENCE_EXACT     = 'exact';
+    public const STORED_CONFIDENCE_PROBABLE  = 'probable';
+    public const STORED_CONFIDENCE_AMBIGUOUS = 'ambiguous';
+
+    /**
+     * The closed set of persistable stored-confidence tiers (an allow-list; anything
+     * outside it — a floor-only `derived-exact*` tier, a smuggled client value, garbage —
+     * is rejected by {@see self::normalizeStoredConfidence()}).
+     *
+     * @var list<string>
+     */
+    private const STORED_CONFIDENCE_TIERS = array(
+        self::STORED_CONFIDENCE_EXACT,
+        self::STORED_CONFIDENCE_PROBABLE,
+        self::STORED_CONFIDENCE_AMBIGUOUS,
+    );
+
+    /**
      * Optional per-ref provenance field (design §3.2) describing HOW the ref's
      * `srcVersification` was established:
      *  - `authored`     — stamped contemporaneously at an authoring save with the
@@ -75,6 +108,27 @@ final class RefsCapture {
         return self::SRC_VERSIFICATION_CONFIDENCE_AUTHORED === $value
             ? self::SRC_VERSIFICATION_CONFIDENCE_AUTHORED
             : self::SRC_VERSIFICATION_CONFIDENCE_SITE_DEFAULT;
+    }
+
+    /**
+     * De-store enforcement (design §3.4): coerce any candidate confidence to a PERSISTABLE
+     * stored tier, ACTIVELY rejecting a de-stored floor-only tier (`derived-exact` /
+     * `derived-exact-perseg`). A recognized stored tier
+     * ({@see self::STORED_CONFIDENCE_TIERS}) passes through verbatim; ANYTHING else — a
+     * floor-only tier, a smuggled client value, a non-string, garbage — normalizes to the
+     * conservative {@see self::STORED_CONFIDENCE_PROBABLE}.
+     *
+     * This is the SINGLE place the producers guarantee that no `derived-exact*` value is
+     * ever written, closing the bypass where a pre-stamped tier would clear the inline floor
+     * without running the {@see DerivedExactClassifier}. The classifier stays the ONLY
+     * promotion path.
+     *
+     * @param mixed $confidence A computed or client-supplied confidence value.
+     */
+    public static function normalizeStoredConfidence( $confidence ): string {
+        return in_array( $confidence, self::STORED_CONFIDENCE_TIERS, true )
+            ? (string) $confidence
+            : self::STORED_CONFIDENCE_PROBABLE;
     }
 
     /**
@@ -207,7 +261,15 @@ final class RefsCapture {
      * @param array{inCanon:bool,structurallyValid:bool,inlineEligible:bool} $flags
      */
     private function confidence( array $flags ): string {
-        return ( $flags['inCanon'] && $flags['structurallyValid'] ) ? 'probable' : 'ambiguous';
+        $confidence = ( $flags['inCanon'] && $flags['structurallyValid'] )
+            ? self::STORED_CONFIDENCE_PROBABLE
+            : self::STORED_CONFIDENCE_AMBIGUOUS;
+
+        // De-store enforcement (design §3.4): this producer may persist ONLY a stored tier;
+        // never a floor-only `derived-exact*` tier (which is computed at render time by the
+        // classifier). Belt-and-suspenders — the literals above are already in-set — but it
+        // pins the guarantee at the single emit point so the producer can never regress.
+        return self::normalizeStoredConfidence( $confidence );
     }
 
     /**

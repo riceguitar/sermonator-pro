@@ -122,9 +122,15 @@ final class SermonRefsRestSanitizer {
                 continue; // confirmed-but-bogus ref never reaches storage
             }
 
-            // Server-authored provenance — overwrites whatever the client sent.
+            // Server-authored provenance — overwrites whatever the client sent. The
+            // client's submitted `confidence` is NEVER trusted: a forged
+            // `confidence:derived-exact*` (the de-stored render-time tier) is discarded
+            // here and the confirm-chip's `exact` is stamped instead (server-side stamp
+            // wins, design §3.4). The stamp is additionally routed through the producer's
+            // de-store normalizer so a floor-only tier can never reach storage even if this
+            // literal ever regressed — the classifier stays the only promotion path.
             $structural['source']                     = 'authoring';
-            $structural['confidence']                 = 'exact';
+            $structural['confidence']                 = RefsCapture::normalizeStoredConfidence( RefsCapture::STORED_CONFIDENCE_EXACT );
             $structural['srcVersification']           = $srcVersification;
             $structural['srcVersificationConfidence'] = RefsCapture::SRC_VERSIFICATION_CONFIDENCE_AUTHORED;
 

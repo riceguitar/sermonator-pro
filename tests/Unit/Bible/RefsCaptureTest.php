@@ -7,6 +7,7 @@ namespace Sermonator\Tests\Unit\Bible;
 use Brain\Monkey;
 use Brain\Monkey\Functions;
 use PHPUnit\Framework\TestCase;
+use Sermonator\Bible\DerivedExactClassifier;
 use Sermonator\Bible\RefsCapture;
 use Sermonator\Schema\Identifiers as ID;
 
@@ -272,6 +273,66 @@ final class RefsCaptureTest extends TestCase {
         $result = ( new RefsCapture() )->captureForPost( 1, 'authoring' );
 
         $this->assertFalse( $result['wrote'], 'A prior sentinel makes a re-capture a no-op.' );
+    }
+
+    public function test_producer_never_emits_a_de_stored_derived_exact_tier(): void {
+        // De-store enforcement (design §3.4): "derived-exact" is a RENDER-TIME promotion
+        // computed by the classifier, NEVER persisted. The producer must only ever stamp a
+        // stored tier {exact,probable,ambiguous} — emphatically including the inline-SHAPED
+        // 'John 3:16' (verseStart set, chapterEnd null) which the classifier WOULD promote
+        // at render time but which must persist as plain `probable`.
+        $this->sermon( 1, 'John 3:16' );                 // L1-shaped, classifier-promotable.
+        $this->sermon( 2, 'John 3:16; Romans 8:28' );    // compound.
+        $this->sermon( 3, 'Genesis 1' );                 // chapter-only.
+
+        $capture  = new RefsCapture();
+        $deStored = array(
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG,
+        );
+
+        foreach ( array( 1, 2, 3 ) as $id ) {
+            $capture->captureForPost( $id, 'backfill' );
+            foreach ( $this->envelopeOf( $id )['refs'] as $ref ) {
+                $this->assertContains(
+                    $ref['confidence'],
+                    array( 'exact', 'probable', 'ambiguous' ),
+                    'Producer emits only a stored-confidence tier.'
+                );
+                $this->assertNotContains(
+                    $ref['confidence'],
+                    $deStored,
+                    'Producer NEVER stamps a de-stored render-time floor tier.'
+                );
+            }
+        }
+
+        // The classifier-promotable 'John 3:16' persists as the conservative `probable`.
+        $this->assertSame( 'probable', $this->envelopeOf( 1 )['refs'][0]['confidence'] );
+    }
+
+    public function test_normalize_stored_confidence_passes_through_recognized_tiers(): void {
+        foreach ( array( 'exact', 'probable', 'ambiguous' ) as $tier ) {
+            $this->assertSame( $tier, RefsCapture::normalizeStoredConfidence( $tier ) );
+        }
+    }
+
+    public function test_normalize_stored_confidence_rejects_de_stored_floor_tiers(): void {
+        // A smuggled floor-only tier must be actively normalized to the conservative
+        // `probable` — it can never persist and clear the inline floor past the classifier.
+        $this->assertSame(
+            'probable',
+            RefsCapture::normalizeStoredConfidence( DerivedExactClassifier::FLOOR_DERIVED_EXACT )
+        );
+        $this->assertSame(
+            'probable',
+            RefsCapture::normalizeStoredConfidence( DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG )
+        );
+
+        // Any other non-stored value (garbage, wrong case, non-string) also normalizes.
+        foreach ( array( 'DERIVED-EXACT', 'inline', '', 0, null, array() ) as $bad ) {
+            $this->assertSame( 'probable', RefsCapture::normalizeStoredConfidence( $bad ) );
+        }
     }
 
     public function test_plan_reports_outcome_without_writing(): void {
