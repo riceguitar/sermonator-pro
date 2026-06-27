@@ -256,6 +256,84 @@ final class Renderer {
     }
 
     /**
+     * A grid of linked taxonomy-term images (used by the sermon-images block). Pure: takes
+     * already-resolved {name,url,imageHtml,description} entries built OUTSIDE the renderer
+     * (the block does the get_terms / OPTION_TERM_IMAGES[tt_id] / wp_get_attachment_image
+     * resolution). `imageHtml` is core wp_get_attachment_image() output — already-safe HTML
+     * passed through verbatim; every other leaf is escaped here (esc_html / esc_url). Empty
+     * input → '' (empty-state).
+     *
+     * @param list<array{name:string,url:string,imageHtml:string,description:string}> $items
+     */
+    public function termImageGrid( array $items, string $label = '', int $columns = 3 ): string {
+        if ( $items === array() ) {
+            return '';
+        }
+        $columns = max( 1, min( 6, $columns ) );
+
+        $cells = '';
+        foreach ( $items as $item ) {
+            $inner = $item['imageHtml']
+                . '<span class="sermonator-image-grid__name">' . esc_html( $item['name'] ) . '</span>';
+            $cells .= '<li class="sermonator-image-grid__item">'
+                . ( $item['url'] !== ''
+                    ? '<a href="' . esc_url( $item['url'] ) . '">' . $inner . '</a>'
+                    : $inner )
+                . '</li>';
+        }
+
+        $heading = $label !== ''
+            ? '<h2 class="sermonator-image-grid__label">' . esc_html( $label ) . '</h2>'
+            : '';
+        return '<div class="sermonator-image-grid-wrap">' . $heading
+            . '<ul class="sermonator-image-grid" data-columns="' . esc_attr( (string) $columns ) . '">'
+            . $cells . '</ul></div>';
+    }
+
+    /**
+     * The latest series as a single image + title + description card (used by the
+     * latest-series block). Pure: takes ONE already-resolved
+     * {name,url,imageHtml,description} entry built OUTSIDE the renderer. `imageHtml` is core
+     * wp_get_attachment_image() output passed through as already-safe; the title is escaped
+     * (esc_html), the link esc_url'd, and the term description run through wp_kses_post (a
+     * curated term description may carry safe inline HTML). Empty input (or an entry with no
+     * series name) → '' (empty-state).
+     *
+     * @param array{name:string,url:string,imageHtml:string,description:string} $item
+     */
+    public function latestSeries( array $item, bool $showTitle = true, bool $showDescription = true ): string {
+        if ( ( $item['name'] ?? '' ) === '' ) {
+            return '';
+        }
+
+        $image = $item['imageHtml'];
+        if ( $image !== '' ) {
+            $media = $item['url'] !== ''
+                ? '<a class="sermonator-latest-series__media" href="' . esc_url( $item['url'] ) . '">' . $image . '</a>'
+                : '<figure class="sermonator-latest-series__media">' . $image . '</figure>';
+        } else {
+            $media = '';
+        }
+
+        $title = '';
+        if ( $showTitle ) {
+            $name   = esc_html( $item['name'] );
+            $titleInner = $item['url'] !== ''
+                ? '<a href="' . esc_url( $item['url'] ) . '">' . $name . '</a>'
+                : $name;
+            $title = '<h2 class="sermonator-latest-series__title">' . $titleInner . '</h2>';
+        }
+
+        $description = '';
+        if ( $showDescription && ( $item['description'] ?? '' ) !== '' ) {
+            $description = '<div class="sermonator-latest-series__description">'
+                . wp_kses_post( $item['description'] ) . '</div>';
+        }
+
+        return '<div class="sermonator-latest-series">' . $media . $title . $description . '</div>';
+    }
+
+    /**
      * Allowed HTML for a stored video embed. Delegates to the shared policy so the authoring
      * layer and the renderer can never drift.
      *

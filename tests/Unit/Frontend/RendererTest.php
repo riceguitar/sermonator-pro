@@ -249,6 +249,141 @@ final class RendererTest extends TestCase {
         $this->assertStringContainsString( 'Matthew 5:1-7:29', $html );
     }
 
+    public function test_term_image_grid_empty_input_renders_nothing(): void {
+        $this->assertSame( '', ( new Renderer() )->termImageGrid( array(), 'Series', 3 ) );
+    }
+
+    public function test_term_image_grid_renders_linked_images_with_label_and_columns(): void {
+        $items = array(
+            array(
+                'name'        => 'Grace',
+                'url'         => 'http://x/series/grace',
+                'imageHtml'   => '<img src="http://x/grace.jpg" alt="Grace">',
+                'description' => '',
+            ),
+            array(
+                'name'        => 'Hope',
+                'url'         => '',
+                'imageHtml'   => '<img src="http://x/hope.jpg" alt="Hope">',
+                'description' => '',
+            ),
+        );
+        $html = ( new Renderer() )->termImageGrid( $items, 'Series', 4 );
+
+        $this->assertStringContainsString( '<ul class="sermonator-image-grid" data-columns="4">', $html );
+        $this->assertStringContainsString( 'sermonator-image-grid__label', $html );
+        $this->assertStringContainsString( 'Series', $html );
+        // Core attachment HTML is passed through verbatim (already-safe).
+        $this->assertStringContainsString( '<img src="http://x/grace.jpg" alt="Grace">', $html );
+        // Linked item links to its term url; the unlinked item is plain.
+        $this->assertStringContainsString( '<a href="http://x/series/grace">', $html );
+        $this->assertSame( 2, substr_count( $html, 'sermonator-image-grid__item' ) );
+    }
+
+    public function test_term_image_grid_clamps_columns(): void {
+        $items = array( array( 'name' => 'A', 'url' => '', 'imageHtml' => '', 'description' => '' ) );
+        $this->assertStringContainsString(
+            'data-columns="6"',
+            ( new Renderer() )->termImageGrid( $items, '', 99 )
+        );
+        $this->assertStringContainsString(
+            'data-columns="1"',
+            ( new Renderer() )->termImageGrid( $items, '', 0 )
+        );
+    }
+
+    public function test_term_image_grid_escapes_name_and_url(): void {
+        Functions\when( 'esc_html' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+        Functions\when( 'esc_url' )->alias(
+            static fn( $s ) => str_replace( array( '"', '<', '>' ), array( '%22', '%3C', '%3E' ), (string) $s )
+        );
+
+        $items = array(
+            array(
+                'name'        => 'Evil <script>alert(1)</script>',
+                'url'         => 'http://x/"><script>',
+                // Already-safe core HTML — passed through untouched.
+                'imageHtml'   => '<img src="http://x/i.jpg" alt="">',
+                'description' => '',
+            ),
+        );
+        $html = ( new Renderer() )->termImageGrid( $items, 'Series', 3 );
+
+        $this->assertStringNotContainsString( '<script>', $html );
+        $this->assertStringNotContainsString( '"><script>', $html );
+        $this->assertStringContainsString( '&lt;script&gt;', $html );
+        // The attachment HTML still passed through verbatim.
+        $this->assertStringContainsString( '<img src="http://x/i.jpg" alt="">', $html );
+    }
+
+    public function test_latest_series_empty_input_renders_nothing(): void {
+        $r = new Renderer();
+        $this->assertSame( '', $r->latestSeries( array(), true, true ) );
+        $this->assertSame(
+            '',
+            $r->latestSeries(
+                array( 'name' => '', 'url' => 'http://x/s', 'imageHtml' => '<img>', 'description' => 'd' ),
+                true,
+                true
+            )
+        );
+    }
+
+    public function test_latest_series_renders_image_title_and_description(): void {
+        $item = array(
+            'name'        => 'Advent',
+            'url'         => 'http://x/series/advent',
+            'imageHtml'   => '<img src="http://x/advent.jpg" alt="Advent">',
+            'description' => 'A season of waiting.',
+        );
+        $html = ( new Renderer() )->latestSeries( $item, true, true );
+
+        $this->assertStringContainsString( 'sermonator-latest-series', $html );
+        $this->assertStringContainsString( '<img src="http://x/advent.jpg" alt="Advent">', $html );
+        $this->assertStringContainsString( '<a href="http://x/series/advent">Advent</a>', $html );
+        $this->assertStringContainsString( 'A season of waiting.', $html );
+    }
+
+    public function test_latest_series_respects_show_title_and_description_toggles(): void {
+        $item = array(
+            'name'        => 'Advent',
+            'url'         => 'http://x/series/advent',
+            'imageHtml'   => '<img src="http://x/advent.jpg" alt="Advent">',
+            'description' => 'A season of waiting.',
+        );
+        $html = ( new Renderer() )->latestSeries( $item, false, false );
+
+        $this->assertStringNotContainsString( 'sermonator-latest-series__title', $html );
+        $this->assertStringNotContainsString( 'sermonator-latest-series__description', $html );
+        // The image still renders even with both labels suppressed.
+        $this->assertStringContainsString( '<img src="http://x/advent.jpg" alt="Advent">', $html );
+    }
+
+    public function test_latest_series_escapes_title_url_and_kses_description(): void {
+        Functions\when( 'esc_html' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
+        Functions\when( 'esc_url' )->alias(
+            static fn( $s ) => str_replace( array( '"', '<', '>' ), array( '%22', '%3C', '%3E' ), (string) $s )
+        );
+        // wp_kses_post strips disallowed tags (e.g. <script>) but keeps safe inline HTML.
+        Functions\when( 'wp_kses_post' )->alias(
+            static fn( $s ) => preg_replace( '#<script\b[^>]*>.*?</script>#is', '', (string) $s )
+        );
+
+        $item = array(
+            'name'        => 'Evil <script>alert(1)</script>',
+            'url'         => 'http://x/"><script>',
+            'imageHtml'   => '<img src="http://x/i.jpg" alt="">',
+            'description' => 'Safe <em>desc</em><script>alert(2)</script>',
+        );
+        $html = ( new Renderer() )->latestSeries( $item, true, true );
+
+        $this->assertStringNotContainsString( '<script>', $html );
+        $this->assertStringNotContainsString( '"><script>', $html );
+        $this->assertStringContainsString( '&lt;script&gt;', $html );
+        // Curated inline HTML in the description survives wp_kses_post.
+        $this->assertStringContainsString( 'Safe <em>desc</em>', $html );
+    }
+
     public function test_scripture_escapes_label_url_and_badge(): void {
         // Real escaping (not returnArg) so we can prove nothing reaches output raw.
         Functions\when( 'esc_html' )->alias( static fn( $s ) => htmlspecialchars( (string) $s, ENT_QUOTES ) );
