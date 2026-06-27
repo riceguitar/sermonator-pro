@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "sermonator/sermon-images",
+  "title": "Sermon Term Images",
+  "category": "widgets",
+  "icon": "format-image",
+  "description": "A grid of taxonomy-term images (e.g. series artwork), each linking to its term archive. Falls back to a sermon list with a review notice when no term images are configured.",
+  "textdomain": "sermonator",
+  "attributes": {
+    "taxonomy": { "type": "string", "default": "sermonator_series" },
+    "columns": { "type": "number", "default": 3 },
+    "size": { "type": "string", "default": "medium" },
+    "showTitle": { "type": "boolean", "default": true },
+    "showDescription": { "type": "boolean", "default": false },
+    "order": { "type": "string", "default": "ASC" },
+    "orderby": { "type": "string", "default": "name" },
+    "hideEmpty": { "type": "boolean", "default": false }
+  },
+  "supports": {
+    "html": false
+  },
+  "style": "sermonator-frontend"
+}
