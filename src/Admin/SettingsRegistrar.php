@@ -278,8 +278,8 @@ final class SettingsRegistrar {
         // The hard/soft gates, recon stamp, and cache-gen bump must run ONLY on the genuine
         // false->true enable transition; post-enable corpus drift is a Site-Health WARNING (T-K),
         // never a side effect of saving an unrelated field. Reading the stored value first makes
-        // this independent of the add/update_option_ hook wiring (the intended explicit bump on
-        // the real transition is preserved below).
+        // the recon stamp + soft-gate run ONLY on the genuine false->true transition; the cache
+        // bump itself rides the add/update_option_ listener on the enable value-change.
         if ( self::toBool( get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false ) ) ) {
             return true;
         }
@@ -332,7 +332,12 @@ final class SettingsRegistrar {
             Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN,
             CoverageAudit::inlineSignature( $audit )
         );
-        $this->bumpCacheGen();
+
+        // The cache-generation bump is NOT done explicitly here: storing the enabled flag
+        // fires add_option_/update_option_{OPTION_BIBLE_INLINE_ENABLED}, whose shared listener
+        // (see hook()) bumps the generation exactly once on this genuine false->true change —
+        // the same single mechanism the link-version/translation axes use. An explicit bump on
+        // top would double-count the enable transition.
 
         return true;
     }

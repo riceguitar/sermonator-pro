@@ -312,7 +312,10 @@ final class BibleInlinePreviewPanelTest extends WP_UnitTestCase {
         // literal drifts from ATTESTATION_CLAIM, this fails (the constant is no longer dead code).
         $html = $this->renderAttestationField( new BibleInlinePreviewPanel() );
 
-        $this->assertStringContainsString( BibleInlinePreviewPanel::ATTESTATION_CLAIM, $html );
+        // The label is rendered through esc_html__(), which encodes the apostrophe (&#039;), so
+        // assert the ESCAPED form of the single-source constant (the constant itself is pinned
+        // verbatim by test_attestation_claim_constant_matches_design_copy).
+        $this->assertStringContainsString( esc_html( BibleInlinePreviewPanel::ATTESTATION_CLAIM ), $html );
     }
 
     // -------------------------------------------------------------------------

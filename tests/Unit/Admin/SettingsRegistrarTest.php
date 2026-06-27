@@ -478,8 +478,10 @@ final class SettingsRegistrarTest extends TestCase {
             CoverageAudit::inlineSignature( array_merge( $audit, array( 'generated_at' => 1799999999 ) ) ),
             $stamped[ Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ]
         );
-        // The cache generation is also bumped on a successful enable.
-        $this->assertArrayHasKey( Identifiers::OPTION_BIBLE_CACHE_GEN, $stamped );
+        // The cache generation is NOT bumped by the sanitizer itself — it rides the
+        // add_option_/update_option_{OPTION_BIBLE_INLINE_ENABLED} listener on the value change
+        // (single source; proven end-to-end by the integration test_enable_change_bumps_cache_generation).
+        $this->assertArrayNotHasKey( Identifiers::OPTION_BIBLE_CACHE_GEN, $stamped );
     }
 
     public function test_inline_enable_soft_gate_not_consulted_when_snapshot_incomplete(): void {

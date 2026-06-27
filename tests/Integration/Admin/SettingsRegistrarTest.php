@@ -21,6 +21,11 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
     protected function setUp(): void {
         parent::setUp();
 
+        // $wp_settings_errors is a process-global that persists across tests; reset it so a
+        // sibling test's add_settings_error() cannot leak into this test's get_settings_errors()
+        // assertions (the no-op-resave test asserts the ENABLED error set is empty).
+        $GLOBALS['wp_settings_errors'] = array();
+
         delete_option( Identifiers::OPTION_BIBLE_LINK_VERSION );
         delete_option( Identifiers::OPTION_BIBLE_INLINE_TRANSLATION );
         delete_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED );
@@ -262,17 +267,15 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         $this->seedEligibleSermon();
         update_option( Identifiers::OPTION_BIBLE_CACHE_GEN, 0 );
 
-        // First (create) save flips false→true. A SUCCESSFUL enable bumps TWICE: once in the
-        // sanitize success path (the explicit reconciliation cache invalidation, which must
-        // not silently depend on the separate add/update_option hook wiring) and once via the
-        // add_option_{$option} listener → generation 2.
+        // First (create) save flips false→true. The cache generation bumps EXACTLY ONCE — via
+        // the add_option_{$option} listener on the value change (the same single mechanism the
+        // link-version/translation axes use; the sanitize success path no longer double-bumps).
         update_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, true );
-        $this->assertSame( 2, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
+        $this->assertSame( 1, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
 
-        // A subsequent change flips true→false through update_option_{$option}. Disabling does
-        // NOT run the soft-gate (so no sanitize bump) — only the listener fires → generation 3.
+        // A subsequent change flips true→false through update_option_{$option} → one more bump.
         update_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false );
-        $this->assertSame( 3, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
+        $this->assertSame( 2, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
     }
 
     // --- Task G fix: no-op re-save while ALREADY enabled ----------------------
@@ -456,13 +459,22 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
     }
 
     public function test_attestation_can_always_be_withdrawn_on_a_heterogeneous_corpus(): void {
-        // Withdrawing is never gated — even on a heterogeneous corpus it returns to false.
+        // Establish a TRUE attestation while the corpus is still homogeneous (the only state in
+        // which setting it true is permitted).
+        $this->seedEligibleSermon(); // ESV only -> homogeneous
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, true );
+        $this->assertTrue(
+            (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false ),
+            'Precondition: attestation set true on a homogeneous corpus.'
+        );
+
+        // Drift the corpus heterogeneous (a second, unknown-family bucket). Withdrawing must
+        // STILL be honored — the hard-disable only blocks setting TRUE, never withdrawing.
         $this->seedSermon( 'Psalm 23:1', array(
             'bookUSFM' => 'PSA', 'chapterStart' => 23, 'verseStart' => 1,
             'verseEnd' => null, 'chapterEnd' => null, 'raw' => 'Psalm 23:1',
             'confidence' => 'exact', 'srcVersificationConfidence' => 'authored',
         ) );
-        $this->seedEligibleSermon();
 
         update_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false );
 
