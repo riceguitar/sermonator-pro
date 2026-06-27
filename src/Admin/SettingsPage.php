@@ -73,6 +73,13 @@ final class SettingsPage {
     private MigrationState $state;
 
     /**
+     * The read-only live inline audit-preview panel (design §4 / spec T-H). Owns the Bible
+     * section's attestation checkbox UI + the would-promote preview; renders nothing until its
+     * field callbacks run at page render (no audit on admin_init). Injected for tests.
+     */
+    private BibleInlinePreviewPanel $inlinePanel;
+
+    /**
      * Whether the podcast section is rendered read-only (migration mid-flight). Resolved once per
      * render so the section heading, every field callback, and the submit button agree.
      */
@@ -86,9 +93,10 @@ final class SettingsPage {
      */
     private array $podcastSettings = array();
 
-    public function __construct( ?Detector $detector = null, ?MigrationState $state = null ) {
-        $this->detector = $detector ?? new Detector();
-        $this->state    = $state ?? new MigrationState();
+    public function __construct( ?Detector $detector = null, ?MigrationState $state = null, ?BibleInlinePreviewPanel $inlinePanel = null ) {
+        $this->detector    = $detector ?? new Detector();
+        $this->state       = $state ?? new MigrationState();
+        $this->inlinePanel = $inlinePanel ?? new BibleInlinePreviewPanel();
     }
 
     /** Register the admin page, its sections/fields, and its screen-scoped asset enqueue. */
@@ -147,6 +155,26 @@ final class SettingsPage {
             self::PAGE_MAIN,
             'sermonator_bible',
             array( 'label_for' => Identifiers::OPTION_BIBLE_INLINE_TRANSLATION )
+        );
+        // Attestation checkbox (verbatim theological claim) — UI for the SettingsRegistrar-owned
+        // OPTION_BIBLE_INLINE_ATTESTATION. The panel hard-disables it on corpus heterogeneity,
+        // mirroring the sanitize write-boundary. No option is registered here.
+        add_settings_field(
+            Identifiers::OPTION_BIBLE_INLINE_ATTESTATION,
+            __( 'Versification attestation', 'sermonator' ),
+            array( $this, 'fieldBibleInlineAttestation' ),
+            self::PAGE_MAIN,
+            'sermonator_bible',
+            array( 'label_for' => Identifiers::OPTION_BIBLE_INLINE_ATTESTATION )
+        );
+        // Read-only live coverage preview (no input; no write-on-render). Fed by the T-E
+        // would-promote preview over the operator's own corpus.
+        add_settings_field(
+            'sermonator_bible_inline_preview',
+            __( 'Inline coverage preview', 'sermonator' ),
+            array( $this, 'fieldBibleInlinePreview' ),
+            self::PAGE_MAIN,
+            'sermonator_bible'
         );
 
         // --- Section 2: Display (UI only; options owned by DisplaySettingsRegistrar) ----------
@@ -305,6 +333,23 @@ final class SettingsPage {
         }
         echo '</select>';
         echo '<p class="description">' . esc_html__( 'Only public-domain translations may have their full text shown inline.', 'sermonator' ) . '</p>';
+    }
+
+    /**
+     * The versification-attestation checkbox (verbatim theological claim). UI only — the option
+     * is owned by {@see SettingsRegistrar}; the panel renders the control and its
+     * heterogeneity-aware hard-disable. Delegated so the panel is the single source of the copy.
+     */
+    public function fieldBibleInlineAttestation(): void {
+        $this->inlinePanel->renderAttestationField();
+    }
+
+    /**
+     * The read-only live inline coverage preview (design §4 / T-H). No input, no write-on-render —
+     * a pure display over {@see \Sermonator\Bible\CoverageAudit::promotionPreview()}.
+     */
+    public function fieldBibleInlinePreview(): void {
+        $this->inlinePanel->renderPreview();
     }
 
     // -------------------------------------------------------------------------

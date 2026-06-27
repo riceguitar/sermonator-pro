@@ -533,11 +533,74 @@ final class CoverageAuditTest extends TestCase {
                 'heterogeneous'             => true,
             ),
         );
+        $this->options[ ID::OPTION_BIBLE_INLINE_ATTESTATION ] = true;
 
         $result = $this->auditOver( array() )->siteHealthResult();
 
         $this->assertStringContainsString( 'inline-eligible', $result['description'] );
         $this->assertStringContainsString( 'mixes more than one source-versification tradition', $result['description'] );
+    }
+
+    public function test_site_health_inline_description_labels_ceiling_when_attestation_off(): void {
+        // The stored inline sub-report is always computed with attestation ASSUMED TRUE
+        // (the best-case ceiling). When attestation is currently OFF, L6 withholds all
+        // site-default refs — so displaying the ceiling% as "are inline-eligible" is wrong.
+        // The paragraph must be labeled as a potential ceiling ("Up to X%... once you attest;
+        // 0 render inline until then").
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => array(
+                'refs_total'                => 4,
+                'inline_eligible'           => 3,
+                'inline_eligible_pct'       => 75.0,
+                'withheld'                  => array(),
+                'unmodeled_pair_wrong_text' => 0,
+                'families'                  => array( 'eng-protestant' => 4 ),
+                'dominant_family'           => 'eng-protestant',
+                'heterogeneous'             => false,
+            ),
+        );
+        // Attestation OFF: the figure is a ceiling, not a live fact.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ATTESTATION ] = false;
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        // Must NOT say "are inline-eligible" (that implies the live state).
+        $this->assertStringNotContainsString( 'are inline-eligible', $result['description'] );
+        // Must surface the ceiling framing and the "0 render inline until then" context.
+        $this->assertStringContainsString( 'Up to', $result['description'] );
+        $this->assertStringContainsString( '0 render inline until then', $result['description'] );
+    }
+
+    public function test_site_health_inline_description_uses_live_language_when_attested(): void {
+        // When attestation IS on, the stored ceiling IS the live fact: display it normally.
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => array(
+                'refs_total'                => 4,
+                'inline_eligible'           => 3,
+                'inline_eligible_pct'       => 75.0,
+                'withheld'                  => array(),
+                'unmodeled_pair_wrong_text' => 0,
+                'families'                  => array( 'eng-protestant' => 4 ),
+                'dominant_family'           => 'eng-protestant',
+                'heterogeneous'             => false,
+            ),
+        );
+        $this->options[ ID::OPTION_BIBLE_INLINE_ATTESTATION ] = true;
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringContainsString( 'are inline-eligible', $result['description'] );
+        // Must NOT use the ceiling/pre-attestation framing.
+        $this->assertStringNotContainsString( 'Up to', $result['description'] );
+        $this->assertStringNotContainsString( '0 render inline until then', $result['description'] );
     }
 
     public function test_site_health_omits_inline_paragraph_for_pre_3b_rollup(): void {
@@ -552,5 +615,473 @@ final class CoverageAuditTest extends TestCase {
         $result = $this->auditOver( array() )->siteHealthResult();
 
         $this->assertStringNotContainsString( 'inline-eligible', $result['description'] );
+    }
+
+    // ----------------------------------------------------------------------------------
+    // T-K — Site Health DRIFT WARNING (adversarial-review fix): drift is keyed off a
+    // CORPUS-CONTENT signature ({@see CoverageAudit::inlineSignature()}), NOT a wall-clock
+    // `generated_at`. A routine re-audit over an unchanged corpus reproduces the same
+    // signature (silent); only a genuine corpus change advances it (warns).
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * One inline sub-report. `generated_at` is set to a DIFFERENT value than any stamp on
+     * purpose: it must be IRRELEVANT to drift (the whole point of the fix).
+     *
+     * @param array<string,mixed> $overrides
+     *
+     * @return array<string,mixed>
+     */
+    private function inlineSub( array $overrides = array() ): array {
+        return array_merge(
+            array(
+                'generated_at'              => 999999,
+                'refs_total'                => 4,
+                'inline_eligible'           => 4,
+                'inline_eligible_pct'       => 100.0,
+                'withheld'                  => array(),
+                'unmodeled_pair_wrong_text' => 0,
+                'families'                  => array( 'eng-protestant' => 4 ),
+                'dominant_family'           => 'eng-protestant',
+                'heterogeneous'             => false,
+            ),
+            $overrides
+        );
+    }
+
+    /** A green-coverage rollup carrying the given inline subreport. */
+    private function seedRollupWithInline( array $inline ): void {
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => $inline,
+        );
+    }
+
+    public function test_site_health_drift_warns_when_corpus_signature_differs_from_enable_stamp(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ] = true;
+        // Enable reconciled against a 4-ref corpus; the live rollup now carries 5 refs.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        // An actionable advisory downgrades the headline from green.
+        $this->assertSame( 'recommended', $result['status'] );
+    }
+
+    public function test_site_health_drift_warns_when_corpus_becomes_heterogeneous(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        // A second source-versification family appeared after enable.
+        $this->seedRollupWithInline( $this->inlineSub( array(
+            'families'      => array( 'eng-protestant' => 3, 'eng-catholic' => 1 ),
+            'heterogeneous' => true,
+        ) ) );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        $this->assertSame( 'recommended', $result['status'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_corpus_signature_matches_enable_stamp(): void {
+        $inline = $this->inlineSub();
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $inline );
+        $this->seedRollupWithInline( $inline );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        $this->assertSame( 'good', $result['status'] );
+    }
+
+    public function test_site_health_drift_is_silent_after_unchanged_corpus_recompute(): void {
+        // The REAL lifecycle the prior wall-clock proxy got wrong: enable stamps the corpus
+        // signature; a routine cron/on-save re-audit later re-persists the rollup with a FRESH
+        // `generated_at` but the SAME corpus content. Drift must stay silent (no false positive).
+        $atEnable = $this->inlineSub( array( 'generated_at' => 1000 ) );
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $atEnable );
+
+        // The later recompute: identical corpus fields, only the timestamp moved forward.
+        $this->seedRollupWithInline( $this->inlineSub( array( 'generated_at' => 9999999 ) ) );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        $this->assertSame( 'good', $result['status'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_inline_is_disabled(): void {
+        // No enable in effect: a changed corpus against a stale stamp is not a drift to surface.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = false;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_never_enabled_no_stamp(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ] = true; // enabled but no recon stamp.
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
+
+    public function test_site_health_drift_is_silent_for_pre_3b_rollup_even_with_a_stamp(): void {
+        // A rollup persisted before the 3b extension has no `inline` key → no live signature →
+        // never falsely drifts, even with an enable stamp present.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        $this->options[ ID::OPTION_BIBLE_STATS ]                    = array(
+            'with_passage'   => 1,
+            'resolved'       => 1,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 1, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+        );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
+
+    public function test_site_health_drift_is_silent_for_legacy_non_string_stamp(): void {
+        // A legacy integer stamp (pre-fix) is not a usable signature → treated as no stamp →
+        // silent (the safe direction: never a false positive). Re-enabling re-stamps a signature.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 1700000000; // legacy int.
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
+
+    public function test_site_health_drift_warning_does_not_write(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
+        $before = $this->options;
+
+        $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertSame( $before, $this->options );
+    }
+
+    public function test_inline_signature_excludes_wall_clock_but_tracks_corpus_fields(): void {
+        $base = $this->inlineSub();
+
+        // generated_at is IRRELEVANT to the signature (the fix).
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $base ),
+            CoverageAudit::inlineSignature( array_merge( $base, array( 'generated_at' => 424242 ) ) )
+        );
+
+        // Each corpus-content field MOVES the signature.
+        foreach (
+            array(
+                array( 'refs_total' => 5 ),
+                array( 'families' => array( 'eng-protestant' => 3, 'eng-catholic' => 1 ) ),
+                array( 'dominant_family' => 'eng-catholic' ),
+                array( 'heterogeneous' => true ),
+            ) as $change
+        ) {
+            $this->assertNotSame(
+                CoverageAudit::inlineSignature( $base ),
+                CoverageAudit::inlineSignature( array_merge( $base, $change ) ),
+                'Changing ' . key( $change ) . ' must move the corpus signature.'
+            );
+        }
+
+        // Family key ORDER is irrelevant (the map is key-sorted before hashing).
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $this->inlineSub( array( 'families' => array( 'a' => 1, 'b' => 2 ) ) ) ),
+            CoverageAudit::inlineSignature( $this->inlineSub( array( 'families' => array( 'b' => 2, 'a' => 1 ) ) ) )
+        );
+    }
+
+    public function test_inline_signature_is_stable_across_floor_changes_over_unchanged_corpus(): void {
+        // unmodeled_pair_wrong_text is a FLOOR-DEPENDENT computed count: widening the floor
+        // (exact → derived-exact → derived-exact-perseg) promotes more refs into L5, which
+        // can change the unmodeled-pair count without any corpus change. The signature must
+        // NOT include it — a floor change over an unchanged corpus must produce the SAME
+        // signature, so a floor change cannot fire a misattributed "later import" drift warning.
+        $base = $this->inlineSub( array( 'unmodeled_pair_wrong_text' => 0 ) );
+        $widerFloor = $this->inlineSub( array( 'unmodeled_pair_wrong_text' => 3 ) );
+
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $base ),
+            CoverageAudit::inlineSignature( $widerFloor ),
+            'A change in unmodeled_pair_wrong_text alone (simulating a floor widening) must NOT move the corpus signature.'
+        );
+
+        // But a genuine corpus change (refs_total moves) DOES advance the signature.
+        $changedCorpus = $this->inlineSub( array( 'unmodeled_pair_wrong_text' => 0, 'refs_total' => 7 ) );
+        $this->assertNotSame(
+            CoverageAudit::inlineSignature( $base ),
+            CoverageAudit::inlineSignature( $changedCorpus ),
+            'A change in refs_total (genuine corpus change) must move the corpus signature.'
+        );
+    }
+
+    // ----------------------------------------------------------------------------------
+    // T-E — would-promote PREVIEW (three floors, assume-attested ceiling, sample)
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Build a PROMOTABLE inline-shape ref carrying its own `raw` so the shared
+     * {@see \Sermonator\Bible\DerivedExactClassifier} can re-parse it in isolation.
+     * `confidence` defaults to `probable` (the only promotable stored tier) and
+     * `srcVersification` to ESV (eng-protestant, site-default provenance).
+     *
+     * @return array<string,mixed>
+     */
+    private function promoRef(
+        string $book,
+        int $chapter,
+        int $verseStart,
+        string $raw,
+        string $confidence = 'probable',
+        string $src = 'ESV',
+        ?int $verseEnd = null
+    ): array {
+        return array(
+            'bookUSFM'         => $book,
+            'chapterStart'     => $chapter,
+            'verseStart'       => $verseStart,
+            'verseEnd'         => $verseEnd,
+            'chapterEnd'       => null,
+            'confidence'       => $confidence,
+            'srcVersification' => $src,
+            'raw'              => $raw,
+        );
+    }
+
+    public function test_promotion_preview_three_floor_counters_and_strict_vs_perseg_delta(): void {
+        // Post A: compound (2 clean probable refs) — promotes under PERSEG, NOT strict.
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16, 17',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16' ),
+                $this->promoRef( 'JHN', 3, 17, 'John 3:17' ),
+            ) ),
+        ) );
+        // Post B: lone clean probable — promotes under STRICT and perseg.
+        $this->seed( 2, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16' ),
+            ) ),
+        ) );
+        // Post C: lone EXACT — inline-eligible under EVERY floor, never "promoted".
+        $this->seed( 3, array(
+            ID::META_BIBLE_PASSAGE => 'Genesis 1:1',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'GEN', 1, 1, 'Genesis 1:1', 'exact' ),
+            ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1, 2, 3 ), $this->chapterWith( array( 1, 16, 17 ) ) )
+            ->promotionPreview( true );
+
+        $this->assertSame( 4, $preview['refs_total'] );
+
+        $exact  = $preview['floors']['exact'];
+        $strict = $preview['floors']['derived-exact'];
+        $perseg = $preview['floors']['derived-exact-perseg'];
+
+        // would-promote (the L2 lever): exact 0, strict 1 (post B), perseg 3 (A's 2 + B).
+        $this->assertSame( 0, $exact['would_promote'] );
+        $this->assertSame( 1, $strict['would_promote'] );
+        $this->assertSame( 3, $perseg['would_promote'] );
+
+        // inline-eligible (full predicate): exact 1 (only the exact ref), strict 2, perseg 4.
+        $this->assertSame( 1, $exact['inline_eligible'] );
+        $this->assertSame( 2, $strict['inline_eligible'] );
+        $this->assertSame( 4, $perseg['inline_eligible'] );
+
+        $this->assertSame( 25.0, $exact['inline_eligible_pct'] );
+        $this->assertSame( 50.0, $strict['inline_eligible_pct'] );
+        $this->assertSame( 100.0, $perseg['inline_eligible_pct'] );
+
+        // The compound's segments are withheld low-confidence under strict, cleared under perseg.
+        $this->assertSame( 3, $exact['withheld']['low-confidence'] );
+        $this->assertSame( 2, $strict['withheld']['low-confidence'] );
+        $this->assertSame( 0, $perseg['withheld']['low-confidence'] );
+
+        // Each floor's report PARTITIONS the corpus refs.
+        foreach ( array( $exact, $strict, $perseg ) as $floor ) {
+            $this->assertSame(
+                $preview['refs_total'],
+                $floor['inline_eligible'] + array_sum( $floor['withheld'] )
+            );
+        }
+    }
+
+    public function test_promotion_preview_ignores_the_stored_floor_option(): void {
+        // The preview computes ALL THREE floors regardless of the persisted floor.
+        $this->options[ ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR ] = 'derived-exact-perseg';
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true );
+
+        foreach ( array( 'exact', 'derived-exact', 'derived-exact-perseg' ) as $floor ) {
+            $this->assertArrayHasKey( $floor, $preview['floors'] );
+            $this->assertSame( $floor, $preview['floors'][ $floor ]['floor'] );
+        }
+        // exact promotes nothing; perseg promotes the lone clean probable.
+        $this->assertSame( 0, $preview['floors']['exact']['inline_eligible'] );
+        $this->assertSame( 1, $preview['floors']['derived-exact-perseg']['inline_eligible'] );
+    }
+
+    public function test_promotion_preview_assume_attested_ceiling(): void {
+        // A lone EXACT, site-default-provenance ESV ref: eligible ONLY when attestation is
+        // assumed; un-attested it fails L6 (src-versification-unattested).
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16', 'exact' ),
+            ) ),
+        ) );
+
+        $audit = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) );
+
+        $ceiling = $audit->promotionPreview( true );
+        $this->assertTrue( $ceiling['assume_attested'] );
+        $this->assertSame( 1, $ceiling['floors']['exact']['inline_eligible'] );
+
+        $actual = $audit->promotionPreview( false );
+        $this->assertFalse( $actual['assume_attested'] );
+        $this->assertSame( 0, $actual['floors']['exact']['inline_eligible'] );
+        $this->assertSame( 1, $actual['floors']['exact']['withheld']['src-versification-unattested'] );
+    }
+
+    public function test_promotion_preview_heterogeneous_canary_fires_on_mixed_family(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'corpus',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16', 'exact', 'ESV' ),
+                $this->promoRef( 'GEN', 1, 1, 'Genesis 1:1', 'exact', 'RVR1960' ),
+            ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 1, 16 ) ) )->promotionPreview( true );
+
+        $this->assertTrue( $preview['heterogeneous'] );
+        $this->assertArrayHasKey( 'eng-protestant', $preview['families'] );
+        $this->assertArrayHasKey( 'unknown', $preview['families'] );
+    }
+
+    public function test_promotion_preview_homogeneous_corpus_is_not_heterogeneous(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'corpus',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16', 'exact', 'ESV' ),
+                $this->promoRef( 'GEN', 1, 1, 'Genesis 1:1', 'exact', 'NIV' ),
+            ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 1, 16 ) ) )->promotionPreview( true );
+
+        $this->assertFalse( $preview['heterogeneous'] );
+        $this->assertSame( array( 'eng-protestant' => 2 ), $preview['families'] );
+    }
+
+    public function test_promotion_preview_sample_returns_promoted_refs_with_raw(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+        $this->seed( 2, array(
+            ID::META_BIBLE_PASSAGE => 'Genesis 1:1',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'GEN', 1, 1, 'Genesis 1:1' ) ) ),
+        ) );
+        $this->seed( 3, array(
+            ID::META_BIBLE_PASSAGE => 'Romans 8:28',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'ROM', 8, 28, 'Romans 8:28' ) ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1, 2, 3 ), $this->chapterWith( array( 1, 16, 28 ) ) )
+            ->promotionPreview( true, 2 );
+
+        // Capped at N=2 promoted refs, each carrying its own raw passage substring.
+        $this->assertCount( 2, $preview['sample'] );
+        foreach ( $preview['sample'] as $entry ) {
+            $this->assertArrayHasKey( 'raw', $entry );
+            $this->assertNotSame( '', $entry['raw'] );
+            $this->assertArrayHasKey( 'bookUSFM', $entry );
+            $this->assertArrayHasKey( 'verseStart', $entry );
+        }
+    }
+
+    public function test_promotion_preview_sample_only_includes_promoted_eligible_refs(): void {
+        // A lone clean probable (promotes) + a chapter-only ref (never inline-shaped). Only
+        // the promoted, inline-eligible ref enters the sample.
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16' ),
+                $this->ref( 'JHN', 3, null ),
+            ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true, 10 );
+
+        $this->assertCount( 1, $preview['sample'] );
+        $this->assertSame( 'John 3:16', $preview['sample'][0]['raw'] );
+    }
+
+    public function test_promotion_preview_default_sample_is_empty(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true );
+
+        $this->assertSame( array(), $preview['sample'] );
+    }
+
+    public function test_promotion_preview_writes_nothing(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+
+        $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true, 5 );
+
+        // Read-only instrument: it must not persist the rollup option (no write-on-GET).
+        $this->assertArrayNotHasKey( ID::OPTION_BIBLE_STATS, $this->options );
+    }
+
+    public function test_promotion_preview_shape_carries_canaries(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true );
+
+        foreach ( array(
+            'generated_at', 'target', 'assume_attested', 'refs_total',
+            'families', 'dominant_family', 'heterogeneous', 'unmodeled_pair_wrong_text',
+            'floors', 'sample',
+        ) as $key ) {
+            $this->assertArrayHasKey( $key, $preview, "missing preview key: $key" );
+        }
+        $this->assertSame( 0, $preview['unmodeled_pair_wrong_text'] );
+        $this->assertSame( 'ENGWEBP', $preview['target'] );
     }
 }

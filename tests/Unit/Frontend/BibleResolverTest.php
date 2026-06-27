@@ -351,9 +351,10 @@ final class BibleResolverTest extends TestCase {
         $this->assertSame( array(), $calls );
     }
 
-    public function test_inline_widened_floor_admits_probable(): void {
-        // Admin widened the floor to `probable`: the same ref now inlines.
-        $this->enableInline( 'probable' );
+    public function test_inline_promoted_probable_clears_derived_exact_floor(): void {
+        // De-stored tier: floor `derived-exact`, a lone (refCount===1) `probable` ref whose
+        // raw re-parses identically is PROMOTED at render time and inlines.
+        $this->enableInline( 'derived-exact' );
         $this->stubMeta( $this->envelope( array(
             $this->exactRef( array( 'confidence' => 'probable' ) ),
         ) ) );
@@ -362,6 +363,91 @@ final class BibleResolverTest extends TestCase {
         $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
 
         $this->assertIsArray( $resolved->refs()[0]['inline'] );
+        $this->assertCount( 0, $this->fallbackHook );
+    }
+
+    public function test_inline_exact_always_clears_under_derived_exact_floor(): void {
+        // `exact` is the top stored tier: it clears EVERY floor, derived-exact* included.
+        $this->enableInline( 'derived-exact' );
+        $this->stubMeta( $this->envelope( array( $this->exactRef() ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertIsArray( $resolved->refs()[0]['inline'] );
+        $this->assertCount( 0, $this->fallbackHook );
+    }
+
+    public function test_inline_prestamped_derived_exact_clears_nothing(): void {
+        // De-store enforcement: a SMUGGLED `confidence:derived-exact` is NOT a recognized
+        // stored tier -> below floor -> never inlines (closes the bulk-promote bypass).
+        $this->enableInline( 'derived-exact' );
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'confidence' => 'derived-exact' ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        $this->assertNull( $resolved->refs()[0]['inline'] );
+        $this->assertSame( 'low-confidence', $this->fallbackHook[0]['reason'] );
+        // L2 fails BEFORE L8 -> the chapter resolver is never reached.
+        $this->assertSame( array(), $calls );
+    }
+
+    public function test_inline_strict_floor_withholds_compound_segments(): void {
+        // STRICT `derived-exact`: refCount===2, so NEITHER individually-clean `probable`
+        // segment promotes (the corpus-independent compound-stays-dark guarantee).
+        $this->enableInline( 'derived-exact' );
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'confidence' => 'probable' ) ),
+            $this->exactRef( array(
+                'bookUSFM'     => 'ROM',
+                'chapterStart' => 8,
+                'verseStart'   => 28,
+                'raw'          => 'Romans 8:28',
+                'confidence'   => 'probable',
+            ) ),
+        ) ) );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $this->chapterWithVerse16(), $calls ) );
+
+        foreach ( $resolved->refs() as $ref ) {
+            $this->assertNull( $ref['inline'] );
+        }
+        $this->assertSame( 'low-confidence', $this->fallbackHook[0]['reason'] );
+        $this->assertSame( array(), $calls );
+    }
+
+    public function test_inline_perseg_floor_promotes_compound_segments(): void {
+        // PER-SEG `derived-exact-perseg`: the SAME 2-ref compound now promotes per segment
+        // (refCount threads but is ignored by perseg) — both inline.
+        $this->enableInline( 'derived-exact-perseg' );
+        $this->stubMeta( $this->envelope( array(
+            $this->exactRef( array( 'confidence' => 'probable' ) ),
+            $this->exactRef( array(
+                'bookUSFM'     => 'ROM',
+                'chapterStart' => 8,
+                'verseStart'   => 28,
+                'raw'          => 'Romans 8:28',
+                'confidence'   => 'probable',
+            ) ),
+        ) ) );
+
+        // Chapter spy returns a chapter carrying BOTH verse 16 (John 3) and verse 28
+        // (Romans 8) so L8/L9 pass for each.
+        $chapter = array(
+            array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'For God so loved the world,' ) ) ),
+            array( 'number' => 28, 'nodes' => array( array( 'type' => 'text', 'text' => 'And we know…' ) ) ),
+        );
+
+        $calls    = array();
+        $resolved = BibleResolver::resolve( 123, $this->chapterSpy( $chapter, $calls ) );
+
+        foreach ( $resolved->refs() as $ref ) {
+            $this->assertIsArray( $ref['inline'] );
+        }
         $this->assertCount( 0, $this->fallbackHook );
     }
 

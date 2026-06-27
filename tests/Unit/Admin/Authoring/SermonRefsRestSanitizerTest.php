@@ -7,6 +7,7 @@ namespace Sermonator\Tests\Unit\Admin\Authoring {
     use Brain\Monkey;
     use Brain\Monkey\Functions;
     use Sermonator\Admin\Authoring\SermonRefsRestSanitizer;
+    use Sermonator\Bible\DerivedExactClassifier;
     use Sermonator\Bible\RefsCapture;
 
     /**
@@ -78,6 +79,38 @@ namespace Sermonator\Tests\Unit\Admin\Authoring {
             $this->assertSame( 'JHN', $ref['bookUSFM'] );
             $this->assertSame( 3, $ref['chapterStart'] );
             $this->assertSame( 16, $ref['verseStart'] );
+        }
+
+        public function test_client_supplied_derived_exact_is_rejected_server_stamp_wins(): void {
+            // De-store enforcement (design §3.4): a client cannot pre-stamp the de-stored
+            // render-time tier `derived-exact*` to clear the inline floor past the
+            // classifier. The confirm-chip path discards client confidence entirely and the
+            // SERVER stamp (`exact`) wins — the persisted value is NEVER `derived-exact*`.
+            foreach (
+                array(
+                    DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+                    DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG,
+                ) as $forged
+            ) {
+                $submitted = array(
+                    'refs' => array(
+                        array(
+                            'bookUSFM'     => 'JHN',
+                            'chapterStart' => 3,
+                            'verseStart'   => 16,
+                            'verseEnd'     => 16,
+                            'chapterEnd'   => null,
+                            'raw'          => 'John 3:16',
+                            'confidence'   => $forged,
+                        ),
+                    ),
+                );
+
+                $ref = $this->decode( ( new SermonRefsRestSanitizer() )->stamp( $submitted ) )['refs'][0];
+
+                $this->assertSame( 'exact', $ref['confidence'], 'Server stamp wins over the forged tier.' );
+                $this->assertNotSame( $forged, $ref['confidence'], 'The de-stored floor tier never persists.' );
+            }
         }
 
         public function test_invalid_ref_is_dropped(): void {

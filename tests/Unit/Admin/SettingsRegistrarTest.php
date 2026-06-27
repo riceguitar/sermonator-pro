@@ -8,6 +8,8 @@ use PHPUnit\Framework\TestCase;
 use Brain\Monkey;
 use Brain\Monkey\Functions;
 use Sermonator\Admin\SettingsRegistrar;
+use Sermonator\Bible\CoverageAudit;
+use Sermonator\Bible\DerivedExactClassifier;
 use Sermonator\Schema\BibleTranslations;
 use Sermonator\Schema\Identifiers;
 
@@ -211,6 +213,8 @@ final class SettingsRegistrarTest extends TestCase {
 
     public function test_inline_enable_allowed_when_snapshot_complete(): void {
         Functions\when( 'get_option' )->justReturn( BibleTranslations::DEFAULT_INLINE );
+        // The success path stamps the recon generation + bumps the cache generation.
+        Functions\when( 'update_option' )->justReturn( true );
 
         // No settings error may be raised on the happy path.
         Functions\expect( 'add_settings_error' )->never();
@@ -220,7 +224,9 @@ final class SettingsRegistrarTest extends TestCase {
             static function ( string $translation ) use ( &$captured ): bool {
                 $captured[] = $translation;
                 return true;
-            }
+            },
+            // A fresh audit that PASSES the soft-gate: eligible, no wrong-text, homogeneous.
+            static fn(): array => self::passingInlineAudit()
         );
 
         $this->assertTrue( $registrar->sanitizeInlineEnabled( '1' ) );
@@ -276,7 +282,12 @@ final class SettingsRegistrarTest extends TestCase {
     // --- Phase 3b: attestation sanitize --------------------------------------
 
     public function test_attestation_sanitize_coerces_truthy_and_falsy(): void {
-        $registrar = new SettingsRegistrar();
+        // A homogeneous corpus: attesting is permitted, so the boolean coercion is what
+        // is under test here (the heterogeneity hard-disable has its own test).
+        $registrar = new SettingsRegistrar(
+            null,
+            static fn(): array => self::passingInlineAudit()
+        );
 
         foreach ( array( true, '1', 'true', 'on', 'yes', 1 ) as $truthy ) {
             $this->assertTrue( $registrar->sanitizeAttestation( $truthy ), var_export( $truthy, true ) );
@@ -304,6 +315,331 @@ final class SettingsRegistrarTest extends TestCase {
         $this->assertSame( SettingsRegistrar::DEFAULT_CONFIDENCE_FLOOR, $registrar->sanitizeConfidenceFloor( null ) );
         $this->assertSame( SettingsRegistrar::DEFAULT_CONFIDENCE_FLOOR, $registrar->sanitizeConfidenceFloor( 42 ) );
         $this->assertSame( 'exact', SettingsRegistrar::DEFAULT_CONFIDENCE_FLOOR );
+    }
+
+    // --- Task G: perseg floor gated behind the axis-2 spot-check ack ----------
+
+    public function test_confidence_floor_perseg_floored_to_strict_without_ack(): void {
+        // The ack option is unset → submitting `derived-exact-perseg` floors back to the
+        // STRICT `derived-exact` (NOT all the way to exact) and registers a settings error.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK ? false : $default;
+            }
+        );
+
+        $errors = array();
+        Functions\when( 'add_settings_error' )->alias(
+            static function ( string $setting, string $code, string $message, string $type = 'error' ) use ( &$errors ): void {
+                $errors[] = array( 'setting' => $setting, 'code' => $code );
+            }
+        );
+
+        $registrar = new SettingsRegistrar();
+
+        $this->assertSame(
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+            $registrar->sanitizeConfidenceFloor( DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG )
+        );
+        $this->assertNotEmpty( $errors, 'Selecting perseg without the ack must register a settings error.' );
+        $this->assertSame( Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR, $errors[0]['setting'] );
+        $this->assertSame( 'sermonator_bible_inline_perseg_unacked', $errors[0]['code'] );
+    }
+
+    public function test_confidence_floor_perseg_allowed_with_ack(): void {
+        // The ack is set → `derived-exact-perseg` is accepted verbatim, no error raised.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK ? '1' : $default;
+            }
+        );
+        Functions\expect( 'add_settings_error' )->never();
+
+        $registrar = new SettingsRegistrar();
+
+        $this->assertSame(
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG,
+            $registrar->sanitizeConfidenceFloor( DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG )
+        );
+    }
+
+    public function test_confidence_floor_strings_align_with_classifier_constants(): void {
+        // The settings vocabulary is the classifier's FLOOR_* constants (single source).
+        $registrar = new SettingsRegistrar();
+
+        $this->assertSame( DerivedExactClassifier::FLOOR_EXACT, SettingsRegistrar::DEFAULT_CONFIDENCE_FLOOR );
+        $this->assertSame(
+            DerivedExactClassifier::FLOOR_EXACT,
+            $registrar->sanitizeConfidenceFloor( DerivedExactClassifier::FLOOR_EXACT )
+        );
+        $this->assertSame(
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+            $registrar->sanitizeConfidenceFloor( DerivedExactClassifier::FLOOR_DERIVED_EXACT )
+        );
+    }
+
+    // --- Task G: attestation hard-disabled on a heterogeneous corpus ----------
+
+    public function test_attestation_refused_when_corpus_heterogeneous(): void {
+        $errors = array();
+        Functions\when( 'add_settings_error' )->alias(
+            static function ( string $setting, string $code, string $message, string $type = 'error' ) use ( &$errors ): void {
+                $errors[] = array( 'setting' => $setting, 'code' => $code );
+            }
+        );
+
+        $registrar = new SettingsRegistrar(
+            null,
+            static fn(): array => self::passingInlineAudit( array( 'heterogeneous' => true ) )
+        );
+
+        $this->assertFalse( $registrar->sanitizeAttestation( '1' ) );
+        $this->assertFalse( $registrar->sanitizeAttestation( true ) );
+        $this->assertNotEmpty( $errors, 'Attesting on a heterogeneous corpus must register a settings error.' );
+        $this->assertSame( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, $errors[0]['setting'] );
+        $this->assertSame( 'sermonator_bible_inline_attest_heterogeneous', $errors[0]['code'] );
+    }
+
+    public function test_attestation_withdrawal_never_consults_audit(): void {
+        // Unchecking is always honored and must NOT run the (expensive) corpus audit.
+        Functions\expect( 'add_settings_error' )->never();
+
+        $probed = false;
+        $registrar = new SettingsRegistrar(
+            null,
+            static function () use ( &$probed ): array {
+                $probed = true;
+                return self::passingInlineAudit();
+            }
+        );
+
+        $this->assertFalse( $registrar->sanitizeAttestation( '0' ) );
+        $this->assertFalse( $registrar->sanitizeAttestation( false ) );
+        $this->assertFalse( $probed, 'Withdrawing attestation must not consult the audit.' );
+    }
+
+    // --- Task G: enable soft-gate (fresh-audit reconciliation) ----------------
+
+    public function test_inline_enable_refused_when_audit_has_zero_eligible(): void {
+        $this->assertEnableRefusedForAudit(
+            self::passingInlineAudit( array( 'inline_eligible' => 0 ) )
+        );
+    }
+
+    public function test_inline_enable_refused_when_audit_has_unmodeled_wrong_text(): void {
+        $this->assertEnableRefusedForAudit(
+            self::passingInlineAudit( array( 'unmodeled_pair_wrong_text' => 3 ) )
+        );
+    }
+
+    public function test_inline_enable_refused_when_audit_is_heterogeneous(): void {
+        $this->assertEnableRefusedForAudit(
+            self::passingInlineAudit( array( 'heterogeneous' => true ) )
+        );
+    }
+
+    public function test_inline_enable_stamps_reconciliation_generation_on_success(): void {
+        Functions\when( 'get_option' )->justReturn( BibleTranslations::DEFAULT_INLINE );
+
+        $stamped = array();
+        Functions\when( 'update_option' )->alias(
+            static function ( string $name, $value ) use ( &$stamped ) {
+                $stamped[ $name ] = $value;
+                return true;
+            }
+        );
+        Functions\expect( 'add_settings_error' )->never();
+
+        // The audit carries the corpus-content fields the signature is derived from. The
+        // wall-clock `generated_at` is DELIBERATELY irrelevant to the stamp (adversarial-review
+        // fix: stamping the timestamp made T-K's drift advisory a permanent false positive).
+        $audit = self::passingInlineAudit( array(
+            'generated_at'              => 1717000000,
+            'refs_total'                => 9,
+            'families'                  => array( 'eng-protestant' => 9 ),
+            'dominant_family'           => 'eng-protestant',
+        ) );
+
+        $registrar = new SettingsRegistrar(
+            static fn( string $translation ): bool => true,
+            static fn(): array => $audit
+        );
+
+        $this->assertTrue( $registrar->sanitizeInlineEnabled( '1' ) );
+        $this->assertArrayHasKey( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, $stamped );
+        // The stamp is the CORPUS-CONTENT signature, NOT the wall-clock generated_at.
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $audit ),
+            $stamped[ Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ]
+        );
+        $this->assertNotSame( 1717000000, $stamped[ Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] );
+        // The stamp ignores the timestamp: the same corpus with a later generated_at stamps equal.
+        $this->assertSame(
+            CoverageAudit::inlineSignature( array_merge( $audit, array( 'generated_at' => 1799999999 ) ) ),
+            $stamped[ Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ]
+        );
+        // The cache generation is NOT bumped by the sanitizer itself — it rides the
+        // add_option_/update_option_{OPTION_BIBLE_INLINE_ENABLED} listener on the value change
+        // (single source; proven end-to-end by the integration test_enable_change_bumps_cache_generation).
+        $this->assertArrayNotHasKey( Identifiers::OPTION_BIBLE_CACHE_GEN, $stamped );
+    }
+
+    public function test_inline_enable_soft_gate_not_consulted_when_snapshot_incomplete(): void {
+        // The hard snapshot gate short-circuits BEFORE the soft audit gate, so an
+        // un-vendored site never pays for a corpus audit it cannot use.
+        Functions\when( 'get_option' )->justReturn( BibleTranslations::DEFAULT_INLINE );
+        Functions\when( 'add_settings_error' )->justReturn( null );
+
+        $audited = false;
+        $registrar = new SettingsRegistrar(
+            static fn( string $translation ): bool => false,
+            static function () use ( &$audited ): array {
+                $audited = true;
+                return self::passingInlineAudit();
+            }
+        );
+
+        $this->assertFalse( $registrar->sanitizeInlineEnabled( '1' ) );
+        $this->assertFalse( $audited, 'The soft audit gate must not run when the snapshot is incomplete.' );
+    }
+
+    public function test_inline_enable_resave_while_already_enabled_is_a_noop(): void {
+        // Adversarial-review fix: the shared settings group re-submits the checked enable box on
+        // EVERY save, and the sanitize_callback runs before update_option()'s old==new short-circuit.
+        // While inline is ALREADY enabled, a re-save must NOT re-run the snapshot probe, NOT re-run
+        // the corpus audit, NOT re-stamp the reconciliation generation, and NOT re-bump the cache
+        // generation — it just keeps the stored true.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_BIBLE_INLINE_ENABLED ? true : $default;
+            }
+        );
+        Functions\expect( 'update_option' )->never();
+        Functions\expect( 'add_settings_error' )->never();
+
+        $probed  = false;
+        $audited = false;
+        $registrar = new SettingsRegistrar(
+            static function ( string $translation ) use ( &$probed ): bool {
+                $probed = true;
+                return true;
+            },
+            static function () use ( &$audited ): array {
+                $audited = true;
+                return self::passingInlineAudit();
+            }
+        );
+
+        $this->assertTrue( $registrar->sanitizeInlineEnabled( '1' ) );
+        $this->assertTrue( $registrar->sanitizeInlineEnabled( true ) );
+        $this->assertFalse( $probed, 'A re-save while already enabled must not re-probe the snapshot.' );
+        $this->assertFalse( $audited, 'A re-save while already enabled must not re-run the corpus audit.' );
+    }
+
+    public function test_inline_enable_resave_does_not_disable_on_corpus_drift(): void {
+        // The critical safety property: an UNRELATED settings save while inline is already enabled
+        // must NOT silently flip inline OFF even if the corpus has since drifted (heterogeneous,
+        // zero eligible, or unmodeled wrong-text) AND even if the snapshot probe would now fail.
+        // The short-circuit returns true BEFORE any gate runs; drift is a Site-Health warning (T-K).
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_BIBLE_INLINE_ENABLED ? true : $default;
+            }
+        );
+        Functions\expect( 'add_settings_error' )->never();
+        Functions\expect( 'update_option' )->never();
+
+        $registrar = new SettingsRegistrar(
+            // Snapshot would now FAIL the hard gate …
+            static fn( string $translation ): bool => false,
+            // … and the corpus would now FAIL every soft-gate signal.
+            static fn(): array => self::passingInlineAudit( array(
+                'inline_eligible'           => 0,
+                'unmodeled_pair_wrong_text' => 5,
+                'heterogeneous'             => true,
+            ) )
+        );
+
+        $this->assertTrue(
+            $registrar->sanitizeInlineEnabled( '1' ),
+            'A re-save while enabled must keep inline ON despite post-enable corpus drift.'
+        );
+    }
+
+    public function test_attestation_resave_while_already_attested_is_a_noop(): void {
+        // Mirror of the enable guard: re-saving the (already true) attestation box on an unrelated
+        // settings save must NOT re-run the corpus audit nor silently withdraw attestation if the
+        // corpus has since drifted heterogeneous.
+        Functions\when( 'get_option' )->alias(
+            static function ( string $name, $default = false ) {
+                return $name === Identifiers::OPTION_BIBLE_INLINE_ATTESTATION ? true : $default;
+            }
+        );
+        Functions\expect( 'add_settings_error' )->never();
+
+        $audited = false;
+        $registrar = new SettingsRegistrar(
+            null,
+            static function () use ( &$audited ): array {
+                $audited = true;
+                // Even a now-heterogeneous corpus must not withdraw the standing attestation here.
+                return self::passingInlineAudit( array( 'heterogeneous' => true ) );
+            }
+        );
+
+        $this->assertTrue( $registrar->sanitizeAttestation( '1' ) );
+        $this->assertTrue( $registrar->sanitizeAttestation( true ) );
+        $this->assertFalse( $audited, 'A re-save while already attested must not re-run the corpus audit.' );
+    }
+
+    /**
+     * Drive sanitizeInlineEnabled with a snapshot-complete site and the given audit, and
+     * assert the enable is refused (sanitized to false) with the soft-gate settings error.
+     *
+     * @param array<string,mixed> $audit
+     */
+    private function assertEnableRefusedForAudit( array $audit ): void {
+        Functions\when( 'get_option' )->justReturn( BibleTranslations::DEFAULT_INLINE );
+
+        $errors = array();
+        Functions\when( 'add_settings_error' )->alias(
+            static function ( string $setting, string $code, string $message, string $type = 'error' ) use ( &$errors ): void {
+                $errors[] = array( 'setting' => $setting, 'code' => $code );
+            }
+        );
+        // The recon stamp must NOT happen on a refused enable.
+        Functions\expect( 'update_option' )->never();
+
+        $registrar = new SettingsRegistrar(
+            static fn( string $translation ): bool => true,
+            static fn(): array => $audit
+        );
+
+        $this->assertFalse( $registrar->sanitizeInlineEnabled( '1' ) );
+        $this->assertNotEmpty( $errors, 'A failing audit must register a settings error.' );
+        $this->assertSame( Identifiers::OPTION_BIBLE_INLINE_ENABLED, $errors[0]['setting'] );
+        $this->assertSame( 'sermonator_bible_inline_audit_unreconciled', $errors[0]['code'] );
+    }
+
+    /**
+     * A fresh inline-audit report that PASSES the enable soft-gate, with optional overrides
+     * to flip a single signal (inline_eligible / unmodeled_pair_wrong_text / heterogeneous /
+     * generated_at) for the refusal tests.
+     *
+     * @param array<string,mixed> $overrides
+     *
+     * @return array<string,mixed>
+     */
+    private static function passingInlineAudit( array $overrides = array() ): array {
+        return array_merge(
+            array(
+                'inline_eligible'           => 12,
+                'unmodeled_pair_wrong_text' => 0,
+                'heterogeneous'             => false,
+                'generated_at'              => 1700000000,
+            ),
+            $overrides
+        );
     }
 
     // --- Registration wiring -------------------------------------------------

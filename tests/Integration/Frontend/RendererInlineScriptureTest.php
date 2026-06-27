@@ -74,6 +74,55 @@ final class RendererInlineScriptureTest extends WP_UnitTestCase {
         $this->assertSame( $expected, ( new Renderer() )->scripture( $this->view(), $resolved ) );
     }
 
+    /**
+     * INSTANT-ROLLBACK GUARANTEE under the REAL escaping primitives (T-J / spec §5):
+     * the SAME ref rendered with `inline => null` (inline disabled / floor=exact /
+     * any L1–L9 withhold) is byte-identical to the canonical 3a link output, while
+     * the inline payload genuinely differs. Disabling inline returns the sermon to
+     * its 3a link unchanged, to the byte — with no stored-meta change to undo.
+     */
+    public function test_inline_off_is_byte_identical_to_3a_link_rollback_under_real_esc(): void {
+        $ref = array(
+            'label'          => 'John 3:16',
+            'linkUrl'        => 'https://www.biblegateway.com/passage/?search=John%203%3A16&version=ESV',
+            'version'        => 'ESV',
+            'inlineEligible' => true,
+        );
+
+        $on = ( new Renderer() )->scripture( $this->view(), new ResolvedScripture( array(
+            $ref + array(
+                'inline' => array(
+                    'translation' => 'ENGWEBP',
+                    'attribution' => 'World English Bible',
+                    'verses'      => array(
+                        array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'For God so loved the world' ) ) ),
+                    ),
+                ),
+            ),
+        ) ) );
+
+        $off = ( new Renderer() )->scripture(
+            $this->view(),
+            new ResolvedScripture( array( $ref + array( 'inline' => null ) ) )
+        );
+
+        $expected = '<section class="sermonator-scripture">'
+            . '<h2 class="sermonator-scripture__heading">' . esc_html__( 'Scripture', 'sermonator' ) . '</h2>'
+            . '<ul class="sermonator-scripture__list">'
+            . '<li class="sermonator-scripture__ref">'
+            . '<a class="sermonator-scripture__link" href="'
+            . esc_url( 'https://www.biblegateway.com/passage/?search=John%203%3A16&version=ESV' ) . '">'
+            . esc_html( 'John 3:16' )
+            . '</a>'
+            . ' <span class="sermonator-scripture__version">(' . esc_html( 'ESV' ) . ')</span>'
+            . '</li>'
+            . '</ul></section>';
+
+        $this->assertSame( $expected, $off );
+        $this->assertNotSame( $off, $on );
+        $this->assertStringContainsString( 'sermonator-scripture__ref--inline', $on );
+    }
+
     public function test_inline_payload_renders_typed_nodes_with_real_escaping(): void {
         $resolved = new ResolvedScripture( array(
             array(

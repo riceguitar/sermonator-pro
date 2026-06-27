@@ -105,6 +105,58 @@ final class Identifiers {
     public const OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR = 'sermonator_bible_inline_confidence_floor';
 
     /**
+     * Axis-2 human spot-check acknowledgement (bool) — the THIRD gate the per-ref
+     * `derived-exact-perseg` floor is un-selectable until set (design §3.3/§3.6, step 4).
+     * Set ONLY by the logged CLI ack step (`wp sermonator bible ack-perseg --confirm`, T-I),
+     * never a Settings-API field: an admin lowering the floor to `derived-exact-perseg`
+     * without this ack is floored back to STRICT `derived-exact` by the sanitize callback.
+     * The intended operator flow is to first run the read-only spot-check
+     * (`wp sermonator bible audit --inline --sample=N`), eyeball the promoted references
+     * against their raw text, and only then run `ack-perseg --confirm` — the one deliberate
+     * write — so the audit itself stays purely read-only. The 49→76% perseg delta is exactly
+     * the Psalm-bearing lectionary bundles whose safety rides the single attestation boolean
+     * and which the axis-1 audit is structurally blind to.
+     */
+    public const OPTION_BIBLE_INLINE_PERSEG_ACK = 'sermonator_bible_inline_perseg_ack';
+
+    /**
+     * Append-only audit log of the logged CLI per-segment spot-check ack
+     * (`wp sermonator bible ack-perseg --confirm|--revoke`, T-I) — the ONLY way to set (or
+     * clear) {@see self::OPTION_BIBLE_INLINE_PERSEG_ACK}. Each entry records the time, acting
+     * user id, the previous ack state, and the via marker (`cli-confirm` / `cli-revoke`), so
+     * the deliberate decision to trust per-segment promotion (or to withdraw that trust) is
+     * never silent — mirroring {@see self::OPTION_BIBLE_INLINE_ATTEST_LOG}. A list of entries;
+     * never read on a render path.
+     */
+    public const OPTION_BIBLE_INLINE_PERSEG_ACK_LOG = 'sermonator_bible_inline_perseg_ack_log';
+
+    /**
+     * Reconciliation signature stamped at the moment inline rendering was enabled — the
+     * {@see \Sermonator\Bible\CoverageAudit::inlineSignature()} CORPUS-CONTENT fingerprint of
+     * the fresh audit the enable soft-gate reconciled against (design §3.6, decision 6). Lets
+     * Site Health (T-K) warn when the LIVE corpus signature DIFFERS from the one enable
+     * reconciled against (corpus drift between audit and enable). It is a content hash, NOT a
+     * wall-clock `generated_at`: a routine cron/on-save re-audit over an unchanged corpus
+     * reproduces the identical signature, so the drift advisory stays silent until the corpus
+     * actually changes (the adversarial-review fix for the permanent-false-positive timestamp
+     * proxy). Stamped by `sanitizeInlineEnabled` on a successful enable (and re-stamped by the
+     * documented `wp sermonator bible audit --inline` reconcile once a drifted corpus is safe
+     * again), alongside the {@see self::OPTION_BIBLE_CACHE_GEN} bump.
+     */
+    public const OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN = 'sermonator_bible_inline_enabled_audit_gen';
+
+    /**
+     * Append-only audit log of the logged CLI attestation override
+     * (`wp sermonator bible attest --force`, T-I) — the ONLY way to set the L6 attestation
+     * TRUE while the Settings-API heterogeneity hard-disable would refuse it. Each entry
+     * records the time, acting user id, the previous attestation state, and the via marker
+     * (`cli-force`), so the deliberate bypass of the single-tradition safety premise is
+     * never silent (design §4 — "a logged escape hatch, never a silent UI bypass"). A list
+     * of entries; never read on a render path.
+     */
+    public const OPTION_BIBLE_INLINE_ATTEST_LOG = 'sermonator_bible_inline_attest_log';
+
+    /**
      * Stamped into every vendored/normalized per-chapter JSON file and folded into
      * the chapter-cache transient key. Bump to invalidate every cached chapter when
      * the normalized node shape changes (design §3.4 / §3.6). Distinct from the
