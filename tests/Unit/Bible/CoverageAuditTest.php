@@ -553,4 +553,256 @@ final class CoverageAuditTest extends TestCase {
 
         $this->assertStringNotContainsString( 'inline-eligible', $result['description'] );
     }
+
+    // ----------------------------------------------------------------------------------
+    // T-E — would-promote PREVIEW (three floors, assume-attested ceiling, sample)
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Build a PROMOTABLE inline-shape ref carrying its own `raw` so the shared
+     * {@see \Sermonator\Bible\DerivedExactClassifier} can re-parse it in isolation.
+     * `confidence` defaults to `probable` (the only promotable stored tier) and
+     * `srcVersification` to ESV (eng-protestant, site-default provenance).
+     *
+     * @return array<string,mixed>
+     */
+    private function promoRef(
+        string $book,
+        int $chapter,
+        int $verseStart,
+        string $raw,
+        string $confidence = 'probable',
+        string $src = 'ESV',
+        ?int $verseEnd = null
+    ): array {
+        return array(
+            'bookUSFM'         => $book,
+            'chapterStart'     => $chapter,
+            'verseStart'       => $verseStart,
+            'verseEnd'         => $verseEnd,
+            'chapterEnd'       => null,
+            'confidence'       => $confidence,
+            'srcVersification' => $src,
+            'raw'              => $raw,
+        );
+    }
+
+    public function test_promotion_preview_three_floor_counters_and_strict_vs_perseg_delta(): void {
+        // Post A: compound (2 clean probable refs) — promotes under PERSEG, NOT strict.
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16, 17',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16' ),
+                $this->promoRef( 'JHN', 3, 17, 'John 3:17' ),
+            ) ),
+        ) );
+        // Post B: lone clean probable — promotes under STRICT and perseg.
+        $this->seed( 2, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16' ),
+            ) ),
+        ) );
+        // Post C: lone EXACT — inline-eligible under EVERY floor, never "promoted".
+        $this->seed( 3, array(
+            ID::META_BIBLE_PASSAGE => 'Genesis 1:1',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'GEN', 1, 1, 'Genesis 1:1', 'exact' ),
+            ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1, 2, 3 ), $this->chapterWith( array( 1, 16, 17 ) ) )
+            ->promotionPreview( true );
+
+        $this->assertSame( 4, $preview['refs_total'] );
+
+        $exact  = $preview['floors']['exact'];
+        $strict = $preview['floors']['derived-exact'];
+        $perseg = $preview['floors']['derived-exact-perseg'];
+
+        // would-promote (the L2 lever): exact 0, strict 1 (post B), perseg 3 (A's 2 + B).
+        $this->assertSame( 0, $exact['would_promote'] );
+        $this->assertSame( 1, $strict['would_promote'] );
+        $this->assertSame( 3, $perseg['would_promote'] );
+
+        // inline-eligible (full predicate): exact 1 (only the exact ref), strict 2, perseg 4.
+        $this->assertSame( 1, $exact['inline_eligible'] );
+        $this->assertSame( 2, $strict['inline_eligible'] );
+        $this->assertSame( 4, $perseg['inline_eligible'] );
+
+        $this->assertSame( 25.0, $exact['inline_eligible_pct'] );
+        $this->assertSame( 50.0, $strict['inline_eligible_pct'] );
+        $this->assertSame( 100.0, $perseg['inline_eligible_pct'] );
+
+        // The compound's segments are withheld low-confidence under strict, cleared under perseg.
+        $this->assertSame( 3, $exact['withheld']['low-confidence'] );
+        $this->assertSame( 2, $strict['withheld']['low-confidence'] );
+        $this->assertSame( 0, $perseg['withheld']['low-confidence'] );
+
+        // Each floor's report PARTITIONS the corpus refs.
+        foreach ( array( $exact, $strict, $perseg ) as $floor ) {
+            $this->assertSame(
+                $preview['refs_total'],
+                $floor['inline_eligible'] + array_sum( $floor['withheld'] )
+            );
+        }
+    }
+
+    public function test_promotion_preview_ignores_the_stored_floor_option(): void {
+        // The preview computes ALL THREE floors regardless of the persisted floor.
+        $this->options[ ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR ] = 'derived-exact-perseg';
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true );
+
+        foreach ( array( 'exact', 'derived-exact', 'derived-exact-perseg' ) as $floor ) {
+            $this->assertArrayHasKey( $floor, $preview['floors'] );
+            $this->assertSame( $floor, $preview['floors'][ $floor ]['floor'] );
+        }
+        // exact promotes nothing; perseg promotes the lone clean probable.
+        $this->assertSame( 0, $preview['floors']['exact']['inline_eligible'] );
+        $this->assertSame( 1, $preview['floors']['derived-exact-perseg']['inline_eligible'] );
+    }
+
+    public function test_promotion_preview_assume_attested_ceiling(): void {
+        // A lone EXACT, site-default-provenance ESV ref: eligible ONLY when attestation is
+        // assumed; un-attested it fails L6 (src-versification-unattested).
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16', 'exact' ),
+            ) ),
+        ) );
+
+        $audit = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) );
+
+        $ceiling = $audit->promotionPreview( true );
+        $this->assertTrue( $ceiling['assume_attested'] );
+        $this->assertSame( 1, $ceiling['floors']['exact']['inline_eligible'] );
+
+        $actual = $audit->promotionPreview( false );
+        $this->assertFalse( $actual['assume_attested'] );
+        $this->assertSame( 0, $actual['floors']['exact']['inline_eligible'] );
+        $this->assertSame( 1, $actual['floors']['exact']['withheld']['src-versification-unattested'] );
+    }
+
+    public function test_promotion_preview_heterogeneous_canary_fires_on_mixed_family(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'corpus',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16', 'exact', 'ESV' ),
+                $this->promoRef( 'GEN', 1, 1, 'Genesis 1:1', 'exact', 'RVR1960' ),
+            ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 1, 16 ) ) )->promotionPreview( true );
+
+        $this->assertTrue( $preview['heterogeneous'] );
+        $this->assertArrayHasKey( 'eng-protestant', $preview['families'] );
+        $this->assertArrayHasKey( 'unknown', $preview['families'] );
+    }
+
+    public function test_promotion_preview_homogeneous_corpus_is_not_heterogeneous(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'corpus',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16', 'exact', 'ESV' ),
+                $this->promoRef( 'GEN', 1, 1, 'Genesis 1:1', 'exact', 'NIV' ),
+            ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 1, 16 ) ) )->promotionPreview( true );
+
+        $this->assertFalse( $preview['heterogeneous'] );
+        $this->assertSame( array( 'eng-protestant' => 2 ), $preview['families'] );
+    }
+
+    public function test_promotion_preview_sample_returns_promoted_refs_with_raw(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+        $this->seed( 2, array(
+            ID::META_BIBLE_PASSAGE => 'Genesis 1:1',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'GEN', 1, 1, 'Genesis 1:1' ) ) ),
+        ) );
+        $this->seed( 3, array(
+            ID::META_BIBLE_PASSAGE => 'Romans 8:28',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'ROM', 8, 28, 'Romans 8:28' ) ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1, 2, 3 ), $this->chapterWith( array( 1, 16, 28 ) ) )
+            ->promotionPreview( true, 2 );
+
+        // Capped at N=2 promoted refs, each carrying its own raw passage substring.
+        $this->assertCount( 2, $preview['sample'] );
+        foreach ( $preview['sample'] as $entry ) {
+            $this->assertArrayHasKey( 'raw', $entry );
+            $this->assertNotSame( '', $entry['raw'] );
+            $this->assertArrayHasKey( 'bookUSFM', $entry );
+            $this->assertArrayHasKey( 'verseStart', $entry );
+        }
+    }
+
+    public function test_promotion_preview_sample_only_includes_promoted_eligible_refs(): void {
+        // A lone clean probable (promotes) + a chapter-only ref (never inline-shaped). Only
+        // the promoted, inline-eligible ref enters the sample.
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->promoRef( 'JHN', 3, 16, 'John 3:16' ),
+                $this->ref( 'JHN', 3, null ),
+            ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true, 10 );
+
+        $this->assertCount( 1, $preview['sample'] );
+        $this->assertSame( 'John 3:16', $preview['sample'][0]['raw'] );
+    }
+
+    public function test_promotion_preview_default_sample_is_empty(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true );
+
+        $this->assertSame( array(), $preview['sample'] );
+    }
+
+    public function test_promotion_preview_writes_nothing(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+
+        $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true, 5 );
+
+        // Read-only instrument: it must not persist the rollup option (no write-on-GET).
+        $this->assertArrayNotHasKey( ID::OPTION_BIBLE_STATS, $this->options );
+    }
+
+    public function test_promotion_preview_shape_carries_canaries(): void {
+        $this->seed( 1, array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->promoRef( 'JHN', 3, 16, 'John 3:16' ) ) ),
+        ) );
+
+        $preview = $this->inlineAuditOver( array( 1 ), $this->chapterWith( array( 16 ) ) )->promotionPreview( true );
+
+        foreach ( array(
+            'generated_at', 'target', 'assume_attested', 'refs_total',
+            'families', 'dominant_family', 'heterogeneous', 'unmodeled_pair_wrong_text',
+            'floors', 'sample',
+        ) as $key ) {
+            $this->assertArrayHasKey( $key, $preview, "missing preview key: $key" );
+        }
+        $this->assertSame( 0, $preview['unmodeled_pair_wrong_text'] );
+        $this->assertSame( 'ENGWEBP', $preview['target'] );
+    }
 }

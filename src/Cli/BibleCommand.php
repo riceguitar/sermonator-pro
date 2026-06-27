@@ -339,10 +339,17 @@ final class BibleCommand {
      * : Run the inline corpus-gate report (withheld-by-reason, inline-eligible%, and the
      *   unmodeled-pair WRONG-TEXT canary) instead of the parse-coverage summary.
      *
+     * [--sample=<n>]
+     * : With `--inline`, print the would-promote PREVIEW (the would-promote count +
+     *   inline-eligible% under each of the three confidence floors, assume-attested) plus
+     *   up to N PROMOTED references with their raw passage substrings — the axis-2 human
+     *   spot-check the per-segment floor is gated behind (design §4 step 4).
+     *
      * ## EXAMPLES
      *
      *     wp sermonator bible audit
      *     wp sermonator bible audit --inline
+     *     wp sermonator bible audit --inline --sample=20
      *
      * @param array<int,string>    $args
      * @param array<string,string> $assoc_args
@@ -355,7 +362,70 @@ final class BibleCommand {
             return;
         }
 
+        if ( array_key_exists( 'sample', $assoc_args ) ) {
+            $this->reportPromotionPreview( $audit->promotionPreview( true, (int) $assoc_args['sample'] ) );
+            return;
+        }
+
         $this->reportInline( $audit->inlineReport() );
+    }
+
+    /**
+     * Print the READ-ONLY would-promote PREVIEW: the would-promote count + inline-eligible%
+     * under each of the three confidence floors (assume-attested ceiling), the corpus
+     * canaries, and the axis-2 promoted-ref sample (raw passage substrings). Writes nothing.
+     *
+     * @param array{target:string,assume_attested:bool,refs_total:int,heterogeneous:bool,families:array<string,int>,dominant_family:string,unmodeled_pair_wrong_text:int,floors:array<string,array{floor:string,would_promote:int,inline_eligible:int,inline_eligible_pct:float,withheld:array<string,int>}>,sample:list<array<string,mixed>>} $preview
+     */
+    private function reportPromotionPreview( array $preview ): void {
+        \WP_CLI::log( sprintf(
+            'Would-promote preview (target %s, assume-attested %s, %d render-ready references):',
+            $preview['target'],
+            $preview['assume_attested'] ? 'yes' : 'no',
+            $preview['refs_total']
+        ) );
+
+        foreach ( $preview['floors'] as $floor ) {
+            \WP_CLI::log( sprintf(
+                '  %-22s would-promote %d, inline-eligible %s%% (%d).',
+                $floor['floor'] . ':',
+                $floor['would_promote'],
+                (string) $floor['inline_eligible_pct'],
+                $floor['inline_eligible']
+            ) );
+        }
+
+        if ( $preview['unmodeled_pair_wrong_text'] > 0 ) {
+            \WP_CLI::warning( sprintf(
+                'WRONG-TEXT canary: %d reference(s) hit an UNMODELED versification pair at the per-segment floor — model these before enabling inline at scale.',
+                $preview['unmodeled_pair_wrong_text']
+            ) );
+        }
+
+        if ( $preview['heterogeneous'] ) {
+            \WP_CLI::warning( sprintf(
+                'Source-versification HETEROGENEITY: the corpus carries %d distinct family bucket(s) (dominant: %s). The single site-wide attestation is unsafe.',
+                count( $preview['families'] ),
+                '' === $preview['dominant_family'] ? '(none)' : $preview['dominant_family']
+            ) );
+        }
+
+        if ( array() === $preview['sample'] ) {
+            \WP_CLI::log( '  No promoted references to sample.' );
+        } else {
+            \WP_CLI::log( sprintf( '  Axis-2 spot-check sample (%d promoted reference(s)):', count( $preview['sample'] ) ) );
+            foreach ( $preview['sample'] as $entry ) {
+                \WP_CLI::log( sprintf(
+                    '    - %s  [%s %s:%s]',
+                    (string) ( $entry['raw'] ?? '' ),
+                    (string) ( $entry['bookUSFM'] ?? '' ),
+                    (string) ( $entry['chapterStart'] ?? '' ),
+                    (string) ( $entry['verseStart'] ?? '' )
+                ) );
+            }
+        }
+
+        \WP_CLI::success( 'Would-promote preview complete (read-only; no writes).' );
     }
 
     /**

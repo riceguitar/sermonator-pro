@@ -113,6 +113,15 @@ final class CoverageAudit {
     public const INLINE_REASON_VERSE_OUT_OF_RANGE   = 'verse-out-of-range';
 
     /**
+     * L6 — the admin has NOT attested the single-tradition premise. NEVER fires in the
+     * always-attested {@see self::inlineReport()} (which assumes the best-case ceiling);
+     * it is surfaced ONLY by the would-promote PREVIEW when called with `assumeAttested`
+     * false (the real, pre-attestation state — "0% until you attest"). Reuses the gate's
+     * own constant so the string has a single home.
+     */
+    public const INLINE_REASON_UNATTESTED           = VersificationGate::REASON_UNATTESTED;
+
+    /**
      * STORED confidence tiers ranked HIGH → LOW for the L2 floor check — kept in BYTE-
      * lockstep with {@see \Sermonator\Frontend\BibleResolver::STORED_CONFIDENCE_RANK} so
      * the audit predicts the live decision exactly. The vocabulary is **de-stored**
@@ -269,6 +278,193 @@ final class CoverageAudit {
     }
 
     /**
+     * The READ-ONLY would-promote PREVIEW (design §4 live preview / spec T-E): over the
+     * corpus in a SINGLE pass it returns, under EACH of the three floors
+     * (`exact` / strict `derived-exact` / `derived-exact-perseg`), the would-promote count
+     * (the L2 lever's effect) and the full-predicate inline-eligible% + withheld-by-reason
+     * breakdown — so an admin sees the recall of each floor over THEIR OWN corpus before
+     * lowering it. It NEVER reads {@see self::confidenceFloor()} (it spans all three) and
+     * WRITES NOTHING (no write-on-GET; the persisted rollup stays the cron/on-save concern).
+     *
+     * `$assumeAttested` is the ceiling lever: TRUE (the default) computes what WOULD promote
+     * if the admin attested (so the potential is visible BEFORE attesting); FALSE reflects
+     * the real pre-attestation state where site-default refs fall to L6
+     * `src-versification-unattested` ("0% until you attest"). Either way the corpus-level
+     * canaries — `heterogeneous` (>1 source-versification family bucket) and
+     * `unmodeled_pair_wrong_text` (the worst-case, most-permissive-floor unmodeled-pair
+     * count) — surface attestation-independently, because a green recall headline must never
+     * hide a mis-versification.
+     *
+     * `$sampleSize` > 0 additionally returns up to N PROMOTED, inline-eligible refs (under
+     * the most-permissive perseg floor) paired with their own `raw` passage substring — the
+     * axis-2 human spot-check the perseg floor is gated behind (design §4 step 4).
+     *
+     * Reuses the SAME shared {@see DerivedExactClassifier} both lockstep L2 checks call, so
+     * the preview's promotion decision matches the live render exactly.
+     *
+     * @return array{generated_at:int,target:string,assume_attested:bool,refs_total:int,families:array<string,int>,dominant_family:string,heterogeneous:bool,unmodeled_pair_wrong_text:int,floors:array<string,array{floor:string,would_promote:int,inline_eligible:int,inline_eligible_pct:float,withheld:array<string,int>}>,sample:list<array<string,mixed>>}
+     */
+    public function promotionPreview( bool $assumeAttested = true, int $sampleSize = 0 ): array {
+        return $this->computePromotionPreview( ( $this->postsProvider )(), $assumeAttested, max( 0, $sampleSize ) );
+    }
+
+    /**
+     * The single-pass would-promote computation behind {@see self::promotionPreview()}.
+     * Collects the corpus's render-ready refs ONCE (one meta pass), buckets families for the
+     * heterogeneity canary, then classifies every ref under all three floors — the floor only
+     * changes L2, so the same per-ref work feeds all three counters. Never writes; never
+     * throws; zero network I/O (L8 reads disk/cache via the injected resolver).
+     *
+     * @param list<int> $ids
+     *
+     * @return array{generated_at:int,target:string,assume_attested:bool,refs_total:int,families:array<string,int>,dominant_family:string,heterogeneous:bool,unmodeled_pair_wrong_text:int,floors:array<string,array{floor:string,would_promote:int,inline_eligible:int,inline_eligible_pct:float,withheld:array<string,int>}>,sample:list<array<string,mixed>>}
+     */
+    private function computePromotionPreview( array $ids, bool $assumeAttested, int $sampleSize ): array {
+        $target = TranslationRegistry::current()->inlineTranslation();
+
+        $entries       = $this->corpusRefs( $ids );
+        $families      = self::familyHistogram( $entries );
+        $dominant      = self::dominantFamily( $families );
+        $heterogeneous = count( $families ) > 1;
+
+        $floors = array(
+            DerivedExactClassifier::FLOOR_EXACT,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG,
+        );
+
+        $reports = array();
+        foreach ( $floors as $floor ) {
+            $reports[ $floor ] = array(
+                'floor'               => $floor,
+                'would_promote'       => 0,
+                'inline_eligible'     => 0,
+                'inline_eligible_pct' => 0.0,
+                'withheld'            => self::previewWithheldTemplate(),
+            );
+        }
+
+        $sample = array();
+
+        foreach ( $entries as $entry ) {
+            $ref      = $entry['ref'];
+            $refCount = $entry['refCount'];
+            // Only the `probable` stored tier is PROMOTABLE; `exact` already clears L2
+            // natively (not a promotion) and everything else ranks 0.
+            $isProbable = ( ( $ref['confidence'] ?? '' ) === 'probable' );
+
+            $persegReason = null;
+            foreach ( $floors as $floor ) {
+                $promoted = $isProbable && DerivedExactClassifier::promotes( $ref, $floor, $refCount );
+                if ( $promoted ) {
+                    ++$reports[ $floor ]['would_promote'];
+                }
+
+                $reason = $this->classifyInlineRef(
+                    $ref,
+                    $refCount,
+                    $target,
+                    $floor,
+                    $dominant,
+                    $heterogeneous,
+                    $assumeAttested
+                );
+                if ( DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG === $floor ) {
+                    $persegReason = $reason;
+                }
+
+                if ( null === $reason ) {
+                    ++$reports[ $floor ]['inline_eligible'];
+                    continue;
+                }
+                $key = isset( $reports[ $floor ]['withheld'][ $reason ] )
+                    ? $reason
+                    : self::INLINE_REASON_NOT_INLINE_ELIGIBLE;
+                ++$reports[ $floor ]['withheld'][ $key ];
+            }
+
+            // The axis-2 spot-check sample: PROMOTED (probable→inline) AND fully eligible
+            // under the most-permissive perseg floor, paired with its own raw substring.
+            if (
+                $sampleSize > 0
+                && count( $sample ) < $sampleSize
+                && $isProbable
+                && null === $persegReason
+                && DerivedExactClassifier::promotes( $ref, DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG, $refCount )
+            ) {
+                $sample[] = self::sampleEntry( $ref );
+            }
+        }
+
+        $refsTotal = count( $entries );
+        foreach ( $floors as $floor ) {
+            $reports[ $floor ]['inline_eligible_pct'] = self::percentage(
+                $reports[ $floor ]['inline_eligible'],
+                $refsTotal
+            );
+        }
+
+        return array(
+            'generated_at'   => time(),
+            'target'         => $target,
+            'assume_attested' => $assumeAttested,
+            'refs_total'     => $refsTotal,
+            'families'       => $families,
+            'dominant_family' => $dominant,
+            'heterogeneous'  => $heterogeneous,
+            // Worst-case WRONG-TEXT canary: the unmodeled-pair count at the MOST permissive
+            // (perseg) floor, where the most refs reach the L5 versification check — so the
+            // canary shows the admin the full potential exposure before they lower the floor.
+            'unmodeled_pair_wrong_text' => $reports[ DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG ]['withheld'][ self::INLINE_REASON_UNMODELED_PAIR ],
+            'floors'         => $reports,
+            'sample'         => $sample,
+        );
+    }
+
+    /**
+     * The withheld-by-reason zero template for a PREVIEW floor report. Identical to the
+     * always-attested {@see self::computeInlineReport()} buckets PLUS the
+     * `src-versification-unattested` bucket, which only the preview can surface (when called
+     * with `assumeAttested` false).
+     *
+     * @return array<string,int>
+     */
+    private static function previewWithheldTemplate(): array {
+        return array(
+            self::INLINE_REASON_NOT_INLINE_ELIGIBLE    => 0,
+            self::INLINE_REASON_LOW_CONFIDENCE         => 0,
+            self::INLINE_REASON_TRANSLATION_INELIGIBLE => 0,
+            self::INLINE_REASON_SRC_UNSUPPORTED        => 0,
+            self::INLINE_REASON_SRC_HETEROGENEOUS      => 0,
+            self::INLINE_REASON_UNMODELED_PAIR         => 0,
+            self::INLINE_REASON_UNATTESTED             => 0,
+            self::INLINE_REASON_DIVERGENT              => 0,
+            self::INLINE_REASON_COLD_UNWARMED          => 0,
+            self::INLINE_REASON_VERSE_OUT_OF_RANGE     => 0,
+        );
+    }
+
+    /**
+     * A spot-check sample row: the ref's own `raw` passage substring plus its structural
+     * identity, for the axis-2 human verification that the promoted reference's raw text
+     * genuinely names the verse the inline render would show. Read-only; carries no payload.
+     *
+     * @param array<string,mixed> $ref
+     *
+     * @return array{raw:string,bookUSFM:string,chapterStart:?int,verseStart:?int,verseEnd:?int,confidence:string}
+     */
+    private static function sampleEntry( array $ref ): array {
+        return array(
+            'raw'          => isset( $ref['raw'] ) && is_string( $ref['raw'] ) ? $ref['raw'] : '',
+            'bookUSFM'     => isset( $ref['bookUSFM'] ) && is_string( $ref['bookUSFM'] ) ? $ref['bookUSFM'] : '',
+            'chapterStart' => isset( $ref['chapterStart'] ) ? (int) $ref['chapterStart'] : null,
+            'verseStart'   => isset( $ref['verseStart'] ) && null !== $ref['verseStart'] ? (int) $ref['verseStart'] : null,
+            'verseEnd'     => isset( $ref['verseEnd'] ) && null !== $ref['verseEnd'] ? (int) $ref['verseEnd'] : null,
+            'confidence'   => isset( $ref['confidence'] ) && is_string( $ref['confidence'] ) ? $ref['confidence'] : '',
+        );
+    }
+
+    /**
      * The inline corpus-gate computation shared by {@see self::run()} (which persists it
      * under the rollup's `inline` key) and {@see self::inlineReport()} (which returns it
      * read-only). Never writes; never throws; performs ZERO network I/O (L8 reads disk/
@@ -365,8 +561,12 @@ final class CoverageAudit {
      * @param string              $floor         L2 confidence floor.
      * @param string              $dominant      The corpus-dominant source-versification family bucket.
      * @param bool                $heterogeneous Whether the corpus carries >1 family bucket.
+     * @param bool                $attested      L6 attestation assumption (default TRUE — the
+     *                                           best-case ceiling {@see self::inlineReport()}
+     *                                           uses; the preview passes FALSE to surface the
+     *                                           pre-attestation `src-versification-unattested`).
      */
-    private function classifyInlineRef( array $ref, int $refCount, string $target, string $floor, string $dominant, bool $heterogeneous ): ?string {
+    private function classifyInlineRef( array $ref, int $refCount, string $target, string $floor, string $dominant, bool $heterogeneous, bool $attested = true ): ?string {
         // L1 — pure structural inline-shape: a specific verse, not cross-chapter.
         $verseStart = $ref['verseStart'] ?? null;
         $chapterEnd = $ref['chapterEnd'] ?? null;
@@ -400,10 +600,11 @@ final class CoverageAudit {
             return self::INLINE_REASON_SRC_UNSUPPORTED;
         }
 
-        // L5–L7 — the (source-family → target) versification relation. Attestation is
-        // ASSUMED TRUE here (best-case ceiling); the gate returns the precise reason for
-        // an unmodeled pair (L5) or a divergent zone (L7). L6 cannot fire under attested.
-        $gate = VersificationGate::eligible( $ref, $target, true );
+        // L5–L7 — the (source-family → target) versification relation. The gate returns the
+        // precise reason for an unmodeled pair (L5), an unattested site-default ref (L6, only
+        // when `$attested` is false), or a divergent zone (L7). The always-attested ceiling
+        // ({@see self::inlineReport()}) passes true so L6 cannot fire there.
+        $gate = VersificationGate::eligible( $ref, $target, $attested );
         if ( ! $gate['eligible'] ) {
             return (string) $gate['reason'];
         }
