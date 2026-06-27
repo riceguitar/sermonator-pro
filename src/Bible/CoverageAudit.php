@@ -428,14 +428,24 @@ final class CoverageAudit {
     /**
      * Flatten every in-canon, structurally-valid ref across the corpus (the same
      * render-ready universe {@see self::anyResolves()} counts, but per-ref) — each PAIRED
-     * with its own post's envelope refCount. Reads each post's refs via
-     * {@see self::refsForPost()} (stored envelope, else live parse).
+     * with its own post's envelope refCount.
      *
-     * The refCount is the count of the post's WHOLE ref list (NOT just the valid refs that
-     * survive the in-canon/structural filter), mirroring {@see
-     * \Sermonator\Frontend\BibleResolver::resolve()}'s `count( $refs )` over the full
-     * envelope — so the STRICT `derived-exact` singleton constraint (a compound passage's
-     * segments never promote) decides identically here and at render.
+     * The refCount is the count of the post's WHOLE stored ref list read through the ONE
+     * shared {@see RefsEnvelope::decode()}, **UNFILTERED** — non-array junk entries are
+     * INCLUDED, exactly as {@see \Sermonator\Frontend\BibleResolver::resolve()} takes
+     * `count( $refs )` over `readEnvelopeRefs()` BEFORE its per-ref
+     * `if ( ! is_array( $ref ) ) { continue; }`. Counting the identical population is what
+     * makes the STRICT `derived-exact` singleton constraint (a compound passage's segments
+     * never promote) decide identically here and at render — closing the malformed-envelope
+     * lockstep gap where dropping a junk sibling before the count would falsely promote a
+     * lone clean `probable` in the audit while the render withholds it.
+     *
+     * Only the array-typed refs are iterated for the in-canon/structural filter (the
+     * resolver's per-ref guard). A post with a stored envelope whose entries are ALL
+     * non-array junk contributes nothing here — exactly as the resolver renders nothing
+     * inline for it (it never live-parses once an envelope is present). Live-parse of the
+     * preserved label is the fallback ONLY when there is no usable stored envelope (where
+     * the resolver likewise renders nothing inline and every parsed ref is an array).
      *
      * @param list<int> $ids
      *
@@ -451,8 +461,18 @@ final class CoverageAudit {
                 continue;
             }
 
-            $postRefs = $this->refsForPost( $id, $passage );
-            $refCount = count( $postRefs );
+            $envelope = RefsEnvelope::decode( get_post_meta( $id, ID::META_BIBLE_REFS, true ) );
+
+            if ( null !== $envelope ) {
+                // UNFILTERED count — byte-lockstep with the resolver's refCount.
+                $refCount = count( $envelope );
+                $postRefs = array_values( array_filter( $envelope, 'is_array' ) );
+            } else {
+                // No usable stored envelope: live-parse the preserved label as ground
+                // truth (every parsed ref is an array, so the count needs no filter).
+                $postRefs = $this->liveParseRefs( $passage );
+                $refCount = count( $postRefs );
+            }
 
             foreach ( $postRefs as $ref ) {
                 $flags = RefValidator::validate( $ref );
@@ -748,20 +768,27 @@ final class CoverageAudit {
      * @return list<array<string,mixed>>
      */
     private function refsForPost( int $postId, string $passage ): array {
-        $stored = get_post_meta( $postId, ID::META_BIBLE_REFS, true );
+        $envelope = RefsEnvelope::decode( get_post_meta( $postId, ID::META_BIBLE_REFS, true ) );
 
-        if ( is_string( $stored ) && '' !== $stored ) {
-            $decoded = json_decode( $stored, true );
-            if ( is_array( $decoded ) && isset( $decoded['refs'] ) && is_array( $decoded['refs'] ) ) {
-                $refs = array_values( array_filter( $decoded['refs'], 'is_array' ) );
-                if ( array() !== $refs ) {
-                    return $refs;
-                }
+        if ( null !== $envelope ) {
+            $refs = array_values( array_filter( $envelope, 'is_array' ) );
+            if ( array() !== $refs ) {
+                return $refs;
             }
         }
 
         // No usable stored envelope (un-backfilled / un-authored): live-parse the
         // preserved label as ground truth.
+        return $this->liveParseRefs( $passage );
+    }
+
+    /**
+     * Live-parse a preserved passage label into its array refs (the un-backfilled
+     * ground-truth fallback). Never throws; never writes.
+     *
+     * @return list<array<string,mixed>>
+     */
+    private function liveParseRefs( string $passage ): array {
         $parsed = ReferenceParser::parse( $passage );
         $refs   = array();
         foreach ( $parsed['segments'] as $segment ) {

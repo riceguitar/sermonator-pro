@@ -245,4 +245,78 @@ final class BibleL2LockstepTest extends TestCase {
             array( false )
         );
     }
+
+    // ----------------------------------------------------------------------------------
+    // Malformed-envelope refCount lockstep (a non-array junk sibling)
+    //
+    // The STRICT singleton constraint compares the per-post envelope refCount to 1. The
+    // resolver derives that count from `readEnvelopeRefs()` — the UNFILTERED list, junk
+    // INCLUDED, skipping non-array entries only while iterating AFTER the count. The audit
+    // must count the SAME population; if it drops the junk sibling before counting it sees
+    // refCount 1 and FALSE-promotes the lone `probable` while the render (refCount 2)
+    // withholds it — a false-green on exactly the corpus-independent dark guarantee. These
+    // pin both engines to the shared {@see \Sermonator\Bible\RefsEnvelope} count.
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Seed a post whose envelope carries the given (possibly non-array) entries verbatim,
+     * so a non-array junk sibling survives into the stored bytes both engines read.
+     *
+     * @param list<mixed> $entries
+     */
+    private function seedRawEnvelope( int $id, array $entries ): void {
+        $this->meta[ $id ] = array(
+            ID::META_BIBLE_PASSAGE => 'passage',
+            ID::META_BIBLE_REFS    => (string) json_encode( array( 'v' => 1, 'refs' => $entries ) ),
+        );
+    }
+
+    public function test_non_array_junk_sibling_suppresses_promotion_in_lockstep_under_strict(): void {
+        // The concrete review case: {"refs":[{lone clean probable JHN 3:16}, 5]}. The junk
+        // sibling makes refCount 2 in BOTH engines → STRICT withholds the probable. Before
+        // the shared reader the audit counted 1 and reported it inline-eligible (false-green)
+        // while the render withheld it.
+        $this->seedRawEnvelope( 1, array( $this->ref( 16, 'John 3:16', 'probable' ), 5 ) );
+        $this->options = array(
+            ID::OPTION_BIBLE_LINK_VERSION            => 'ESV',
+            ID::OPTION_BIBLE_INLINE_ENABLED          => true,
+            ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR => DEC::FLOOR_DERIVED_EXACT,
+            ID::OPTION_BIBLE_INLINE_ATTESTATION      => true,
+        );
+
+        // Resolver: the one render-ready ref resolves but is WITHHELD from inline (refCount 2).
+        $resolved = BibleResolver::resolve( 1, $this->chapter() );
+        $this->assertNotNull( $resolved );
+        $this->assertCount( 1, $resolved->refs() );
+        $this->assertNull( $resolved->refs()[0]['inline'], 'render must withhold the probable (refCount 2)' );
+
+        // Audit: identical decision — withheld low-confidence, NOT counted inline-eligible.
+        $report = ( new CoverageAudit( static fn(): array => array( 1 ), $this->chapter() ) )->inlineReport();
+        $this->assertSame( 1, $report['refs_total'], 'only the array-typed ref is render-ready' );
+        $this->assertSame( 0, $report['inline_eligible'], 'audit must NOT over-promote (lockstep refCount 2)' );
+        $this->assertSame( 1, $report['withheld']['low-confidence'] );
+    }
+
+    public function test_non_array_junk_sibling_does_not_block_perseg_promotion_in_lockstep(): void {
+        // Under perseg the singleton constraint does not apply, so the junk sibling is
+        // irrelevant: the lone clean `probable` still promotes in BOTH engines (junk is
+        // skipped while iterating, never miscounted into the decision).
+        $this->seedRawEnvelope( 1, array( $this->ref( 16, 'John 3:16', 'probable' ), 5 ) );
+        $this->options = array(
+            ID::OPTION_BIBLE_LINK_VERSION            => 'ESV',
+            ID::OPTION_BIBLE_INLINE_ENABLED          => true,
+            ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR => DEC::FLOOR_DERIVED_EXACT_PERSEG,
+            ID::OPTION_BIBLE_INLINE_ATTESTATION      => true,
+        );
+
+        $resolved = BibleResolver::resolve( 1, $this->chapter() );
+        $this->assertNotNull( $resolved );
+        $this->assertCount( 1, $resolved->refs() );
+        $this->assertNotNull( $resolved->refs()[0]['inline'], 'render must promote the probable under perseg' );
+
+        $report = ( new CoverageAudit( static fn(): array => array( 1 ), $this->chapter() ) )->inlineReport();
+        $this->assertSame( 1, $report['refs_total'] );
+        $this->assertSame( 1, $report['inline_eligible'], 'audit must promote in lockstep under perseg' );
+        $this->assertSame( 0, $report['withheld']['low-confidence'] );
+    }
 }

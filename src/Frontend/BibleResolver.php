@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Sermonator\Frontend;
 
 use Sermonator\Bible\DerivedExactClassifier;
+use Sermonator\Bible\RefsEnvelope;
 use Sermonator\Bible\RefValidator;
 use Sermonator\Bible\TranslationRegistry;
 use Sermonator\Bible\VersificationGate;
@@ -486,26 +487,18 @@ final class BibleResolver {
      * Read + decode the META_BIBLE_REFS envelope into its raw ref list, or null when the
      * envelope is absent, empty, or not a well-formed `{refs:[…]}`.
      *
+     * Delegates to the ONE shared {@see RefsEnvelope::decode()} so the per-post `$refCount`
+     * derived here ({@see self::resolve()}) is provably the SAME population the corpus audit
+     * counts — the singleton-constraint lockstep. The list is UNFILTERED (non-array junk
+     * preserved); the {@see self::resolve()} loop skips non-array entries AFTER taking the
+     * count.
+     *
      * @return list<mixed>|null
      */
     private static function readEnvelopeRefs( int $postId ): ?array {
         $stored = get_post_meta( $postId, Identifiers::META_BIBLE_REFS, true );
 
-        if ( ! is_string( $stored ) || '' === $stored ) {
-            return null;
-        }
-
-        $decoded = json_decode( $stored, true );
-        if ( ! is_array( $decoded ) ) {
-            return null;
-        }
-
-        $refs = $decoded['refs'] ?? null;
-        if ( ! is_array( $refs ) || array() === $refs ) {
-            return null;
-        }
-
-        return array_values( $refs );
+        return RefsEnvelope::decode( $stored );
     }
 
     /**

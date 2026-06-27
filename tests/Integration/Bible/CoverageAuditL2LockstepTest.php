@@ -131,6 +131,63 @@ final class CoverageAuditL2LockstepTest extends WP_UnitTestCase {
         $this->assertSame( 0, $report['withheld']['cold-unwarmed'] );
     }
 
+    public function test_non_array_junk_sibling_keeps_strict_singleton_lockstep(): void {
+        // MALFORMED-ENVELOPE refCount lockstep (the review's `{"refs":[{probable}, 5]}`
+        // case): the non-array junk sibling makes the per-post envelope refCount 2 — the
+        // SAME population the live resolver counts via `readEnvelopeRefs()` — so the STRICT
+        // singleton constraint withholds the lone clean `probable` at L2 (low-confidence),
+        // never reaching cold-unwarmed. Before the shared RefsEnvelope reader the audit
+        // dropped the junk before counting (refCount 1) and FALSE-promoted it: a false-green
+        // for the operator's enable go/no-go. Only the array-typed ref is render-ready.
+        $id      = (int) self::factory()->post->create( array(
+            'post_type'   => ID::POST_TYPE_SERMON,
+            'post_status' => 'publish',
+            'post_title'  => 'L2 lockstep malformed envelope',
+        ) );
+        update_post_meta( $id, ID::META_BIBLE_PASSAGE, 'passage' );
+        update_post_meta(
+            $id,
+            ID::META_BIBLE_REFS,
+            (string) wp_json_encode( array(
+                'v'    => 1,
+                'refs' => array( $this->ref( 16, 'John 3:16', 'probable' ), 5 ),
+            ) )
+        );
+
+        $report = $this->reportUnderFloor( DEC::FLOOR_DERIVED_EXACT );
+
+        $this->assertSame( 1, $report['refs_total'], 'only the array-typed ref is render-ready' );
+        $this->assertSame( 0, $report['inline_eligible'], 'STRICT must withhold (refCount 2, lockstep)' );
+        $this->assertSame( 1, $report['withheld']['low-confidence'] );
+        $this->assertSame( 0, $report['withheld']['cold-unwarmed'] );
+    }
+
+    public function test_non_array_junk_sibling_does_not_block_perseg_promotion(): void {
+        // Under perseg the singleton constraint does not apply: the junk sibling is
+        // irrelevant and the lone clean `probable` still clears L2, reaching cold-unwarmed
+        // (no false WITHHOLD from miscounting the junk into the decision).
+        $id      = (int) self::factory()->post->create( array(
+            'post_type'   => ID::POST_TYPE_SERMON,
+            'post_status' => 'publish',
+            'post_title'  => 'L2 lockstep malformed envelope perseg',
+        ) );
+        update_post_meta( $id, ID::META_BIBLE_PASSAGE, 'passage' );
+        update_post_meta(
+            $id,
+            ID::META_BIBLE_REFS,
+            (string) wp_json_encode( array(
+                'v'    => 1,
+                'refs' => array( $this->ref( 16, 'John 3:16', 'probable' ), 5 ),
+            ) )
+        );
+
+        $report = $this->reportUnderFloor( DEC::FLOOR_DERIVED_EXACT_PERSEG );
+
+        $this->assertSame( 1, $report['refs_total'] );
+        $this->assertSame( 0, $report['withheld']['low-confidence'], 'perseg clears the lone probable' );
+        $this->assertSame( 1, $report['withheld']['cold-unwarmed'] );
+    }
+
     public function test_unknown_legacy_floor_normalizes_to_exact(): void {
         // A stale/legacy floor value (e.g. the old stored `probable`) must normalize to
         // the conservative `exact` — promoting nothing — not crash or over-promote.
