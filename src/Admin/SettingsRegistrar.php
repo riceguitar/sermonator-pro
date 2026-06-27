@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Sermonator\Admin;
 
+use Sermonator\Bible\CoverageAudit;
+use Sermonator\Bible\DerivedExactClassifier;
 use Sermonator\Migration\BibleChapterVendor;
 use Sermonator\Schema\BibleTranslations;
 use Sermonator\Schema\Identifiers;
@@ -69,18 +71,28 @@ final class SettingsRegistrar {
     /**
      * The default — and conservative — confidence floor an inline-eligible ref must
      * clear (design §2 L2 / §3.5). `exact` = author-confirmed chips only; `derived-exact`
-     * is the only widening an admin may opt into here. `probable` is deliberately NOT
+     * (STRICT single-segment) is the offerable widening; `derived-exact-perseg` (per-ref)
+     * is the WIDEST and is selectable ONLY behind the axis-2 spot-check ack
+     * ({@see Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK}). `probable` is deliberately NOT
      * offerable through settings (it requires a documented misparse-risk acceptance).
+     *
+     * The value strings are the {@see DerivedExactClassifier::FLOOR_*} constants verbatim
+     * (single source) so the settings whitelist can never drift from the classifier that
+     * consumes the floor at render/audit time.
      */
-    public const DEFAULT_CONFIDENCE_FLOOR = 'exact';
+    public const DEFAULT_CONFIDENCE_FLOOR = DerivedExactClassifier::FLOOR_EXACT;
 
     /**
-     * The whitelist for {@see Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR}. Order is
-     * widest-trust-LAST; anything outside it floors to {@see self::DEFAULT_CONFIDENCE_FLOOR}.
+     * The whitelist for {@see Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR}, ALWAYS
+     * selectable. Order is widest-trust-LAST; anything outside it (and outside the
+     * ack-gated perseg floor) floors to {@see self::DEFAULT_CONFIDENCE_FLOOR}.
      *
      * @var list<string>
      */
-    private const ALLOWED_CONFIDENCE_FLOORS = array( 'exact', 'derived-exact' );
+    private const ALLOWED_CONFIDENCE_FLOORS = array(
+        DerivedExactClassifier::FLOOR_EXACT,
+        DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+    );
 
     /**
      * Snapshot-completeness oracle for the un-enableable hard-gate. Injected so the
@@ -92,11 +104,26 @@ final class SettingsRegistrar {
     private $snapshotComplete;
 
     /**
-     * @param callable(string):bool|null $snapshotComplete Override the snapshot-complete
-     *        oracle (tests); defaults to {@see BibleChapterVendor::isSnapshotComplete()}.
+     * Live inline corpus-gate audit oracle for the heterogeneity attest-disable and the
+     * enable soft-gate (design §3.6). Returns the {@see CoverageAudit::inlineReport()} shape
+     * (`inline_eligible`, `unmodeled_pair_wrong_text`, `heterogeneous`, `generated_at`, …).
+     * Injected so both gates are unit-testable without a live `WP_Query`/corpus; defaults to
+     * a fresh, READ-ONLY {@see CoverageAudit::inlineReport()} (no write-on-save beyond the
+     * recon-gen stamp the enable success path performs).
+     *
+     * @var callable():array<string,mixed>
      */
-    public function __construct( ?callable $snapshotComplete = null ) {
+    private $inlineAudit;
+
+    /**
+     * @param callable(string):bool|null      $snapshotComplete Override the snapshot-complete
+     *        oracle (tests); defaults to {@see BibleChapterVendor::isSnapshotComplete()}.
+     * @param callable():array<string,mixed>|null $inlineAudit   Override the live inline-audit
+     *        oracle (tests); defaults to a fresh {@see CoverageAudit::inlineReport()}.
+     */
+    public function __construct( ?callable $snapshotComplete = null, ?callable $inlineAudit = null ) {
         $this->snapshotComplete = $snapshotComplete ?? array( BibleChapterVendor::class, 'isSnapshotComplete' );
+        $this->inlineAudit      = $inlineAudit ?? static fn(): array => ( new CoverageAudit() )->inlineReport();
     }
 
     public function hook(): void {
@@ -234,13 +261,15 @@ final class SettingsRegistrar {
      * @param mixed $value Raw submitted value.
      */
     public function sanitizeInlineEnabled( $value ): bool {
-        // Turning the feature OFF is always permitted and needs no vendor check.
+        // Turning the feature OFF is always permitted and needs no vendor/audit check.
         if ( ! self::toBool( $value ) ) {
             return false;
         }
 
         $translation = $this->currentInlineTranslation();
 
+        // Hard-gate (design §3.4): the offline snapshot must be fully vendored + warmed,
+        // so inline rendering can never ship half-on / dark.
         if ( ! ( $this->snapshotComplete )( $translation ) ) {
             add_settings_error(
                 Identifiers::OPTION_BIBLE_INLINE_ENABLED,
@@ -251,34 +280,113 @@ final class SettingsRegistrar {
             return false;
         }
 
+        // Soft-gate (design §3.6, decision 6): refuse enable unless a FRESH inline audit over
+        // THIS corpus shows it would actually render something safely — inline_eligible > 0
+        // (else "enabled but dark = looks like a bug"), zero unmodeled-pair wrong-text exposure,
+        // and a single source-versification tradition (heterogeneity makes the site-wide
+        // attestation unsafe). The only override is the logged CLI escape hatch, which bypasses
+        // this sanitize entirely. On success the audit GENERATION is stamped (T-K drift warning)
+        // and the cache generation is bumped so the warmed cache reflects the reconciled corpus.
+        $audit = ( $this->inlineAudit )();
+
+        $eligible      = (int) ( $audit['inline_eligible'] ?? 0 );
+        $wrongText     = (int) ( $audit['unmodeled_pair_wrong_text'] ?? 0 );
+        $heterogeneous = ! empty( $audit['heterogeneous'] );
+
+        if ( $eligible <= 0 || $wrongText > 0 || $heterogeneous ) {
+            add_settings_error(
+                Identifiers::OPTION_BIBLE_INLINE_ENABLED,
+                'sermonator_bible_inline_audit_unreconciled',
+                __( 'Inline Bible verse text cannot be enabled yet: a fresh coverage audit must show at least one inline-eligible reference, zero references on an unmodeled versification pair, and a single source-versification tradition. Run "wp sermonator bible audit --inline" and resolve the warnings (or use the logged CLI override) before enabling. Inline rendering stays off until then.', 'sermonator' ),
+                'error'
+            );
+            return false;
+        }
+
+        // Reconciliation stamp: record the audit generation this enable reconciled against,
+        // then bump the cache generation so warmed chapters built under the prior mode drop.
+        update_option(
+            Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN,
+            (int) ( $audit['generated_at'] ?? 0 )
+        );
+        $this->bumpCacheGen();
+
         return true;
     }
 
     /**
-     * Attestation sanitize — a plain boolean coercion. The admin affirms (or withdraws)
-     * that every reference uses one English-tradition link version; this is the L6 gate for
-     * `site-default` provenance refs. No vendor precondition: the attestation can be set
-     * independently of (and before) enabling, and only takes effect once inline is enabled.
+     * Attestation sanitize — the admin affirms (or withdraws) that every reference uses one
+     * English-tradition link version; this is the L6 gate for `site-default` provenance refs.
+     * Withdrawing (false) is always honored. SETTING TRUE is HARD-DISABLED (design §4) when
+     * the live inline audit reports `heterogeneous == true` (>1 source-versification family
+     * bucket): the single-tradition premise is then provably false, so attesting would surface
+     * real-but-wrong verses for the minority tradition. The only override is the logged CLI
+     * escape hatch (`wp sermonator bible attest --force`, T-I), which bypasses this sanitize
+     * entirely — never a silent UI bypass. The audit is consulted ONLY when setting true.
      *
      * @param mixed $value Raw submitted value.
      */
     public function sanitizeAttestation( $value ): bool {
-        return self::toBool( $value );
+        if ( ! self::toBool( $value ) ) {
+            return false;
+        }
+
+        if ( ! empty( ( $this->inlineAudit )()['heterogeneous'] ) ) {
+            add_settings_error(
+                Identifiers::OPTION_BIBLE_INLINE_ATTESTATION,
+                'sermonator_bible_inline_attest_heterogeneous',
+                __( 'Attestation refused: the sermon corpus mixes more than one source-versification tradition, so the single-tradition affirmation is not true. Attesting would let inline rendering surface real-but-wrong verses for the minority tradition. Resolve the heterogeneity (or use the logged CLI override) first.', 'sermonator' ),
+                'error'
+            );
+            return false;
+        }
+
+        return true;
     }
 
     /**
-     * Confidence-floor sanitize — a strict enum whitelist (L2). Keeps `exact` or the
-     * widened `derived-exact`; anything else (including a non-string or the deliberately
-     * un-offerable `probable`) floors conservatively to {@see self::DEFAULT_CONFIDENCE_FLOOR}.
+     * Confidence-floor sanitize — a strict enum whitelist (L2) with the THIRD gate on the
+     * widest floor (design §3.3/§3.6). `exact` and STRICT `derived-exact` are always
+     * selectable. The per-ref `derived-exact-perseg` floor is selectable ONLY when the
+     * axis-2 spot-check ack ({@see Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK}) is set;
+     * submitting it WITHOUT the ack floors back to STRICT `derived-exact` (not all the way to
+     * `exact`) and registers a settings error pointing at the spot-check CLI. Anything else
+     * (a non-string or the deliberately un-offerable `probable`) floors conservatively to
+     * {@see self::DEFAULT_CONFIDENCE_FLOOR}.
      *
      * @param mixed $value Raw submitted value.
      */
     public function sanitizeConfidenceFloor( $value ): string {
         $value = is_string( $value ) ? $value : '';
 
+        // The widest floor is gated behind the axis-2 human spot-check ack.
+        if ( DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG === $value ) {
+            if ( self::persegAcknowledged() ) {
+                return DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG;
+            }
+
+            add_settings_error(
+                Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR,
+                'sermonator_bible_inline_perseg_unacked',
+                __( 'Per-reference inline scripture (derived-exact-perseg) requires the human spot-check first. Run "wp sermonator bible audit --inline --sample=N", verify the promoted references against their raw text, then re-select it. The floor was set to the stricter single-segment "derived-exact" for now.', 'sermonator' ),
+                'error'
+            );
+
+            return DerivedExactClassifier::FLOOR_DERIVED_EXACT;
+        }
+
         return in_array( $value, self::ALLOWED_CONFIDENCE_FLOORS, true )
             ? $value
             : self::DEFAULT_CONFIDENCE_FLOOR;
+    }
+
+    /**
+     * Whether the axis-2 per-ref spot-check has been acknowledged (the perseg floor's third
+     * gate). Read-only coercion of {@see Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK}, which
+     * is set only by the logged CLI spot-check (T-I), never a Settings-API field.
+     */
+    private static function persegAcknowledged(): bool {
+        return self::toBool( get_option( Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK, false ) );
     }
 
     /**

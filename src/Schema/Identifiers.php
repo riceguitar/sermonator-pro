@@ -105,6 +105,27 @@ final class Identifiers {
     public const OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR = 'sermonator_bible_inline_confidence_floor';
 
     /**
+     * Axis-2 human spot-check acknowledgement (bool) — the THIRD gate the per-ref
+     * `derived-exact-perseg` floor is un-selectable until set (design §3.3/§3.6, step 4).
+     * Set ONLY by the logged CLI spot-check (`wp sermonator bible audit --inline --sample=N`,
+     * T-I), never a Settings-API field: an admin lowering the floor to `derived-exact-perseg`
+     * without this ack is floored back to STRICT `derived-exact` by the sanitize callback.
+     * The 49→76% perseg delta is exactly the Psalm-bearing lectionary bundles whose safety
+     * rides the single attestation boolean and which the axis-1 audit is structurally blind to.
+     */
+    public const OPTION_BIBLE_INLINE_PERSEG_ACK = 'sermonator_bible_inline_perseg_ack';
+
+    /**
+     * Reconciliation generation stamped at the moment inline rendering was enabled — the
+     * {@see \Sermonator\Bible\CoverageAudit} report `generated_at` of the fresh audit the
+     * enable soft-gate reconciled against (design §3.6, decision 6). Lets Site Health
+     * (T-K) warn when the LIVE audit generation has moved past the one enable reconciled
+     * against (corpus drift between audit and enable). Stamped by `sanitizeInlineEnabled`
+     * on a successful enable, alongside the {@see self::OPTION_BIBLE_CACHE_GEN} bump.
+     */
+    public const OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN = 'sermonator_bible_inline_enabled_audit_gen';
+
+    /**
      * Stamped into every vendored/normalized per-chapter JSON file and folded into
      * the chapter-cache transient key. Bump to invalidate every cached chapter when
      * the normalized node shape changes (design §3.4 / §3.6). Distinct from the

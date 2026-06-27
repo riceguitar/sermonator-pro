@@ -6,6 +6,7 @@ namespace Sermonator\Tests\Integration\Admin;
 
 use WP_UnitTestCase;
 use Sermonator\Admin\SettingsRegistrar;
+use Sermonator\Bible\DerivedExactClassifier;
 use Sermonator\Migration\BibleChapterVendor;
 use Sermonator\Schema\BibleTranslations;
 use Sermonator\Schema\Identifiers;
@@ -24,6 +25,9 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         delete_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED );
         delete_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION );
         delete_option( Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR );
+        delete_option( Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK );
+        delete_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN );
+        delete_option( Identifiers::OPTION_BIBLE_STATS );
         delete_option( Identifiers::OPTION_BIBLE_CACHE_GEN );
         delete_option( 'sermonmanager_verse_bible_version' );
         delete_option( Identifiers::OPTION_PREFIX . 'verse_bible_version' );
@@ -42,6 +46,9 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         delete_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED );
         delete_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION );
         delete_option( Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR );
+        delete_option( Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK );
+        delete_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN );
+        delete_option( Identifiers::OPTION_BIBLE_STATS );
         delete_option( Identifiers::OPTION_BIBLE_CACHE_GEN );
         delete_option( 'sermonmanager_verse_bible_version' );
         delete_option( Identifiers::OPTION_PREFIX . 'verse_bible_version' );
@@ -188,8 +195,11 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         );
     }
 
-    public function test_enable_is_allowed_once_snapshot_is_complete(): void {
+    public function test_enable_is_allowed_once_snapshot_is_complete_and_audit_reconciles(): void {
+        // T-G soft-gate: the snapshot must be complete (hard gate) AND a fresh inline audit
+        // must reconcile (eligible > 0, no unmodeled wrong-text, single tradition).
         $this->vendorCompleteSnapshot();
+        $this->seedEligibleSermon();
 
         $this->assertTrue(
             BibleChapterVendor::isSnapshotComplete( BibleTranslations::DEFAULT_INLINE ),
@@ -200,7 +210,34 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
 
         $this->assertTrue(
             (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false ),
-            'Enabling must be honored once the snapshot is complete.'
+            'Enabling must be honored once the snapshot is complete and the audit reconciles.'
+        );
+
+        // The reconciliation generation is stamped against the audit it reconciled with.
+        $this->assertGreaterThan(
+            0,
+            (int) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 ),
+            'A successful enable must stamp the reconciliation generation.'
+        );
+    }
+
+    public function test_enable_is_refused_when_corpus_has_no_inline_eligible_ref(): void {
+        // Snapshot complete but the corpus is EMPTY → inline_eligible == 0 → the soft-gate
+        // refuses enable ("enabled but dark = looks like a bug"), with its own error code.
+        $this->vendorCompleteSnapshot();
+
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, true );
+
+        $this->assertFalse(
+            (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false ),
+            'Enabling must be refused when no reference is inline-eligible.'
+        );
+        $codes = wp_list_pluck( get_settings_errors( Identifiers::OPTION_BIBLE_INLINE_ENABLED ), 'code' );
+        $this->assertContains( 'sermonator_bible_inline_audit_unreconciled', $codes );
+        $this->assertSame(
+            0,
+            (int) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 ),
+            'A refused enable must not stamp the reconciliation generation.'
         );
     }
 
@@ -215,15 +252,20 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
 
     public function test_enable_change_bumps_cache_generation(): void {
         $this->vendorCompleteSnapshot();
+        $this->seedEligibleSermon();
         update_option( Identifiers::OPTION_BIBLE_CACHE_GEN, 0 );
 
-        // First (create) save flips false→true through add_option_{$option}.
+        // First (create) save flips false→true. A SUCCESSFUL enable bumps TWICE: once in the
+        // sanitize success path (the explicit reconciliation cache invalidation, which must
+        // not silently depend on the separate add/update_option hook wiring) and once via the
+        // add_option_{$option} listener → generation 2.
         update_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, true );
-        $this->assertSame( 1, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
-
-        // A subsequent change flips true→false through update_option_{$option}.
-        update_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false );
         $this->assertSame( 2, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
+
+        // A subsequent change flips true→false through update_option_{$option}. Disabling does
+        // NOT run the soft-gate (so no sanitize bump) — only the listener fires → generation 3.
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED, false );
+        $this->assertSame( 3, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
     }
 
     // --- Phase 3b: attestation + confidence-floor sanitize -------------------
@@ -248,7 +290,136 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         );
     }
 
+    // --- Task G: perseg floor gated behind the axis-2 spot-check ack ----------
+
+    public function test_perseg_floor_floored_to_strict_without_ack(): void {
+        // The ack option is unset (deleted in setUp) → the widest floor is refused down to
+        // the STRICT single-segment `derived-exact`, with a perseg-unacked settings error.
+        update_option(
+            Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG
+        );
+
+        $this->assertSame(
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+            get_option( Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR )
+        );
+        $codes = wp_list_pluck(
+            get_settings_errors( Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR ),
+            'code'
+        );
+        $this->assertContains( 'sermonator_bible_inline_perseg_unacked', $codes );
+    }
+
+    public function test_perseg_floor_persists_once_ack_is_set(): void {
+        // The logged CLI spot-check sets the ack → the per-ref floor is now selectable.
+        update_option( Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK, true );
+
+        update_option(
+            Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG
+        );
+
+        $this->assertSame(
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG,
+            get_option( Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR )
+        );
+    }
+
+    // --- Task G: attestation hard-disabled on a heterogeneous corpus ----------
+
+    public function test_attestation_refused_on_a_heterogeneous_corpus(): void {
+        // Two render-ready refs in DIFFERENT source-versification family buckets → the live
+        // audit reports heterogeneous → attesting the single-tradition premise is refused.
+        $this->seedEligibleSermon();                 // ESV (English family) bucket.
+        $this->seedSermon( 'Psalm 23:1', array(
+            'bookUSFM'                   => 'PSA',
+            'chapterStart'               => 23,
+            'verseStart'                 => 1,
+            'verseEnd'                   => null,
+            'chapterEnd'                 => null,
+            'raw'                        => 'Psalm 23:1',
+            'confidence'                 => 'exact',
+            // No srcVersification → buckets under `unknown`, a SECOND family bucket.
+            'srcVersificationConfidence' => 'authored',
+        ) );
+
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, true );
+
+        $this->assertFalse(
+            (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false ),
+            'Attesting must be refused while the corpus mixes traditions.'
+        );
+        $codes = wp_list_pluck(
+            get_settings_errors( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION ),
+            'code'
+        );
+        $this->assertContains( 'sermonator_bible_inline_attest_heterogeneous', $codes );
+    }
+
+    public function test_attestation_allowed_on_a_homogeneous_corpus(): void {
+        // A single-tradition corpus → attesting is honored.
+        $this->seedEligibleSermon();
+
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, true );
+
+        $this->assertTrue( (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false ) );
+    }
+
+    public function test_attestation_can_always_be_withdrawn_on_a_heterogeneous_corpus(): void {
+        // Withdrawing is never gated — even on a heterogeneous corpus it returns to false.
+        $this->seedSermon( 'Psalm 23:1', array(
+            'bookUSFM' => 'PSA', 'chapterStart' => 23, 'verseStart' => 1,
+            'verseEnd' => null, 'chapterEnd' => null, 'raw' => 'Psalm 23:1',
+            'confidence' => 'exact', 'srcVersificationConfidence' => 'authored',
+        ) );
+        $this->seedEligibleSermon();
+
+        update_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, false );
+
+        $this->assertFalse( (bool) get_option( Identifiers::OPTION_BIBLE_INLINE_ATTESTATION, true ) );
+    }
+
     // --- Helpers -------------------------------------------------------------
+
+    /**
+     * Seed ONE published sermon whose stored envelope carries a single inline-eligible ref:
+     * an `authored` (attestation-skipping) ESV→ENGWEBP Genesis 1:1 — verse 1 is present in
+     * the stub-vendored snapshot, so it clears L1–L9. Makes the live audit report
+     * inline_eligible >= 1 over a single (English) source-versification family.
+     */
+    private function seedEligibleSermon(): void {
+        $this->seedSermon( 'Genesis 1:1', array(
+            'bookUSFM'                   => 'GEN',
+            'chapterStart'               => 1,
+            'verseStart'                 => 1,
+            'verseEnd'                   => null,
+            'chapterEnd'                 => null,
+            'raw'                        => 'Genesis 1:1',
+            'confidence'                 => 'exact',
+            'srcVersification'           => 'ESV',
+            'srcVersificationConfidence' => 'authored',
+        ) );
+    }
+
+    /**
+     * Seed ONE published sermon with the given passage label and a single stored envelope ref.
+     *
+     * @param array<string,mixed> $ref
+     */
+    private function seedSermon( string $passage, array $ref ): void {
+        $id = (int) self::factory()->post->create( array(
+            'post_type'   => Identifiers::POST_TYPE_SERMON,
+            'post_status' => 'publish',
+            'post_title'  => 'Inline Settings Sermon',
+        ) );
+        update_post_meta( $id, Identifiers::META_BIBLE_PASSAGE, $passage );
+        update_post_meta(
+            $id,
+            Identifiers::META_BIBLE_REFS,
+            (string) wp_json_encode( array( 'v' => 1, 'refs' => array( $ref ) ) )
+        );
+    }
 
     /**
      * Vendor a COMPLETE ENGWEBP snapshot (all 1189 chapters) to the uploads dir using a
