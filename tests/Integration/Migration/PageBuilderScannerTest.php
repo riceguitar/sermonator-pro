@@ -176,6 +176,11 @@ final class PageBuilderScannerTest extends WP_UnitTestCase {
      * admin_notices wiring from Plugin::boot() — or breaking the screen scope — fails loudly.
      */
     public function test_plugin_boot_wizard_admin_notice_emits_report_on_wizard_screen(): void {
+        // The wizard report renders for an admin (manage_options) on the wizard screen, so the
+        // page cell links the title to its edit URL (which carries the post id). Without a capable
+        // current user get_edit_post_link() returns '' and the cell degrades to a plain title.
+        wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
+
         $id = $this->makePost(
             '',
             array( '_elementor_data' => '[{"settings":{"shortcode":"[sermons]"}}]' ),
