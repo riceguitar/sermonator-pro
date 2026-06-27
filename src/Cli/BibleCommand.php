@@ -341,7 +341,7 @@ final class BibleCommand {
 
     /**
      * READ-ONLY corpus-gate report. Delegates to {@see CoverageAudit}, which owns the
-     * never-fail-WRONG L1–L9 classification and writes NOTHING on this path (the
+     * never-fail-WRONG L1–L9 classification and writes NOTHING on the default path (the
      * standalone instrument the operator runs BEFORE deciding to enable inline at scale —
      * the §3.9 / Task 16 go/no-go).
      *
@@ -367,11 +367,22 @@ final class BibleCommand {
      *   have been verified, the operator records the acknowledgement with the separate,
      *   deliberate `wp sermonator bible ack-perseg --confirm` step (which is the one write).
      *
+     * [--reconcile]
+     * : With `--inline`, ALSO re-stamp the Site-Health corpus-drift reconciliation signature
+     *   ({@see ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN}) if inline is enabled and the
+     *   current corpus is safe. This is the ONLY WRITE on the audit path and it is an
+     *   EXPLICIT OPT-IN: it clears the "corpus has changed since inline scripture was
+     *   enabled" advisory when the operator has verified the corpus is safe again.
+     *   Without this flag the entire audit path is genuinely read-only. A safety check
+     *   is run before writing: if the corpus is heterogeneous, has unmodeled-pair wrong-text,
+     *   or has zero inline-eligible refs, the write is refused and a warning is printed.
+     *
      * ## EXAMPLES
      *
      *     wp sermonator bible audit
      *     wp sermonator bible audit --inline
      *     wp sermonator bible audit --inline --sample=20
+     *     wp sermonator bible audit --inline --reconcile
      *
      * @param array<int,string>    $args
      * @param array<string,string> $assoc_args
@@ -384,19 +395,21 @@ final class BibleCommand {
 
         $audit = $this->coverageAudit ?? new CoverageAudit();
 
-        // `--inline` is now the three-floor would-promote PREVIEW (delegating to the shared
-        // CoverageAudit preview, T-E). `--sample=N` adds up to N promoted refs + raw; both
-        // are READ-ONLY (the preview classifies and counts but persists nothing).
+        // `--inline` is the three-floor would-promote PREVIEW (delegating to the shared
+        // CoverageAudit preview, T-E). `--sample=N` adds up to N promoted refs + raw.
+        // Both are READ-ONLY (the preview classifies and counts but persists nothing).
         $withSample = array_key_exists( 'sample', $assoc_args );
         $sampleSize = $withSample ? max( 0, (int) $assoc_args['sample'] ) : 0;
 
         $this->reportPromotionPreview( $audit->promotionPreview( true, $sampleSize ), $withSample );
 
-        // T-K remediation (adversarial-review fix): this is the command the Site-Health drift
-        // advisory tells the operator to re-run. When inline is enabled and the corpus has
-        // drifted back to a SAFE state, re-stamp the reconciliation signature so the advisory
-        // actually clears (the prior text was un-clearable by its own instructions).
-        $this->reconcileDriftStamp();
+        // --reconcile is the ONLY write on the audit path (T-K remediation): re-stamps the
+        // enable-time corpus-content signature so the Site-Health drift advisory clears, but
+        // ONLY when the operator explicitly opts in via --reconcile AND the corpus is safe.
+        // Without this flag the entire audit path is genuinely read-only; no writes occur.
+        if ( ! empty( $assoc_args['reconcile'] ) ) {
+            $this->reconcileDriftStamp();
+        }
     }
 
     /**

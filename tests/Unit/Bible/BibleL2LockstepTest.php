@@ -130,6 +130,13 @@ final class BibleL2LockstepTest extends TestCase {
      * the number of `true` in $expected and its `low-confidence` withheld count equals the
      * complement — so the aggregate report is a faithful per-ref oracle.
      *
+     * Per-ref identity: in addition to the aggregate counts, each ref at position i is
+     * isolated in its own single-ref corpus (with the correct compound refCount preserved
+     * via non-array junk fillers — byte-lockstep with how the resolver derives refCount),
+     * and the audit's per-ref decision is compared with the resolver's per-ref decision.
+     * This ensures the audit promotes/withholds the SAME refs as the resolver, not just
+     * the same total — a wrong-ref-but-same-count audit cannot pass.
+     *
      * @param list<array<string,mixed>> $refs
      * @param list<bool>                $expected
      */
@@ -165,6 +172,41 @@ final class BibleL2LockstepTest extends TestCase {
             count( array_filter( $resolverEligible ) ),
             "resolver/audit eligible-count divergence under $floor"
         );
+
+        // Per-ref identity: verify the audit classifies each individual ref the same way
+        // as the resolver — not just the same total. Each ref is tested in an isolated
+        // single-ref corpus whose envelope's UNFILTERED refCount equals the compound
+        // refCount (matching the STRICT singleton constraint's denominator), achieved by
+        // padding with non-array junk entries — byte-lockstep with the resolver's
+        // readEnvelopeRefs() + count() pattern.
+        $totalRefCount = count( $refs );
+        foreach ( $refs as $i => $ref ) {
+            // Envelope: the real ref first, then (totalRefCount - 1) non-array junk entries.
+            // The audit sees refCount = totalRefCount, postRefs = [ref] (only array entries).
+            $perRefEntries = array_merge( array( $ref ), array_fill( 0, $totalRefCount - 1, 5 ) );
+            $perRefPostId  = 1000 + $i;
+            $this->meta[ $perRefPostId ] = array(
+                ID::META_BIBLE_PASSAGE => 'passage',
+                ID::META_BIBLE_REFS    => (string) json_encode( array( 'v' => 1, 'refs' => $perRefEntries ) ),
+            );
+
+            $pid          = $perRefPostId;
+            $perRefReport = ( new CoverageAudit(
+                function () use ( $pid ): array { return array( $pid ); },
+                $this->chapter()
+            ) )->inlineReport();
+
+            $this->assertSame(
+                $expected[ $i ] ? 1 : 0,
+                $perRefReport['inline_eligible'],
+                sprintf(
+                    'audit per-ref[%d] eligibility mismatch under %s (resolver classified it as %s)',
+                    $i,
+                    $floor,
+                    $expected[ $i ] ? 'eligible' : 'withheld'
+                )
+            );
+        }
     }
 
     // ----------------------------------------------------------------------------------

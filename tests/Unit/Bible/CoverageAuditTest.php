@@ -533,11 +533,74 @@ final class CoverageAuditTest extends TestCase {
                 'heterogeneous'             => true,
             ),
         );
+        $this->options[ ID::OPTION_BIBLE_INLINE_ATTESTATION ] = true;
 
         $result = $this->auditOver( array() )->siteHealthResult();
 
         $this->assertStringContainsString( 'inline-eligible', $result['description'] );
         $this->assertStringContainsString( 'mixes more than one source-versification tradition', $result['description'] );
+    }
+
+    public function test_site_health_inline_description_labels_ceiling_when_attestation_off(): void {
+        // The stored inline sub-report is always computed with attestation ASSUMED TRUE
+        // (the best-case ceiling). When attestation is currently OFF, L6 withholds all
+        // site-default refs — so displaying the ceiling% as "are inline-eligible" is wrong.
+        // The paragraph must be labeled as a potential ceiling ("Up to X%... once you attest;
+        // 0 render inline until then").
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => array(
+                'refs_total'                => 4,
+                'inline_eligible'           => 3,
+                'inline_eligible_pct'       => 75.0,
+                'withheld'                  => array(),
+                'unmodeled_pair_wrong_text' => 0,
+                'families'                  => array( 'eng-protestant' => 4 ),
+                'dominant_family'           => 'eng-protestant',
+                'heterogeneous'             => false,
+            ),
+        );
+        // Attestation OFF: the figure is a ceiling, not a live fact.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ATTESTATION ] = false;
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        // Must NOT say "are inline-eligible" (that implies the live state).
+        $this->assertStringNotContainsString( 'are inline-eligible', $result['description'] );
+        // Must surface the ceiling framing and the "0 render inline until then" context.
+        $this->assertStringContainsString( 'Up to', $result['description'] );
+        $this->assertStringContainsString( '0 render inline until then', $result['description'] );
+    }
+
+    public function test_site_health_inline_description_uses_live_language_when_attested(): void {
+        // When attestation IS on, the stored ceiling IS the live fact: display it normally.
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => array(
+                'refs_total'                => 4,
+                'inline_eligible'           => 3,
+                'inline_eligible_pct'       => 75.0,
+                'withheld'                  => array(),
+                'unmodeled_pair_wrong_text' => 0,
+                'families'                  => array( 'eng-protestant' => 4 ),
+                'dominant_family'           => 'eng-protestant',
+                'heterogeneous'             => false,
+            ),
+        );
+        $this->options[ ID::OPTION_BIBLE_INLINE_ATTESTATION ] = true;
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringContainsString( 'are inline-eligible', $result['description'] );
+        // Must NOT use the ceiling/pre-attestation framing.
+        $this->assertStringNotContainsString( 'Up to', $result['description'] );
+        $this->assertStringNotContainsString( '0 render inline until then', $result['description'] );
     }
 
     public function test_site_health_omits_inline_paragraph_for_pre_3b_rollup(): void {
@@ -723,14 +786,13 @@ final class CoverageAuditTest extends TestCase {
             CoverageAudit::inlineSignature( array_merge( $base, array( 'generated_at' => 424242 ) ) )
         );
 
-        // Each safety-relevant corpus field MOVES the signature.
+        // Each corpus-content field MOVES the signature.
         foreach (
             array(
                 array( 'refs_total' => 5 ),
                 array( 'families' => array( 'eng-protestant' => 3, 'eng-catholic' => 1 ) ),
                 array( 'dominant_family' => 'eng-catholic' ),
                 array( 'heterogeneous' => true ),
-                array( 'unmodeled_pair_wrong_text' => 1 ),
             ) as $change
         ) {
             $this->assertNotSame(
@@ -744,6 +806,30 @@ final class CoverageAuditTest extends TestCase {
         $this->assertSame(
             CoverageAudit::inlineSignature( $this->inlineSub( array( 'families' => array( 'a' => 1, 'b' => 2 ) ) ) ),
             CoverageAudit::inlineSignature( $this->inlineSub( array( 'families' => array( 'b' => 2, 'a' => 1 ) ) ) )
+        );
+    }
+
+    public function test_inline_signature_is_stable_across_floor_changes_over_unchanged_corpus(): void {
+        // unmodeled_pair_wrong_text is a FLOOR-DEPENDENT computed count: widening the floor
+        // (exact → derived-exact → derived-exact-perseg) promotes more refs into L5, which
+        // can change the unmodeled-pair count without any corpus change. The signature must
+        // NOT include it — a floor change over an unchanged corpus must produce the SAME
+        // signature, so a floor change cannot fire a misattributed "later import" drift warning.
+        $base = $this->inlineSub( array( 'unmodeled_pair_wrong_text' => 0 ) );
+        $widerFloor = $this->inlineSub( array( 'unmodeled_pair_wrong_text' => 3 ) );
+
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $base ),
+            CoverageAudit::inlineSignature( $widerFloor ),
+            'A change in unmodeled_pair_wrong_text alone (simulating a floor widening) must NOT move the corpus signature.'
+        );
+
+        // But a genuine corpus change (refs_total moves) DOES advance the signature.
+        $changedCorpus = $this->inlineSub( array( 'unmodeled_pair_wrong_text' => 0, 'refs_total' => 7 ) );
+        $this->assertNotSame(
+            CoverageAudit::inlineSignature( $base ),
+            CoverageAudit::inlineSignature( $changedCorpus ),
+            'A change in refs_total (genuine corpus change) must move the corpus signature.'
         );
     }
 

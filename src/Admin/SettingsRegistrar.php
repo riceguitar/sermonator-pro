@@ -35,8 +35,10 @@ use Sermonator\Schema\Identifiers;
  *   - {@see Identifiers::OPTION_BIBLE_INLINE_ATTESTATION} (bool) — the admin affirms all
  *     references use one English-tradition link version (the L6 gate for `site-default`
  *     provenance refs).
- *   - {@see Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR} (enum `exact|derived-exact`,
+ *   - {@see Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR} (enum `exact|derived-exact|derived-exact-perseg`,
  *     default `exact`) — the L2 confidence floor an inline-eligible ref must clear.
+ *     `derived-exact-perseg` is ack-gated ({@see Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK})
+ *     and floors to strict `derived-exact` when the ack is absent (NOT to `exact`).
  *
  * Creating OR updating a cache-affecting option (the link version, the inline translation,
  * or the inline enable toggle) bumps {@see Identifiers::OPTION_BIBLE_CACHE_GEN}
@@ -203,8 +205,12 @@ final class SettingsRegistrar {
             )
         );
 
-        // Confidence floor an inline-eligible ref must clear (L2). Default `exact`;
-        // admin may opt into `derived-exact`. Anything else floors to `exact`.
+        // Confidence floor an inline-eligible ref must clear (L2). Three-value enum:
+        // `exact` (default, conservative), `derived-exact` (STRICT single-segment, always
+        // selectable), or `derived-exact-perseg` (per-ref widest, ack-gated behind
+        // {@see Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK}). Submitting `derived-exact-perseg`
+        // without the ack floors to strict `derived-exact` (NOT to `exact`); any other
+        // unknown/non-string value floors conservatively to {@see self::DEFAULT_CONFIDENCE_FLOOR}.
         register_setting(
             Identifiers::OPTION_GROUP_SETTINGS,
             Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR,

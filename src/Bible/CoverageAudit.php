@@ -913,6 +913,13 @@ final class CoverageAudit {
      * counter and corpus heterogeneity), because a green parse-coverage headline must
      * never hide a mis-versification.
      *
+     * Attestation-aware labeling: the stored inline sub-report is computed with
+     * attestation ASSUMED TRUE (the best-case ceiling — {@see self::computeInlineReport()}
+     * always passes `$attested=true`). On a pre-attestation site L6 withholds every
+     * site-default ref, so displaying the ceiling figure as a live fact would be
+     * misleading. When attestation is currently OFF the paragraph is labeled as a
+     * potential ceiling ("up to X% once you attest; 0 render inline until then").
+     *
      * @param array<string,mixed> $stats
      */
     private function inlineDescription( array $stats ): string {
@@ -925,15 +932,35 @@ final class CoverageAudit {
         $eligible = (int) ( $inline['inline_eligible'] ?? 0 );
         $total    = (int) $inline['refs_total'];
 
-        $out = '<p>' . esc_html(
-            sprintf(
-                /* translators: 1: percentage, 2: eligible ref count, 3: total ref count. */
-                __( '%1$s%% of scripture references are inline-eligible (%2$d of %3$d) under the never-fail-wrong gate; the rest fall back to a link.', 'sermonator' ),
-                self::formatPercent( $pct ),
-                $eligible,
-                $total
-            )
-        ) . '</p>';
+        // L6 attestation state: the stored figure was computed with attestation ASSUMED
+        // TRUE (the best-case ceiling). If attestation is currently OFF, the live render
+        // withholds ALL site-default refs at L6 — so the ceiling must be labeled as a
+        // potential, not a live fact.
+        $attested = (bool) get_option( ID::OPTION_BIBLE_INLINE_ATTESTATION, false );
+
+        if ( $attested ) {
+            $out = '<p>' . esc_html(
+                sprintf(
+                    /* translators: 1: percentage, 2: eligible ref count, 3: total ref count. */
+                    __( '%1$s%% of scripture references are inline-eligible (%2$d of %3$d) under the never-fail-wrong gate; the rest fall back to a link.', 'sermonator' ),
+                    self::formatPercent( $pct ),
+                    $eligible,
+                    $total
+                )
+            ) . '</p>';
+        } else {
+            // Pre-attestation: the ceiling assumes the single-tradition premise is met.
+            // Until attestation is set, L6 withholds all site-default refs and 0 render inline.
+            $out = '<p>' . esc_html(
+                sprintf(
+                    /* translators: 1: percentage, 2: eligible ref count, 3: total ref count. */
+                    __( 'Up to %1$s%% of scripture references could be inline-eligible (%2$d of %3$d) once the single-tradition premise is attested; 0 render inline until then (L6 withholds all site-default references until attestation is set).', 'sermonator' ),
+                    self::formatPercent( $pct ),
+                    $eligible,
+                    $total
+                )
+            ) . '</p>';
+        }
 
         $wrongText = (int) ( $inline['unmodeled_pair_wrong_text'] ?? 0 );
         if ( $wrongText > 0 ) {
@@ -959,19 +986,31 @@ final class CoverageAudit {
     /**
      * Stable CORPUS-CONTENT signature of an inline sub-report — the drift fingerprint
      * (design §3.6, decision 6 / spec T-K; adversarial-review fix). It hashes ONLY the
-     * safety-relevant corpus fields — `refs_total`, the (key-sorted) source-versification
-     * `families` map, the `dominant_family`, the `heterogeneous` flag, and the
-     * `unmodeled_pair_wrong_text` count — and DELIBERATELY EXCLUDES `generated_at`.
+     * pure corpus-content fields — `refs_total`, the (key-sorted) source-versification
+     * `families` map, the `dominant_family`, and the `heterogeneous` flag — and
+     * DELIBERATELY EXCLUDES both `generated_at` and `unmodeled_pair_wrong_text`.
      *
-     * `generated_at` is a wall-clock {@see time()} re-stamped by {@see self::run()} on EVERY
-     * recompute (the daily cron and every sermon save), independent of any corpus change.
-     * Keying drift off it produced a permanent FALSE POSITIVE: the first routine re-audit
-     * after enable advanced the timestamp past the enable stamp and the advisory fired
-     * forever, with zero corpus change. Hashing the corpus CONTENT instead means a routine
-     * recompute over an UNCHANGED corpus yields an IDENTICAL signature (silent), while a
-     * genuine change (a new family bucket, a different ref count, a newly-unmodeled pair)
-     * advances it (warns) — so the equal/silent steady state is actually REACHABLE in
-     * production. Pure: deterministic, no WP, no I/O, never throws.
+     * `generated_at` is a wall-clock {@see time()} re-stamped on EVERY recompute (the daily
+     * cron and every sermon save), independent of any corpus change. Keying drift off it
+     * produced a permanent FALSE POSITIVE: the first routine re-audit after enable advanced
+     * the timestamp past the enable stamp and the advisory fired forever, with zero corpus
+     * change.
+     *
+     * `unmodeled_pair_wrong_text` is DELIBERATELY EXCLUDED because it is a FLOOR-DEPENDENT
+     * computed count: refs must clear L2 (the configured confidence floor) before they reach
+     * the L5 versification gate where unmodeled pairs fire. Widening the floor from `exact`
+     * to `derived-exact` over an UNCHANGED corpus promotes additional refs into L5, which can
+     * change the unmodeled-pair count without any corpus change — producing a misattributed
+     * "a later import or new sermons" drift warning. The corpus-content fields above
+     * (`refs_total`, `families`, `dominant_family`, `heterogeneous`) change whenever the
+     * CORPUS genuinely changes and are sufficient to detect real drift; a floor change alone
+     * — with no corpus change — must not advance the signature.
+     *
+     * Hashing corpus CONTENT instead means a routine recompute over an UNCHANGED corpus
+     * (or a floor change over an unchanged corpus) yields an IDENTICAL signature (silent),
+     * while a genuine corpus change (a new family bucket, a different ref count) advances it
+     * (warns) — so the equal/silent steady state is actually REACHABLE in production.
+     * Pure: deterministic, no WP, no I/O, never throws.
      *
      * @param array<string,mixed> $inline An inline sub-report (or {@see self::inlineReport()} shape).
      */
@@ -984,13 +1023,15 @@ final class CoverageAudit {
         ksort( $normalized );
 
         $payload = array(
-            'refs_total'                => (int) ( $inline['refs_total'] ?? 0 ),
-            'families'                  => $normalized,
-            'dominant_family'           => isset( $inline['dominant_family'] ) && is_string( $inline['dominant_family'] )
+            'refs_total'      => (int) ( $inline['refs_total'] ?? 0 ),
+            'families'        => $normalized,
+            'dominant_family' => isset( $inline['dominant_family'] ) && is_string( $inline['dominant_family'] )
                 ? $inline['dominant_family']
                 : '',
-            'heterogeneous'             => ! empty( $inline['heterogeneous'] ),
-            'unmodeled_pair_wrong_text' => (int) ( $inline['unmodeled_pair_wrong_text'] ?? 0 ),
+            'heterogeneous'   => ! empty( $inline['heterogeneous'] ),
+            // unmodeled_pair_wrong_text is INTENTIONALLY excluded: it is floor-dependent
+            // (more refs reach L5 under a wider floor), so including it would advance the
+            // signature on a floor change with no corpus change, firing a false drift warning.
         );
 
         return hash( 'sha256', (string) json_encode( $payload ) );
