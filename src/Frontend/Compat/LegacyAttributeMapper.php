@@ -161,8 +161,16 @@ final class LegacyAttributeMapper {
         // NOT filter-form attrs — they are pagination aliases consumed by the
         // disable_pagination axis below.)
 
-        // disable_pagination (aliases hide_nav, hide_pagination) is NO-OP-SAFE: the
-        // grid renders no pager today, so there is nothing to disable -> not named.
+        // --- disable_pagination (aliases hide_nav, hide_pagination) --------------
+        // The pager landed (T5/T6), so this axis is now HONORED, not a NO-OP: a truthy
+        // value makes LegacyShortcodes::render() emit the non-paginated Renderer::grid()
+        // (first page of perPage items, NO pager) exactly as display_sermons() :1129 hid
+        // wp_pagenavi/paginate_links. Faithful when honored -> NOT named. Truthiness
+        // matches SM (its `! empty()` alias gate + `! $args['disable_pagination']` check):
+        // any non-empty, non-"0" value is ON; "0"/"" are OFF.
+        $disablePagination = $this->truthy(
+            $this->aliasValue( $atts, 'disable_pagination', array( 'hide_nav', 'hide_pagination' ) )
+        );
 
         // --- any UNKNOWN raw attribute -> named ----------------------------------
         foreach ( $atts as $key => $value ) {
@@ -192,6 +200,7 @@ final class LegacyAttributeMapper {
             $orderbyToken,
             $this->uniqueInts( $postIn ),
             $this->uniqueInts( $postNotIn ),
+            $disablePagination,
             array_values( array_unique( $unfaithful ) )
         );
     }
@@ -483,6 +492,16 @@ final class LegacyAttributeMapper {
     /** A value counts as present when it is a non-empty trimmed string. */
     private function present( mixed $value ): bool {
         return $value !== null && trim( (string) $value ) !== '';
+    }
+
+    /**
+     * SM-faithful boolean reading for the disable_pagination axis: any non-empty,
+     * non-"0" trimmed string is ON (matches SM's `! empty()` alias gate plus the
+     * `! $args['disable_pagination']` render check, `display_sermons()` :1129).
+     */
+    private function truthy( string $value ): bool {
+        $trimmed = trim( $value );
+        return $trimmed !== '' && $trimmed !== '0';
     }
 
     /**

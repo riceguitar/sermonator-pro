@@ -191,4 +191,59 @@ final class LegacySermonsLedgerTest extends WP_UnitTestCase {
         $this->assertContains( 'sermon_page', $vars,
             'sermon_page must be registered via the query_vars filter for the embedded pager to work' );
     }
+
+    // ------------------------------------------- disable_pagination honored (review fix)
+
+    /**
+     * disable_pagination (now that the per_page pager has landed) SUPPRESSES the pager,
+     * exactly as legacy `display_sermons()` :1129 hid wp_pagenavi/paginate_links. Without it
+     * a 3-sermon, per_page=2 list paginates (2 pages → a pager nav); WITH it the pager must be
+     * gone — otherwise a migrated `[sermons disable_pagination="true"]` would silently render
+     * a pager the editor explicitly asked to suppress (the fail-visible gap the review caught).
+     */
+    public function test_disable_pagination_suppresses_the_pager(): void {
+        $this->makeSermon( 'AlphaS', '1000000003' );
+        $this->makeSermon( 'BetaS', '1000000002' );
+        $this->makeSermon( 'GammaS', '1000000001' );
+
+        // Control: the same multi-page list WITHOUT the flag renders the pager nav.
+        $paged = do_shortcode( '[sermons per_page="2"]' );
+        $this->assertStringContainsString( 'sermonator-pager', $paged,
+            'a 3-sermon per_page=2 list must paginate without disable_pagination' );
+
+        // With the flag: no pager nav, but the first page of content still renders.
+        $disabled = do_shortcode( '[sermons per_page="2" disable_pagination="true"]' );
+        $this->assertStringNotContainsString( 'sermonator-pager', $disabled,
+            'disable_pagination must suppress the pager (faithful to SM hiding its pager)' );
+        $this->assertStringContainsString( 'sermonator-grid', $disabled,
+            'the first page of content still renders' );
+    }
+
+    /** Each disable_pagination alias (hide_nav / hide_pagination) suppresses the pager too. */
+    public function test_disable_pagination_aliases_suppress_the_pager(): void {
+        $this->makeSermon( 'AlphaS', '1000000003' );
+        $this->makeSermon( 'BetaS', '1000000002' );
+        $this->makeSermon( 'GammaS', '1000000001' );
+
+        foreach ( array( 'hide_nav', 'hide_pagination' ) as $alias ) {
+            $html = do_shortcode( '[sermons per_page="2" ' . $alias . '="1"]' );
+            $this->assertStringNotContainsString( 'sermonator-pager', $html,
+                "$alias must suppress the pager (legacy alias of disable_pagination)" );
+        }
+    }
+
+    /**
+     * disable_pagination is HONORED, hence FAITHFUL — it earns NO review notice for an editor
+     * (naming a faithfully-reproduced attribute would be a false alarm).
+     */
+    public function test_disable_pagination_earns_no_review_notice(): void {
+        $editor = (int) self::factory()->user->create( array( 'role' => 'editor' ) );
+        wp_set_current_user( $editor );
+        $this->makeSermon( 'AlphaS', '1000000001' );
+
+        $html = do_shortcode( '[sermons disable_pagination="true"]' );
+
+        $this->assertStringNotContainsString( 'sermonator-compat-notice', $html,
+            'disable_pagination is honored → faithful → no notice' );
+    }
 }

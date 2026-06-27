@@ -28,6 +28,7 @@ final class LegacyShortcodesTest extends TestCase {
         Functions\when( '__' )->returnArg();
         Functions\when( 'esc_html' )->returnArg();
         Functions\when( 'esc_attr' )->returnArg();
+        Functions\when( 'esc_attr__' )->returnArg();
         Functions\when( 'esc_url' )->returnArg();
         Functions\when( 'wp_kses_post' )->returnArg();
         Functions\when( 'is_wp_error' )->justReturn( false );
@@ -314,6 +315,57 @@ final class LegacyShortcodesTest extends TestCase {
         $this->assertStringContainsString( 'sermonator-grid', $html, 'the visitor still sees rendered content' );
         $this->assertSame( array( array( 50, 10 ) ), $fired,
             'sermonator_list_truncated must fire once with (total, perPage), regardless of login' );
+    }
+
+    /**
+     * disable_pagination (and its aliases) SUPPRESSES the pager: even with a multi-page list
+     * (total > perPage), render() emits the non-paginated grid with NO pager nav — faithfully
+     * reproducing SM hiding wp_pagenavi/paginate_links — and shows no review notice (the axis
+     * is honored, hence faithful). Without it, the same list renders the pager. This pins the
+     * fail-visible gap the pager landing would otherwise open.
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_disable_pagination_suppresses_pager(): void {
+        $this->stubRenderEnv( isEditor: true );
+        // 50 found across 5 pages → the pager WOULD render without the flag.
+        $GLOBALS['__sermonator_ls_found'] = 50;
+        $GLOBALS['__sermonator_ls_pages'] = 5;
+        Functions\when( 'do_action' )->justReturn( null );
+        Functions\when( 'add_query_arg' )->justReturn( 'http://example.test/?sermon_page=2' );
+
+        $disabled = ( new LegacyShortcodes() )->render( array( 'disable_pagination' => 'true' ) );
+        $this->assertStringContainsString( 'sermonator-grid', $disabled, 'content still renders' );
+        $this->assertStringNotContainsString( 'sermonator-pager', $disabled,
+            'disable_pagination must suppress the pager exactly as SM hid its pager' );
+        $this->assertStringNotContainsString( 'sermonator-compat-notice', $disabled,
+            'disable_pagination is honored → faithful → no review notice' );
+
+        // Control: the SAME multi-page list WITHOUT the flag DOES render the pager.
+        $paged = ( new LegacyShortcodes() )->render( array() );
+        $this->assertStringContainsString( 'sermonator-pager', $paged,
+            'without disable_pagination the multi-page list still paginates' );
+    }
+
+    /**
+     * Each disable_pagination alias suppresses the pager too.
+     *
+     * @runInSeparateProcess
+     * @preserveGlobalState disabled
+     */
+    public function test_disable_pagination_aliases_suppress_pager(): void {
+        $this->stubRenderEnv( isEditor: true );
+        $GLOBALS['__sermonator_ls_found'] = 50;
+        $GLOBALS['__sermonator_ls_pages'] = 5;
+        Functions\when( 'do_action' )->justReturn( null );
+        Functions\when( 'add_query_arg' )->justReturn( 'http://example.test/?sermon_page=2' );
+
+        foreach ( array( 'hide_nav', 'hide_pagination' ) as $alias ) {
+            $html = ( new LegacyShortcodes() )->render( array( $alias => '1' ) );
+            $this->assertStringNotContainsString( 'sermonator-pager', $html, "$alias must suppress the pager" );
+            $this->assertStringContainsString( 'sermonator-grid', $html );
+        }
     }
 
     /**

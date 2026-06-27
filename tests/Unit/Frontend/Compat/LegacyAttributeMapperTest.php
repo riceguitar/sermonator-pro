@@ -355,13 +355,26 @@ final class LegacyAttributeMapperTest extends TestCase {
         $this->assertSame( 100, $result->gridArgs['perPage'] );
     }
 
-    // === NO-OP-SAFE (disable_pagination + its aliases) =======================
+    // === disable_pagination (HONORED, T6 — faithful, not named) ==============
 
-    public function test_disable_pagination_and_aliases_are_noop_safe_not_named(): void {
+    /**
+     * A truthy disable_pagination (and each alias) sets the HONORED flag and is NOT named:
+     * the pager landed, so suppressing it is a faithful reproduction of SM hiding its pager,
+     * not an unvalidatable divergence.
+     */
+    public function test_disable_pagination_and_aliases_honored_and_not_named(): void {
         foreach ( array( 'disable_pagination', 'hide_nav', 'hide_pagination' ) as $attr ) {
             $result = $this->mapper()->map( array( $attr => 'yes' ) );
-            $this->assertSame( array(), $result->unfaithfulAttrs, "$attr should be NO-OP-SAFE" );
+            $this->assertTrue( $result->disablePagination, "$attr should set the honored flag" );
+            $this->assertSame( array(), $result->unfaithfulAttrs, "$attr is faithful — not named" );
         }
+    }
+
+    /** Absent or falsy disable_pagination leaves the pager ON (SM truthiness: "0"/"" are OFF). */
+    public function test_disable_pagination_off_when_absent_or_falsy(): void {
+        $this->assertFalse( $this->mapper()->map( array() )->disablePagination );
+        $this->assertFalse( $this->mapper()->map( array( 'disable_pagination' => '0' ) )->disablePagination );
+        $this->assertFalse( $this->mapper()->map( array( 'disable_pagination' => '' ) )->disablePagination );
     }
 
     // === UNSUPPORTED §63 no-op (NOT named — sermon set byte-identical) ========

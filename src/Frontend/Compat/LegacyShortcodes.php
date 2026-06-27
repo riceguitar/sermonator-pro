@@ -108,9 +108,14 @@ final class LegacyShortcodes {
     /**
      * Attribute-faithful [sermons]/[sermons_sm] (Bundle 2, T6): map the RAW atts through
      * {@see LegacyAttributeMapper}, run the faithful axes through {@see SermonQuery}, and render
-     * the paginated list with the pure {@see Renderer}. Replaces the Bundle 1 safe-default render.
+     * the list with the pure {@see Renderer}. Replaces the Bundle 1 safe-default render.
      *
-     * The editor notice is now PRECISE — built ONLY from the mapper's `unfaithfulAttrs`; an empty
+     * Pagination is HONORED per the legacy `disable_pagination` axis: when set
+     * ({@see LegacyMappedQuery::$disablePagination}) the non-paginated {@see Renderer::grid()}
+     * is rendered (first page, no pager) exactly as legacy `display_sermons()` hid its pager;
+     * otherwise the {@see Renderer::paginatedGrid()} variant keeps the long tail reachable.
+     *
+     * The editor notice is PRECISE — built ONLY from the mapper's `unfaithfulAttrs`; an empty
      * set means every attribute was faithfully reproduced and NO notice is shown (the earned
      * end-state). When the list spans more than one page, {@see self::TRUNCATED_ACTION} fires so
      * the silent-tail-drop risk is observable even to logged-out visitors (who never see the
@@ -138,7 +143,17 @@ final class LegacyShortcodes {
 
         $this->enqueueGridStyle();
 
-        $html = ( new Renderer() )->paginatedGrid( $result, $this->listBaseUrl() );
+        // disable_pagination (aliases hide_nav/hide_pagination) is now HONORED: a truthy
+        // value suppresses the pager exactly as legacy display_sermons() :1129 hid
+        // wp_pagenavi/paginate_links, rendering the non-paginated grid (the first page of
+        // perPage items). Otherwise emit the paginated variant so a large archive's long
+        // tail stays reachable. Either way the always-on TRUNCATED_ACTION above keeps the
+        // tail-drop observable — when pagination is disabled the drop is the editor's
+        // explicit request, not a silent divergence.
+        $renderer = new Renderer();
+        $html     = $mapped->disablePagination
+            ? $renderer->grid( $result )
+            : $renderer->paginatedGrid( $result, $this->listBaseUrl() );
 
         return self::preciseNotice( $mapped->unfaithfulAttrs ) . $html;
     }

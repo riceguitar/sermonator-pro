@@ -30,6 +30,12 @@ use Sermonator\Frontend\DateScope;
  *    never passed through raw).
  *  - {@see self::$postIn}/{@see self::$postNotIn} — crosswalk-RESOLVED new post ids
  *    (legacy ids that did not resolve are dropped, never passed through as new ids).
+ *  - {@see self::$disablePagination} — true when the legacy `disable_pagination`
+ *    axis (aliases `hide_nav`/`hide_pagination`) is set. HONORED by
+ *    {@see LegacyShortcodes::render()} (the pager landed in T5): a truthy value
+ *    renders the non-paginated {@see \Sermonator\Frontend\Renderer::grid()}
+ *    (first page only, no pager) exactly as legacy `display_sermons()` :1129 hid
+ *    the pager — faithful when honored, so it is NOT named.
  *  - {@see self::$unfaithfulAttrs} — the precise per-attribute notice set.
  *
  * The `page` arg is intentionally NOT set here: the embedded current page is read
@@ -48,6 +54,7 @@ final class LegacyMappedQuery {
         public readonly string $orderby,
         public readonly array $postIn,
         public readonly array $postNotIn,
+        public readonly bool $disablePagination,
         public readonly array $unfaithfulAttrs
     ) {}
 
