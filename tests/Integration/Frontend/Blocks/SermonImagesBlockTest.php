@@ -21,10 +21,11 @@ use Sermonator\Schema\Identifiers as ID;
  * NOTE: written for the wp-env integration suite; not run in this environment (no Docker).
  */
 final class SermonImagesBlockTest extends WP_UnitTestCase {
-    private function makeSeriesTerm( string $name ): array {
+    private function makeSeriesTerm( string $name, string $description = '' ): array {
         $term  = self::factory()->term->create_and_get( array(
-            'taxonomy' => ID::TAX_SERIES,
-            'name'     => $name,
+            'taxonomy'    => ID::TAX_SERIES,
+            'name'        => $name,
+            'description' => $description,
         ) );
         return array( (int) $term->term_id, (int) $term->term_taxonomy_id );
     }
@@ -67,6 +68,38 @@ final class SermonImagesBlockTest extends WP_UnitTestCase {
         $this->assertStringContainsString( 'Grace Abounding', $html );
         $this->assertStringContainsString( 'wp-image-' . $attId, $html );
         $this->assertStringNotContainsString( 'sermonator-compat-notice', $html );
+    }
+
+    public function test_show_title_and_description_attributes_are_wired_through(): void {
+        [ , $ttId ] = $this->makeSeriesTerm( 'Grace Abounding', 'A study on <em>grace</em>.' );
+        $attId      = $this->makeImageAttachment();
+        update_option( ID::OPTION_TERM_IMAGES, array( $ttId => $attId ) );
+
+        // showTitle=false hides the term name; showDescription=true emits the kses'd
+        // description — proving both attributes reach the output (not stored-but-dead config).
+        $html = do_blocks(
+            '<!-- wp:sermonator/sermon-images {"showTitle":false,"showDescription":true} /-->'
+        );
+
+        $this->assertStringContainsString( 'sermonator-image-grid', $html );
+        $this->assertStringNotContainsString( 'sermonator-image-grid__name', $html );
+        $this->assertStringContainsString( 'sermonator-image-grid__description', $html );
+        $this->assertStringContainsString( 'A study on <em>grace</em>.', $html );
+        // Title suppressed: the term name is not emitted in a name span.
+        $this->assertStringNotContainsString( 'Grace Abounding</span>', $html );
+    }
+
+    public function test_default_attributes_show_title_and_hide_description(): void {
+        [ , $ttId ] = $this->makeSeriesTerm( 'Grace Abounding', 'A study on grace.' );
+        $attId      = $this->makeImageAttachment();
+        update_option( ID::OPTION_TERM_IMAGES, array( $ttId => $attId ) );
+
+        $html = do_blocks( '<!-- wp:sermonator/sermon-images /-->' );
+
+        // Defaults: title visible, description hidden.
+        $this->assertStringContainsString( 'sermonator-image-grid__name', $html );
+        $this->assertStringContainsString( 'Grace Abounding', $html );
+        $this->assertStringNotContainsString( 'sermonator-image-grid__description', $html );
     }
 
     public function test_term_id_collision_does_not_resolve_image(): void {

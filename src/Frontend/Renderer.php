@@ -260,12 +260,14 @@ final class Renderer {
      * already-resolved {name,url,imageHtml,description} entries built OUTSIDE the renderer
      * (the block does the get_terms / OPTION_TERM_IMAGES[tt_id] / wp_get_attachment_image
      * resolution). `imageHtml` is core wp_get_attachment_image() output — already-safe HTML
-     * passed through verbatim; every other leaf is escaped here (esc_html / esc_url). Empty
+     * passed through verbatim; the name is escaped (esc_html), the link esc_url'd, and the
+     * term description (only when `$showDescription`) run through wp_kses_post (a curated term
+     * description may carry safe inline HTML). `$showTitle` gates the per-item name. Empty
      * input → '' (empty-state).
      *
      * @param list<array{name:string,url:string,imageHtml:string,description:string}> $items
      */
-    public function termImageGrid( array $items, string $label = '', int $columns = 3 ): string {
+    public function termImageGrid( array $items, string $label = '', int $columns = 3, bool $showTitle = true, bool $showDescription = false ): string {
         if ( $items === array() ) {
             return '';
         }
@@ -273,8 +275,13 @@ final class Renderer {
 
         $cells = '';
         foreach ( $items as $item ) {
-            $inner = $item['imageHtml']
-                . '<span class="sermonator-image-grid__name">' . esc_html( $item['name'] ) . '</span>';
+            $name = $showTitle
+                ? '<span class="sermonator-image-grid__name">' . esc_html( $item['name'] ) . '</span>'
+                : '';
+            $description = ( $showDescription && ( $item['description'] ?? '' ) !== '' )
+                ? '<div class="sermonator-image-grid__description">' . wp_kses_post( $item['description'] ) . '</div>'
+                : '';
+            $inner = $item['imageHtml'] . $name . $description;
             $cells .= '<li class="sermonator-image-grid__item">'
                 . ( $item['url'] !== ''
                     ? '<a href="' . esc_url( $item['url'] ) . '">' . $inner . '</a>'

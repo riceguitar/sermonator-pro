@@ -38,11 +38,13 @@ final class SermonImagesBlock extends AbstractBlock {
             $taxonomy = ID::TAX_SERIES;
         }
 
-        $columns   = isset( $attributes['columns'] ) ? (int) $attributes['columns'] : 3;
-        $size      = isset( $attributes['size'] ) && '' !== (string) $attributes['size'] ? (string) $attributes['size'] : 'medium';
-        $order     = isset( $attributes['order'] ) ? (string) $attributes['order'] : 'ASC';
-        $orderby   = isset( $attributes['orderby'] ) ? (string) $attributes['orderby'] : 'name';
-        $hideEmpty = isset( $attributes['hideEmpty'] ) && (bool) $attributes['hideEmpty'];
+        $columns         = isset( $attributes['columns'] ) ? (int) $attributes['columns'] : 3;
+        $size            = isset( $attributes['size'] ) && '' !== (string) $attributes['size'] ? (string) $attributes['size'] : 'medium';
+        $order           = isset( $attributes['order'] ) ? (string) $attributes['order'] : 'ASC';
+        $orderby         = isset( $attributes['orderby'] ) ? (string) $attributes['orderby'] : 'name';
+        $hideEmpty       = isset( $attributes['hideEmpty'] ) && (bool) $attributes['hideEmpty'];
+        $showTitle       = ! isset( $attributes['showTitle'] ) || (bool) $attributes['showTitle'];
+        $showDescription = isset( $attributes['showDescription'] ) && (bool) $attributes['showDescription'];
 
         // OPTION_TERM_IMAGES is keyed by term_taxonomy_id (tt_id), exactly as
         // ArtworkWriter writes it. Absent/empty → safe fallback, never a blank grid.
@@ -92,7 +94,7 @@ final class SermonImagesBlock extends AbstractBlock {
             return $this->safeFallback();
         }
 
-        return ( new Renderer() )->termImageGrid( $items, '', $columns );
+        return ( new Renderer() )->termImageGrid( $items, '', $columns, $showTitle, $showDescription );
     }
 
     /**

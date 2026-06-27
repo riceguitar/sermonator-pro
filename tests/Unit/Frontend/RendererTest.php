@@ -316,6 +316,67 @@ final class RendererTest extends TestCase {
         $this->assertStringContainsString( '<img src="http://x/i.jpg" alt="">', $html );
     }
 
+    public function test_term_image_grid_respects_show_title_and_description_toggles(): void {
+        // wp_kses_post keeps safe inline HTML, strips disallowed tags.
+        Functions\when( 'wp_kses_post' )->alias(
+            static fn( $s ) => preg_replace( '#<script\b[^>]*>.*?</script>#is', '', (string) $s )
+        );
+
+        $items = array(
+            array(
+                'name'        => 'Grace',
+                'url'         => 'http://x/series/grace',
+                'imageHtml'   => '<img src="http://x/grace.jpg" alt="Grace">',
+                'description' => 'On <em>grace</em>.',
+            ),
+        );
+
+        // Default: title shown, description hidden.
+        $default = ( new Renderer() )->termImageGrid( $items, '', 3 );
+        $this->assertStringContainsString( 'sermonator-image-grid__name', $default );
+        $this->assertStringNotContainsString( 'sermonator-image-grid__description', $default );
+
+        // showTitle=false hides the per-item name.
+        $noTitle = ( new Renderer() )->termImageGrid( $items, '', 3, false, false );
+        $this->assertStringNotContainsString( 'sermonator-image-grid__name', $noTitle );
+        // The image still renders.
+        $this->assertStringContainsString( '<img src="http://x/grace.jpg" alt="Grace">', $noTitle );
+
+        // showDescription=true emits the wp_kses_post'd description.
+        $withDesc = ( new Renderer() )->termImageGrid( $items, '', 3, true, true );
+        $this->assertStringContainsString( 'sermonator-image-grid__description', $withDesc );
+        $this->assertStringContainsString( 'On <em>grace</em>.', $withDesc );
+    }
+
+    public function test_term_image_grid_kses_description_and_skips_empty(): void {
+        Functions\when( 'wp_kses_post' )->alias(
+            static fn( $s ) => preg_replace( '#<script\b[^>]*>.*?</script>#is', '', (string) $s )
+        );
+
+        $items = array(
+            // An item with an empty description emits no description wrapper even when shown.
+            array(
+                'name'        => 'Empty',
+                'url'         => '',
+                'imageHtml'   => '<img src="http://x/e.jpg" alt="">',
+                'description' => '',
+            ),
+            array(
+                'name'        => 'Dirty',
+                'url'         => '',
+                'imageHtml'   => '<img src="http://x/d.jpg" alt="">',
+                'description' => 'Keep <strong>this</strong><script>alert(1)</script>',
+            ),
+        );
+        $html = ( new Renderer() )->termImageGrid( $items, '', 3, true, true );
+
+        // Exactly one description wrapper (the empty one is skipped).
+        $this->assertSame( 1, substr_count( $html, 'sermonator-image-grid__description' ) );
+        // Disallowed tags are stripped; curated inline HTML survives.
+        $this->assertStringNotContainsString( '<script>', $html );
+        $this->assertStringContainsString( 'Keep <strong>this</strong>', $html );
+    }
+
     public function test_latest_series_empty_input_renders_nothing(): void {
         $r = new Renderer();
         $this->assertSame( '', $r->latestSeries( array(), true, true ) );
