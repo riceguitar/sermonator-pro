@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Sermonator\Cli;
 
+use Sermonator\Frontend\Bible\BibleWarmer;
 use Sermonator\Migration\BibleChapterVendor;
 use Sermonator\Migration\BibleRefsBackfill;
 use Sermonator\Schema\BibleTranslations;
@@ -17,10 +18,12 @@ use Sermonator\Schema\Identifiers as ID;
  *   wp sermonator bible backfill [--write] [--rollback] [--limit=<n>]
  *   wp sermonator bible flush
  *   wp sermonator bible vendor [--translation=<id>] [--write] [--force] [--limit=<n>] [--rollback]
+ *   wp sermonator bible warm [--limit=<n>] [--rollback]
  *
  * Phase 3a was LINK-MODE only. Phase 3b Task 8 adds the `vendor` subcommand (vendor the
- * public-domain ENGWEBP per-chapter text to the uploads snapshot, reversibly). The `warm`
- * subcommand (prime the transient chapter cache) lands with Task 9 — see the TODO below.
+ * public-domain ENGWEBP per-chapter text to the uploads snapshot, reversibly). Phase 3b
+ * Task 9 adds the `warm` subcommand (prime the disposable transient chapter cache for the
+ * chapters real sermons cite) — its disk-snapshot peer is `vendor`.
  */
 final class BibleCommand {
     /**
@@ -249,7 +252,71 @@ final class BibleCommand {
         }
     }
 
-    // TODO(Phase 3b Task 9): `warm` (prime the transient chapter cache on save + a chunked
-    // CLI backfill) lands with BibleWarmer — migration-gated, fill-missing, reversible
-    // (reverse == `flush` gen bump / TTL expiry). Vendoring (above) is its disk-snapshot peer.
+    /**
+     * Warm the disposable transient chapter cache for the chapters real sermons cite, so
+     * the front end can serve inline verse text with ZERO network I/O once inline rendering
+     * is enabled. Delegates to {@see BibleWarmer}, which owns every guardrail: CACHE-ONLY
+     * (never post meta, never the preserved passage/envelope), fill-missing + idempotent
+     * (a chapter already on disk or in cache is skipped), migration-gated, and structurally
+     * reversible (the reverse just bumps the cache generation — see `--rollback` / `flush`).
+     *
+     * The save-time peer (warm-on-save) runs automatically and synchronously after an
+     * authoring save; this subcommand is the bulk sweep over the EXISTING corpus. It is
+     * chunkable: a chapter warmed by an earlier run resolves from cache and is skipped, so
+     * `--limit=N` drains the missing tail across repeated runs (the cache is the progress
+     * marker — no touched-id log of derived text is kept).
+     *
+     * ## OPTIONS
+     *
+     * [--limit=<n>]
+     * : Warm at most N MISSING chapters this run (re-run to drain the rest; idempotent).
+     *
+     * [--rollback]
+     * : Bump the cache generation so every warmed entry becomes unreachable and expires by
+     *   TTL (the exact, bookkeeping-free reverse of warming; same effect as `flush`).
+     *
+     * ## EXAMPLES
+     *
+     *     wp sermonator bible warm
+     *     wp sermonator bible warm --limit=200
+     *     wp sermonator bible warm --rollback
+     *
+     * @param array<int,string>    $args
+     * @param array<string,string> $assoc_args
+     */
+    public function warm( array $args, array $assoc_args ): void {
+        $service = new BibleWarmer();
+
+        if ( ! empty( $assoc_args['rollback'] ) ) {
+            $result = $service->rollback();
+            if ( $result['gated'] ) {
+                \WP_CLI::warning( 'A migration is in progress — rollback is gated. Finalize or roll back the migration first.' );
+                return;
+            }
+            \WP_CLI::success( sprintf(
+                'Flushed warmed chapter cache (generation %d -> %d); warmed entries are now unreachable and expire by TTL.',
+                $result['from'],
+                $result['to']
+            ) );
+            return;
+        }
+
+        $limit  = isset( $assoc_args['limit'] ) ? (int) $assoc_args['limit'] : 0;
+        $result = $service->warm( $limit );
+
+        if ( $result['gated'] ) {
+            \WP_CLI::warning( 'A migration is in progress — warming is gated. Finalize or roll back the migration first.' );
+            return;
+        }
+
+        \WP_CLI::log( sprintf(
+            '%d sermon(s) with refs; %d cited chapter(s); this run: %d warmed, %d already-present, %d failed.',
+            $result['sermons'],
+            $result['cited'],
+            $result['warmed'],
+            $result['skipped'],
+            $result['failed']
+        ) );
+        \WP_CLI::success( sprintf( 'Warmed %d chapter(s) for %s.', $result['warmed'], $result['translation'] ) );
+    }
 }

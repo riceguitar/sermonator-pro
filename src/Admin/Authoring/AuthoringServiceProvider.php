@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Sermonator\Admin\Authoring;
 
+use Sermonator\Frontend\Bible\BibleWarmer;
+
 /**
  * Wires the Sermon Details authoring layer: meta registration, REST endpoint, save-time date
- * normalization, REST sanitization, and the classic meta-box React UI.
+ * normalization, REST sanitization, the classic meta-box React UI, and the synchronous
+ * warm-on-save cache primer (Phase 3b Task 9).
  */
 final class AuthoringServiceProvider {
 	private SermonMetaRegistrar $metaRegistrar;
@@ -15,6 +18,7 @@ final class AuthoringServiceProvider {
 	private SermonRefsCapture $refsCapture;
 	private SermonMetaRestSanitizer $metaRestSanitizer;
 	private SermonMetaBox $metaBox;
+	private BibleWarmer $bibleWarmer;
 
 	public function __construct(
 		?SermonMetaRegistrar $metaRegistrar = null,
@@ -22,7 +26,8 @@ final class AuthoringServiceProvider {
 		?SermonDateNormalizer $dateNormalizer = null,
 		?SermonMetaRestSanitizer $metaRestSanitizer = null,
 		?SermonMetaBox $metaBox = null,
-		?SermonRefsCapture $refsCapture = null
+		?SermonRefsCapture $refsCapture = null,
+		?BibleWarmer $bibleWarmer = null
 	) {
 		$this->metaRegistrar     = $metaRegistrar ?? new SermonMetaRegistrar();
 		$this->audioController   = $audioController ?? new AudioMetaController();
@@ -30,6 +35,7 @@ final class AuthoringServiceProvider {
 		$this->refsCapture       = $refsCapture ?? new SermonRefsCapture();
 		$this->metaRestSanitizer = $metaRestSanitizer ?? new SermonMetaRestSanitizer();
 		$this->metaBox           = $metaBox ?? new SermonMetaBox();
+		$this->bibleWarmer       = $bibleWarmer ?? new BibleWarmer();
 	}
 
 	public function hook(): void {
@@ -51,6 +57,9 @@ final class AuthoringServiceProvider {
 		$this->metaRestSanitizer->hook();
 		$this->dateNormalizer->hook();
 		$this->refsCapture->hook();
+		// Warm-on-save runs AFTER refsCapture (its own hook priorities enforce the order)
+		// so the envelope it primes the cache from is already persisted.
+		$this->bibleWarmer->hook();
 		$this->metaBox->hook();
 	}
 }
