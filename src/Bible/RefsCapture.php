@@ -43,6 +43,41 @@ final class RefsCapture {
     public const UNPARSEABLE_SENTINEL = '1';
 
     /**
+     * Optional per-ref provenance field (design §3.2) describing HOW the ref's
+     * `srcVersification` was established:
+     *  - `authored`     — stamped contemporaneously at an authoring save with the
+     *                     live link version (the confirm-chip path); gates directly.
+     *  - `site-default` — the conservative default: a backfill/auto-parse ref whose
+     *                     versification is the site-wide stamp, OR ANY v1 envelope ref
+     *                     that predates this field. `site-default` additionally needs
+     *                     the admin attestation (L6) before it can render inline.
+     *
+     * BACKWARD-COMPATIBLE: the field is OPTIONAL. A v1 envelope ref lacking it MUST
+     * read as `site-default` (the conservative default) everywhere consumed — read
+     * the value ONLY through {@see self::srcVersificationConfidence()}, never a bare
+     * array access. We do NOT bump {@see self::ENVELOPE_VERSION} or rewrite existing
+     * envelopes to add it.
+     */
+    public const SRC_VERSIFICATION_CONFIDENCE_AUTHORED     = 'authored';
+    public const SRC_VERSIFICATION_CONFIDENCE_SITE_DEFAULT = 'site-default';
+
+    /**
+     * Read a ref's `srcVersificationConfidence` with back-compat: an absent or
+     * unrecognized value reads as the conservative `site-default`. This is the SINGLE
+     * accessor every consumer (VersificationGate, resolver, audit) must use so the
+     * default is enforced in exactly one place.
+     *
+     * @param array<string,mixed> $ref
+     */
+    public static function srcVersificationConfidence( array $ref ): string {
+        $value = $ref['srcVersificationConfidence'] ?? null;
+
+        return self::SRC_VERSIFICATION_CONFIDENCE_AUTHORED === $value
+            ? self::SRC_VERSIFICATION_CONFIDENCE_AUTHORED
+            : self::SRC_VERSIFICATION_CONFIDENCE_SITE_DEFAULT;
+    }
+
+    /**
      * Produce structured refs for one post and persist them, fill-missing only.
      *
      * @param int    $postId Target sermon post id.
@@ -149,6 +184,11 @@ final class RefsCapture {
                 $ref['source']           = $source;
                 $ref['confidence']       = $this->confidence( $flags );
                 $ref['srcVersification'] = $srcVersification;
+                // This producer (backfill / save-time auto-parse) never authors the
+                // versification contemporaneously — its stamp is the site-wide
+                // default. Only the confirm-chip REST path (T12) promotes a ref to
+                // `authored`. Conservative by construction (design §3.2).
+                $ref['srcVersificationConfidence'] = self::SRC_VERSIFICATION_CONFIDENCE_SITE_DEFAULT;
                 $refs[]                  = $ref;
             }
         }

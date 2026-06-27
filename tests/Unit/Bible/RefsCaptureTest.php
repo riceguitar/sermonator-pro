@@ -123,6 +123,61 @@ final class RefsCaptureTest extends TestCase {
         $this->assertSame( 'ESV', $ref['srcVersification'] );
     }
 
+    public function test_backfill_producer_stamps_site_default_versification_confidence(): void {
+        $this->sermon( 1, 'John 3:16' );
+
+        ( new RefsCapture() )->captureForPost( 1, 'backfill' );
+
+        $ref = $this->envelopeOf( 1 )['refs'][0];
+        $this->assertSame(
+            RefsCapture::SRC_VERSIFICATION_CONFIDENCE_SITE_DEFAULT,
+            $ref['srcVersificationConfidence'],
+            'The backfill/auto-parse producer never authors versification contemporaneously.'
+        );
+        // Constant is the conservative literal.
+        $this->assertSame( 'site-default', RefsCapture::SRC_VERSIFICATION_CONFIDENCE_SITE_DEFAULT );
+    }
+
+    public function test_envelope_version_is_not_bumped_by_the_new_optional_field(): void {
+        // BACKWARD-COMPATIBLE: adding srcVersificationConfidence must NOT change the
+        // envelope schema version (existing v1 envelopes stay valid, unrewritten).
+        $this->sermon( 1, 'John 3:16' );
+        ( new RefsCapture() )->captureForPost( 1, 'backfill' );
+        $this->assertSame( 1, $this->envelopeOf( 1 )['v'] );
+        $this->assertSame( 1, RefsCapture::ENVELOPE_VERSION );
+    }
+
+    public function test_absent_versification_confidence_reads_as_site_default(): void {
+        // A v1 envelope ref written BEFORE this field existed lacks it entirely; the
+        // single accessor must read it as the conservative site-default.
+        $legacyRef = array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16 );
+        $this->assertArrayNotHasKey( 'srcVersificationConfidence', $legacyRef );
+        $this->assertSame(
+            'site-default',
+            RefsCapture::srcVersificationConfidence( $legacyRef )
+        );
+    }
+
+    public function test_authored_versification_confidence_reads_through_verbatim(): void {
+        $authoredRef = array(
+            'bookUSFM'                  => 'JHN',
+            'srcVersificationConfidence' => 'authored',
+        );
+        $this->assertSame( 'authored', RefsCapture::srcVersificationConfidence( $authoredRef ) );
+    }
+
+    public function test_unrecognized_versification_confidence_falls_back_to_site_default(): void {
+        // Never trust a stray/garbage value to clear the provenance gate.
+        foreach ( array( 'bogus', '', 'AUTHORED', 0, null, 'SITE-DEFAULT' ) as $bad ) {
+            $ref = array( 'srcVersificationConfidence' => $bad );
+            $this->assertSame(
+                'site-default',
+                RefsCapture::srcVersificationConfidence( $ref ),
+                'Unrecognized value must fall back to the conservative default.'
+            );
+        }
+    }
+
     public function test_source_tag_is_per_call_so_producers_agree_on_everything_else(): void {
         $this->sermon( 1, 'John 3:16; Romans 8:28' );
         $this->sermon( 2, 'John 3:16; Romans 8:28' );

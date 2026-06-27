@@ -67,6 +67,42 @@ final class Identifiers {
     public const OPTION_BIBLE_REFS_BACKFILL_LOG = 'sermonator_bible_refs_backfill_log';
 
     /**
+     * Phase 3b (inline Bible verse text) option keys — all on the shared
+     * {@see self::OPTION_GROUP_SETTINGS} group.
+     *
+     * Master kill-switch for inline rendering. Physically un-enableable until a full
+     * vendor + warm pass has completed (no half-on / ships-dark) — see design §3.4.
+     */
+    public const OPTION_BIBLE_INLINE_ENABLED         = 'sermonator_bible_inline_enabled';
+    /**
+     * Admin attestation that ALL references use one English-tradition link version.
+     * Required for `srcVersificationConfidence == 'site-default'` (backfill/absent)
+     * refs to clear the L6 provenance gate; `authored` refs skip it (design §2 L6).
+     */
+    public const OPTION_BIBLE_INLINE_ATTESTATION     = 'sermonator_bible_inline_attestation';
+    /**
+     * Confidence floor an inline-eligible ref must clear (default `exact`). Admin
+     * opt-in may widen the allowed set (design §2 L2 / §3.5).
+     */
+    public const OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR = 'sermonator_bible_inline_confidence_floor';
+
+    /**
+     * Stamped into every vendored/normalized per-chapter JSON file and folded into
+     * the chapter-cache transient key. Bump to invalidate every cached chapter when
+     * the normalized node shape changes (design §3.4 / §3.6). Distinct from the
+     * admin-bumpable {@see self::OPTION_BIBLE_CACHE_GEN} cache-buster: this is a
+     * code-owned structural version, that is an operator-owned generation counter.
+     */
+    public const BIBLE_CACHE_SCHEMA_VERSION = 1;
+
+    /**
+     * Sub-directory of `wp-content/uploads/` holding the on-demand vendored chapter
+     * snapshots (`<BIBLE_VENDOR_DIR>/<TRANSLATION>/<BOOK>/<chapter>.json`). NOT in
+     * the committed repo/SVN — populated by `wp sermonator bible vendor` (design §3.4).
+     */
+    public const BIBLE_VENDOR_DIR = 'sermonator-bible';
+
+    /**
      * Bundle 4 (Config & display) live option keys. On the shared
      * {@see self::OPTION_GROUP_SETTINGS} group.
      *
