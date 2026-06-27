@@ -108,6 +108,37 @@ final class SermonMetaBox {
 				error_log( sprintf( 'Sermonator: update_post_meta failed for post %d, key %s', $post_id, $key ) );
 			}
 		}
+
+		$this->saveRefsEnvelope( $post_id, $data );
+	}
+
+	/**
+	 * Persist the confirm-chip {@see Identifiers::META_BIBLE_REFS} envelope on the CLASSIC
+	 * full-page save path (new sermons whose REST autosave never fired, and pure-classic
+	 * editors).
+	 *
+	 * META_BIBLE_REFS is deliberately NOT in {@see self::editableMetaKeys()}: the generic
+	 * loop runs {@see SermonMetaSanitizer}, which has no case for the refs key and would
+	 * therefore persist whatever JSON the hidden input carried VERBATIM — letting a crafted
+	 * blob smuggle a forged `confidence:'exact'`/`source:'authoring'` provenance and defeat
+	 * the never-fail-WRONG trust contract. Instead the envelope is routed through the SAME
+	 * server-side authority the REST write uses ({@see SermonRefsRestSanitizer::stamp()}),
+	 * which whitelists structural fields only, drops invalid refs, caps the count, and
+	 * RE-DERIVES provenance server-side. Client values are never trusted on either path.
+	 *
+	 * Only writes when the author actually submitted a refs value (touched a chip); an
+	 * absent key leaves any previously curated envelope untouched (no-interaction = no
+	 * clobber). It NEVER touches META_BIBLE_PASSAGE.
+	 *
+	 * @param array<string,mixed> $data
+	 */
+	private function saveRefsEnvelope( int $post_id, array $data ): void {
+		if ( ! array_key_exists( Identifiers::META_BIBLE_REFS, $data ) ) {
+			return;
+		}
+
+		$stamped = ( new SermonRefsRestSanitizer() )->stamp( $data[ Identifiers::META_BIBLE_REFS ] );
+		update_post_meta( $post_id, Identifiers::META_BIBLE_REFS, $stamped );
 	}
 
 	public function enqueueAssets( string $hook ): void {
@@ -161,6 +192,7 @@ final class SermonMetaBox {
 					'postId'         => 0,
 					'editingAllowed' => MigrationGuard::editingAllowed(),
 					'initialData'    => array(),
+					'savedRefs'      => '',
 				)
 			);
 			return;
@@ -181,8 +213,24 @@ final class SermonMetaBox {
 				'postId'         => $post->ID,
 				'editingAllowed' => MigrationGuard::editingAllowed(),
 				'initialData'    => $this->initialData( $post ),
+				'savedRefs'      => $this->savedRefsEnvelope( $post ),
 			)
 		);
+	}
+
+	/**
+	 * The persisted {@see Identifiers::META_BIBLE_REFS} envelope (a JSON string), surfaced
+	 * to the React panel as a SEED so the confirm chips reflect the author's PRIOR curation
+	 * rather than defaulting every live-parsed ref back to "kept" on reopen.
+	 *
+	 * It is intentionally kept OUT of {@see self::initialData()} / the editable meta state
+	 * so it never enters the autosave meta payload on its own — refs only join a write once
+	 * the author actually touches a chip (no-interaction = no clobber). The panel reads this
+	 * read-only seed to mark refs the author previously removed as removed; the server stays
+	 * the sole authority for provenance on save.
+	 */
+	private function savedRefsEnvelope( WP_Post $post ): string {
+		return (string) get_post_meta( $post->ID, Identifiers::META_BIBLE_REFS, true );
 	}
 
 	private function currentPostId(): int {

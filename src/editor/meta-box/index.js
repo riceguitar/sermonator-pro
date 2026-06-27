@@ -64,6 +64,41 @@ import apiFetch from '@wordpress/api-fetch';
 	}
 
 	/**
+	 * Build the set of structural refKeys present in a previously-SAVED META_BIBLE_REFS
+	 * envelope (the server-stamped JSON string seeded into window.sermonatorMetaBox.savedRefs).
+	 *
+	 * Used to seed the panel with the author's PRIOR curation: when a non-empty curated
+	 * envelope exists, any live-parsed ref whose key is absent from it was deliberately
+	 * removed by the author in an earlier session and must default to removed — otherwise
+	 * reopening the sermon (and touching any chip) would re-serialize the full live parse
+	 * and the server would re-stamp those removed refs back to confidence:'exact', silently
+	 * resurrecting a ref the author rejected (never-fail-WRONG). Returns null when there is
+	 * no curated envelope (first-time authoring), so every parsed ref defaults to kept.
+	 *
+	 * @param {string} savedRefs JSON envelope string, or '' / undefined.
+	 * @return {Set<string>|null}
+	 */
+	function savedRefKeySet(savedRefs) {
+		if (!savedRefs) {
+			return null;
+		}
+		let env;
+		try {
+			env = JSON.parse(savedRefs);
+		} catch (e) {
+			return null;
+		}
+		if (!env || !Array.isArray(env.refs)) {
+			return null;
+		}
+		const keys = new Set();
+		env.refs.forEach(function (ref) {
+			keys.add(refKey(ref));
+		});
+		return keys;
+	}
+
+	/**
 	 * Best-effort human label for a ref when the parser did not echo the raw text.
 	 *
 	 * @param {Object} ref
@@ -369,6 +404,7 @@ import apiFetch from '@wordpress/api-fetch';
 	 * @param {string}   props.passage
 	 * @param {boolean}  props.editingAllowed
 	 * @param {Function} props.onRefsChange
+	 * @param {string}   props.savedRefs Previously-persisted envelope JSON (curation seed).
 	 */
 	function ScriptureReferences(props) {
 		const passage = props.passage || '';
@@ -386,10 +422,25 @@ import apiFetch from '@wordpress/api-fetch';
 		const dismissedRef = useRef({});
 		// The passage string the current chips were built from (avoids redundant fetches).
 		const builtFromRef = useRef(null);
+		// The author's curation from a PRIOR save, used to seed kept/removed so reopening a
+		// sermon reflects past removals (and a re-touch cannot resurrect them as exact).
+		const savedKeysRef = useRef(savedRefKeySet(props.savedRefs));
 
 		const buildChips = function (refs) {
+			const savedKeys = savedKeysRef.current;
 			return refs.map(function (ref, index) {
 				const key = refKey(ref);
+				// Seed prior curation ONCE per key: when a non-empty curated envelope was
+				// saved and this parsed ref is absent from it, the author removed it before
+				// — default the chip to removed. An author's in-session toggle (recorded in
+				// dismissedRef) always wins over the seed.
+				if (
+					dismissedRef.current[key] === undefined &&
+					savedKeys &&
+					savedKeys.size > 0
+				) {
+					dismissedRef.current[key] = !savedKeys.has(key);
+				}
 				return {
 					id: key + '#' + index,
 					key: key,
@@ -870,6 +921,7 @@ import apiFetch from '@wordpress/api-fetch';
 						el(ScriptureReferences, {
 							passage: meta[META_KEYS.passage] || '',
 							editingAllowed: editingAllowed,
+							savedRefs: config.savedRefs || '',
 							onRefsChange: function (envelope) {
 								updateMeta(META_KEYS.refs, envelope);
 							},
