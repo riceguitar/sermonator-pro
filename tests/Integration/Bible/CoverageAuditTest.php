@@ -117,4 +117,112 @@ final class CoverageAuditTest extends WP_UnitTestCase {
             $this->assertArrayHasKey( $key, $result );
         }
     }
+
+    // ----------------------------------------------------------------------------------
+    // Phase 3b — inline corpus-gate report (Task 14)
+    //
+    // NOT run in this environment (no Docker / wp-env) — authored to run under wp-env.
+    // These exercise the read-only inline instrument against the REAL options/meta/query
+    // stack: the withheld-by-reason tally shape, the no-write-on-report boundary, the
+    // run()-folds-inline persistence path, and the source-versification heterogeneity
+    // signal. Chapters are NOT vendored under wp-env, so inline-eligible refs land in
+    // `cold-unwarmed` rather than `inline_eligible` — which is exactly the honest
+    // pre-warm ground truth (we assert SHAPE + signals, not warmed eligibility).
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * @param string $confidence
+     * @param string $src
+     *
+     * @return array<string,mixed>
+     */
+    private function inlineRef( string $book, int $chapter, ?int $verseStart, string $confidence = 'exact', string $src = 'ESV' ): array {
+        return array(
+            'bookUSFM'         => $book,
+            'chapterStart'     => $chapter,
+            'verseStart'       => $verseStart,
+            'verseEnd'         => null,
+            'chapterEnd'       => null,
+            'confidence'       => $confidence,
+            'srcVersification' => $src,
+        );
+    }
+
+    public function test_inline_report_shape_and_no_write_on_report(): void {
+        delete_option( ID::OPTION_BIBLE_STATS );
+
+        $this->sermon( 'publish', array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->inlineRef( 'JHN', 3, 16 ),                 // inline-shaped exact
+                $this->inlineRef( 'JHN', 3, 16, 'probable' ),     // low-confidence
+                $this->inlineRef( 'JHN', 3, null ),               // not-inline-eligible
+            ) ),
+        ) );
+
+        $report = ( new CoverageAudit() )->inlineReport();
+
+        // Withheld tally carries every reason key (always-present partition buckets).
+        foreach ( array(
+            'not-inline-eligible',
+            'low-confidence',
+            'translation-ineligible',
+            'src-versification-unsupported',
+            'src-heterogeneous',
+            'unmodeled-versification-pair',
+            'versification-divergent',
+            'cold-unwarmed',
+            'verse-out-of-range',
+        ) as $reason ) {
+            $this->assertArrayHasKey( $reason, $report['withheld'] );
+        }
+
+        $this->assertSame( 3, $report['refs_total'] );
+        $this->assertSame( 1, $report['withheld']['low-confidence'] );
+        $this->assertSame( 1, $report['withheld']['not-inline-eligible'] );
+        // Partition holds.
+        $this->assertSame(
+            $report['refs_total'],
+            $report['inline_eligible'] + array_sum( $report['withheld'] )
+        );
+        $this->assertArrayHasKey( 'unmodeled_pair_wrong_text', $report );
+
+        // NO WRITE-ON-REPORT: the read-only instrument never persists the rollup option.
+        $this->assertFalse( get_option( ID::OPTION_BIBLE_STATS, false ) );
+    }
+
+    public function test_run_persists_inline_subreport_in_the_rollup(): void {
+        $this->sermon( 'publish', array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array( $this->inlineRef( 'JHN', 3, 16 ) ) ),
+        ) );
+
+        $stats = ( new CoverageAudit() )->run();
+
+        $this->assertArrayHasKey( 'inline', $stats );
+        $this->assertSame( $stats['inline'], get_option( ID::OPTION_BIBLE_STATS )['inline'] );
+        $this->assertSame( 1, $stats['inline']['refs_total'] );
+        $this->assertArrayHasKey( 'inline_eligible_pct', $stats['inline'] );
+    }
+
+    public function test_inline_report_flags_source_versification_heterogeneity(): void {
+        delete_option( ID::OPTION_BIBLE_STATS );
+
+        // Dominant eng-protestant tradition + a single foreign-tradition ref.
+        $this->sermon( 'publish', array(
+            ID::META_BIBLE_PASSAGE => 'mixed corpus',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                $this->inlineRef( 'JHN', 3, 16, 'exact', 'ESV' ),
+                $this->inlineRef( 'GEN', 1, 1, 'exact', 'NIV' ),
+                $this->inlineRef( 'ROM', 8, 28, 'exact', 'RVR1960' ), // foreign minority
+            ) ),
+        ) );
+
+        $report = ( new CoverageAudit() )->inlineReport();
+
+        $this->assertTrue( $report['heterogeneous'] );
+        $this->assertSame( 'eng-protestant', $report['dominant_family'] );
+        $this->assertSame( 1, $report['withheld']['src-heterogeneous'] );
+        $this->assertSame( 0, $report['withheld']['src-versification-unsupported'] );
+    }
 }

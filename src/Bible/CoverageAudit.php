@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Sermonator\Bible;
 
+use Sermonator\Frontend\Bible\ChapterProvider;
+use Sermonator\Schema\BibleTranslations;
 use Sermonator\Schema\Identifiers as ID;
 
 /**
@@ -41,8 +43,39 @@ use Sermonator\Schema\Identifiers as ID;
  * otherwise live-parsed from the preserved passage label — so the audit reflects what a
  * visitor would actually get without re-running the renderer.
  *
+ * ## Phase 3b: the inline corpus-gate instrument (spec §3.9 / Task 14)
+ *
+ * On top of the structural PARSE-coverage above, this class also answers the harder
+ * 3b question: of the corpus's render-ready refs, how many would actually render
+ * INLINE verse text under the full never-fail-WRONG L1–L9 predicate, and for the rest
+ * — WHY were they withheld? {@see self::inlineReport()} runs the SAME layered gate the
+ * live {@see \Sermonator\Frontend\BibleResolver} uses (so it predicts exactly what a
+ * visitor would get), tallies every withheld ref by its FIRST failing reason, and emits
+ * an inline-eligible% over the corpus. It is READ-ONLY (the corpus-gate instrument the
+ * operator runs BEFORE flipping inline on at scale): it queries + classifies, and writes
+ * NOTHING. The persisted rollup gains an `inline` sub-report ONLY through the existing
+ * write-gated {@see self::run()} (cron + on-save), never on a GET — so Site Health and the
+ * CLI stay pure readers of a precomputed value (no write-on-GET, off the render path).
+ *
+ * Two signals are surfaced distinctly because a green headline must never hide a
+ * mis-versification (the #1 standard):
+ *   - {@see self::INLINE_REASON_UNMODELED_PAIR} is mirrored into a top-level
+ *     `unmodeled_pair_wrong_text` counter — a NONZERO value is direct proof the modeled
+ *     (source-family → target) set was incomplete for the real corpus.
+ *   - {@see self::INLINE_REASON_SRC_HETEROGENEOUS} fires when the corpus carries MORE
+ *     THAN ONE source-versification family — direct proof the single site-wide
+ *     attestation premise ("all references use one English tradition") is FALSE, so
+ *     attesting would surface real-but-wrong verses for the minority tradition.
+ *
+ * Attestation is ASSUMED TRUE for the inline classification (best-case ceiling) so the
+ * L6 attestation toggle cannot mask the deeper L5/L7/L9 wrong-text signals; the
+ * `src-heterogeneous` overlay is the independent check on whether that attestation is
+ * actually safe to make.
+ *
  * @phpstan-type Breakdown array{resolved:int,withheld_low_confidence:int,parse_fail:int,empty:int}
- * @phpstan-type Stats array{generated_at:int,total:int,with_passage:int,resolved:int,parse_coverage:float,breakdown:Breakdown}
+ * @phpstan-type Withheld array{not-inline-eligible:int,low-confidence:int,translation-ineligible:int,src-versification-unsupported:int,src-heterogeneous:int,unmodeled-versification-pair:int,versification-divergent:int,cold-unwarmed:int,verse-out-of-range:int}
+ * @phpstan-type InlineReport array{generated_at:int,target:string,floor:string,refs_total:int,inline_eligible:int,inline_eligible_pct:float,withheld:Withheld,unmodeled_pair_wrong_text:int,families:array<string,int>,dominant_family:string,heterogeneous:bool}
+ * @phpstan-type Stats array{generated_at:int,total:int,with_passage:int,resolved:int,parse_coverage:float,breakdown:Breakdown,inline:InlineReport}
  */
 final class CoverageAudit {
     /** Cron action that recomputes + persists the rollup (also the on-save target). */
@@ -59,6 +92,40 @@ final class CoverageAudit {
     public const GREEN_THRESHOLD = 90.0;
 
     /**
+     * The withheld-by-reason tags for the inline corpus-gate report. The first SEVEN
+     * map directly to the live resolver's fall-open reasons (the §2 L-layers); the
+     * `cold-unwarmed` tag is the audit's name for an offline L8 miss (the chapter is
+     * not yet vendored/warmed to disk — a "would be available once warmed" state, as
+     * opposed to the render-path's `chapter-unavailable`), and `src-heterogeneous` is
+     * the corpus-level overlay that has no single-ref render-path analogue.
+     *
+     * The three versification-relation reasons reuse {@see VersificationGate}'s
+     * constants verbatim so the gate stays the single source of those strings.
+     */
+    public const INLINE_REASON_NOT_INLINE_ELIGIBLE = 'not-inline-eligible';
+    public const INLINE_REASON_LOW_CONFIDENCE       = 'low-confidence';
+    public const INLINE_REASON_TRANSLATION_INELIGIBLE = 'translation-ineligible';
+    public const INLINE_REASON_SRC_UNSUPPORTED      = VersificationGate::REASON_SRC_UNSUPPORTED;
+    public const INLINE_REASON_SRC_HETEROGENEOUS    = 'src-heterogeneous';
+    public const INLINE_REASON_UNMODELED_PAIR       = VersificationGate::REASON_UNMODELED_PAIR;
+    public const INLINE_REASON_DIVERGENT            = VersificationGate::REASON_DIVERGENT;
+    public const INLINE_REASON_COLD_UNWARMED        = 'cold-unwarmed';
+    public const INLINE_REASON_VERSE_OUT_OF_RANGE   = 'verse-out-of-range';
+
+    /**
+     * Confidence tiers ranked HIGH → LOW for the L2 floor check — kept in lockstep with
+     * {@see \Sermonator\Frontend\BibleResolver}'s identical table so the audit predicts
+     * the live decision exactly. `ambiguous`/unknown/absent rank 0 and never inline.
+     *
+     * @var array<string,int>
+     */
+    private const CONFIDENCE_RANK = array(
+        'exact'         => 3,
+        'derived-exact' => 2,
+        'probable'      => 1,
+    );
+
+    /**
      * Resolves the published sermon ids to audit. Injected so the audit math is
      * unit-testable without a live WP_Query; defaults to the real query.
      *
@@ -66,9 +133,23 @@ final class CoverageAudit {
      */
     private $postsProvider;
 
-    /** @param callable():list<int>|null $postsProvider Resolve the published sermon ids. */
-    public function __construct( ?callable $postsProvider = null ) {
-        $this->postsProvider = $postsProvider ?? array( $this, 'queryPublishedSermons' );
+    /**
+     * The L8 offline chapter reader, signature `(translation,bookUSFM,chapter,warmContext)`.
+     * Injected so the inline classification is unit-testable without disk/cache; defaults
+     * to {@see ChapterProvider::get} bound to `warmContext: false` (disk/transient ONLY —
+     * the audit, like the render path, performs ZERO network I/O).
+     *
+     * @var callable(string,string,int,bool):(array<int,mixed>|null)
+     */
+    private $chapterResolver;
+
+    /**
+     * @param callable():list<int>|null                                       $postsProvider   Resolve the published sermon ids.
+     * @param callable(string,string,int,bool):(array<int,mixed>|null)|null   $chapterResolver Offline chapter reader for L8 (tests inject a spy).
+     */
+    public function __construct( ?callable $postsProvider = null, ?callable $chapterResolver = null ) {
+        $this->postsProvider   = $postsProvider ?? array( $this, 'queryPublishedSermons' );
+        $this->chapterResolver = $chapterResolver ?? array( ChapterProvider::class, 'get' );
     }
 
     /**
@@ -158,11 +239,279 @@ final class CoverageAudit {
             'resolved'       => $resolved,
             'parse_coverage' => self::percentage( $resolved, $withPassage ),
             'breakdown'      => $breakdown,
+            // The inline corpus-gate sub-report. Folded in here — the ONLY write-gated
+            // path (cron + on-save) — so Site Health can read it without recomputing
+            // (no write-on-GET). The standalone read-only CLI report uses the same math.
+            'inline'         => $this->computeInlineReport( $ids ),
         );
 
         update_option( ID::OPTION_BIBLE_STATS, $stats, false );
 
         return $stats;
+    }
+
+    /**
+     * Compute the inline corpus-gate report over the published corpus and RETURN it,
+     * WRITING NOTHING (the read-only instrument behind `wp sermonator bible audit
+     * --inline`). It classifies every render-ready ref through the full never-fail-WRONG
+     * L1–L9 predicate and tallies the withheld refs by their first failing reason.
+     *
+     * @return array{generated_at:int,target:string,floor:string,refs_total:int,inline_eligible:int,inline_eligible_pct:float,withheld:array<string,int>,unmodeled_pair_wrong_text:int,families:array<string,int>,dominant_family:string,heterogeneous:bool}
+     */
+    public function inlineReport(): array {
+        return $this->computeInlineReport( ( $this->postsProvider )() );
+    }
+
+    /**
+     * The inline corpus-gate computation shared by {@see self::run()} (which persists it
+     * under the rollup's `inline` key) and {@see self::inlineReport()} (which returns it
+     * read-only). Never writes; never throws; performs ZERO network I/O (L8 reads disk/
+     * cache only via the injected resolver with `warmContext: false`).
+     *
+     * Method: collect every in-canon, structurally-valid ref across the corpus; bucket
+     * each by its source-versification FAMILY to find the dominant tradition and whether
+     * the corpus is heterogeneous; then classify each ref by the layered predicate
+     * ({@see self::classifyInlineRef()}). Attestation is ASSUMED TRUE so the deeper
+     * wrong-text signals are not masked; the `src-heterogeneous` overlay independently
+     * proves whether that assumption holds.
+     *
+     * @param list<int> $ids
+     *
+     * @return array{generated_at:int,target:string,floor:string,refs_total:int,inline_eligible:int,inline_eligible_pct:float,withheld:array<string,int>,unmodeled_pair_wrong_text:int,families:array<string,int>,dominant_family:string,heterogeneous:bool}
+     */
+    private function computeInlineReport( array $ids ): array {
+        $target = TranslationRegistry::current()->inlineTranslation();
+        $floor  = self::confidenceFloor();
+
+        $refs          = $this->corpusRefs( $ids );
+        $families      = self::familyHistogram( $refs );
+        $dominant      = self::dominantFamily( $families );
+        $heterogeneous = count( $families ) > 1;
+
+        $withheld = array(
+            self::INLINE_REASON_NOT_INLINE_ELIGIBLE   => 0,
+            self::INLINE_REASON_LOW_CONFIDENCE        => 0,
+            self::INLINE_REASON_TRANSLATION_INELIGIBLE => 0,
+            self::INLINE_REASON_SRC_UNSUPPORTED       => 0,
+            self::INLINE_REASON_SRC_HETEROGENEOUS     => 0,
+            self::INLINE_REASON_UNMODELED_PAIR        => 0,
+            self::INLINE_REASON_DIVERGENT             => 0,
+            self::INLINE_REASON_COLD_UNWARMED         => 0,
+            self::INLINE_REASON_VERSE_OUT_OF_RANGE    => 0,
+        );
+
+        $eligible = 0;
+        foreach ( $refs as $ref ) {
+            $reason = $this->classifyInlineRef( $ref, $target, $floor, $dominant, $heterogeneous );
+            if ( null === $reason ) {
+                ++$eligible;
+                continue;
+            }
+            // Defensive: an unknown reason is never silently dropped — fold it under the
+            // structural pre-filter bucket so the partition still holds.
+            $key = isset( $withheld[ $reason ] ) ? $reason : self::INLINE_REASON_NOT_INLINE_ELIGIBLE;
+            ++$withheld[ $key ];
+        }
+
+        $refsTotal = count( $refs );
+
+        return array(
+            'generated_at'              => time(),
+            'target'                    => $target,
+            'floor'                     => $floor,
+            'refs_total'                => $refsTotal,
+            'inline_eligible'           => $eligible,
+            'inline_eligible_pct'       => self::percentage( $eligible, $refsTotal ),
+            'withheld'                  => $withheld,
+            // Distinct WRONG-TEXT canary: a nonzero value is direct proof the modeled
+            // (source-family → target) set was incomplete for this corpus (spec §3.9).
+            'unmodeled_pair_wrong_text' => $withheld[ self::INLINE_REASON_UNMODELED_PAIR ],
+            'families'                  => $families,
+            'dominant_family'           => $dominant,
+            'heterogeneous'             => $heterogeneous,
+        );
+    }
+
+    /**
+     * Classify ONE in-canon, structurally-valid ref through the never-fail-WRONG L1–L9
+     * predicate, returning the FIRST failing reason or null when fully inline-eligible.
+     * Mirrors {@see \Sermonator\Frontend\BibleResolver::resolveInline()} layer-for-layer
+     * (so the audit predicts the live render) with one addition: the corpus-level
+     * `src-heterogeneous` overlay, slotted just BEFORE the L4 family check so that in a
+     * mixed corpus the MINORITY-tradition refs are tagged heterogeneous (the louder,
+     * attestation-violating signal) while a homogeneous-but-foreign corpus still reports
+     * the plain L4 `src-versification-unsupported`.
+     *
+     * @param array<string,mixed> $ref           In-canon, structurally-valid ref.
+     * @param string              $target        Inline target translation id (e.g. ENGWEBP).
+     * @param string              $floor         L2 confidence floor.
+     * @param string              $dominant      The corpus-dominant source-versification family bucket.
+     * @param bool                $heterogeneous Whether the corpus carries >1 family bucket.
+     */
+    private function classifyInlineRef( array $ref, string $target, string $floor, string $dominant, bool $heterogeneous ): ?string {
+        // L1 — pure structural inline-shape: a specific verse, not cross-chapter.
+        $verseStart = $ref['verseStart'] ?? null;
+        $chapterEnd = $ref['chapterEnd'] ?? null;
+        if ( null === $verseStart || null !== $chapterEnd ) {
+            return self::INLINE_REASON_NOT_INLINE_ELIGIBLE;
+        }
+
+        // L2 — confidence floor (default `exact`).
+        if ( ! self::confidenceClears( $ref, $floor ) ) {
+            return self::INLINE_REASON_LOW_CONFIDENCE;
+        }
+
+        // L3 — the inline TARGET translation must itself be inline-eligible.
+        if ( ! array_key_exists( $target, BibleTranslations::curatedInline() ) ) {
+            return self::INLINE_REASON_TRANSLATION_INELIGIBLE;
+        }
+
+        // Corpus overlay — in a heterogeneous corpus, a ref NOT in the dominant tradition
+        // bucket means the single site-wide attestation premise is false for it (wrong-text
+        // risk), so it is withheld as `src-heterogeneous` regardless of how its own family
+        // would otherwise gate.
+        $family = VersificationGate::familyCode( self::srcVersification( $ref ) );
+        $bucket = '' === $family ? 'unknown' : $family;
+        if ( $heterogeneous && $bucket !== $dominant ) {
+            return self::INLINE_REASON_SRC_HETEROGENEOUS;
+        }
+
+        // L4 — source versification must normalize to a modeled family.
+        if ( '' === $family ) {
+            return self::INLINE_REASON_SRC_UNSUPPORTED;
+        }
+
+        // L5–L7 — the (source-family → target) versification relation. Attestation is
+        // ASSUMED TRUE here (best-case ceiling); the gate returns the precise reason for
+        // an unmodeled pair (L5) or a divergent zone (L7). L6 cannot fire under attested.
+        $gate = VersificationGate::eligible( $ref, $target, true );
+        if ( ! $gate['eligible'] ) {
+            return (string) $gate['reason'];
+        }
+
+        // L8 — RENDER-CONTEXT parity: disk/cache ONLY, zero network (warmContext FALSE).
+        // An offline miss here is "not yet warmed/vendored", the audit's `cold-unwarmed`.
+        $book       = isset( $ref['bookUSFM'] ) && is_string( $ref['bookUSFM'] ) ? $ref['bookUSFM'] : '';
+        $chapterNum = isset( $ref['chapterStart'] ) ? (int) $ref['chapterStart'] : 0;
+        $chapter    = ( $this->chapterResolver )( $target, $book, $chapterNum, false );
+        if ( ! is_array( $chapter ) || array() === $chapter ) {
+            return self::INLINE_REASON_COLD_UNWARMED;
+        }
+
+        // L9 — every verse verseStart..verseEnd is physically present in the chapter.
+        if ( ! RefValidator::rangeWithinChapter( $ref, $chapter ) ) {
+            return self::INLINE_REASON_VERSE_OUT_OF_RANGE;
+        }
+
+        return null;
+    }
+
+    /**
+     * Flatten every in-canon, structurally-valid ref across the corpus (the same
+     * render-ready universe {@see self::anyResolves()} counts, but per-ref). Reads each
+     * post's refs via {@see self::refsForPost()} (stored envelope, else live parse).
+     *
+     * @param list<int> $ids
+     *
+     * @return list<array<string,mixed>>
+     */
+    private function corpusRefs( array $ids ): array {
+        $out = array();
+
+        foreach ( $ids as $id ) {
+            $id      = (int) $id;
+            $passage = (string) get_post_meta( $id, ID::META_BIBLE_PASSAGE, true );
+            if ( '' === trim( $passage ) ) {
+                continue;
+            }
+
+            foreach ( $this->refsForPost( $id, $passage ) as $ref ) {
+                $flags = RefValidator::validate( $ref );
+                if ( $flags['inCanon'] && $flags['structurallyValid'] ) {
+                    $out[] = $ref;
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Histogram of source-versification family buckets across the corpus refs. An
+     * unrecognized/empty `srcVersification` buckets under the literal `unknown` so a
+     * corpus that MIXES a known English tradition with a foreign one reads as
+     * heterogeneous (more than one bucket) rather than silently collapsing.
+     *
+     * @param list<array<string,mixed>> $refs
+     *
+     * @return array<string,int>
+     */
+    private static function familyHistogram( array $refs ): array {
+        $hist = array();
+
+        foreach ( $refs as $ref ) {
+            $family = VersificationGate::familyCode( self::srcVersification( $ref ) );
+            $bucket = '' === $family ? 'unknown' : $family;
+            $hist[ $bucket ] = ( $hist[ $bucket ] ?? 0 ) + 1;
+        }
+
+        return $hist;
+    }
+
+    /**
+     * The dominant (modal) family bucket, or '' when the corpus has no refs. Ties break
+     * deterministically toward the first-seen bucket so the report is reproducible.
+     *
+     * @param array<string,int> $families
+     */
+    private static function dominantFamily( array $families ): string {
+        $dominant = '';
+        $best     = -1;
+
+        foreach ( $families as $bucket => $count ) {
+            if ( $count > $best ) {
+                $best     = $count;
+                $dominant = (string) $bucket;
+            }
+        }
+
+        return $dominant;
+    }
+
+    /**
+     * L2 — does the ref's `confidence` tier rank at or above the configured floor?
+     * Unknown/absent tiers rank 0 and never clear (never-fail-WRONG).
+     *
+     * @param array<string,mixed> $ref
+     */
+    private static function confidenceClears( array $ref, string $floor ): bool {
+        $floorRank = self::CONFIDENCE_RANK[ $floor ] ?? self::CONFIDENCE_RANK['exact'];
+        $refConf   = isset( $ref['confidence'] ) && is_string( $ref['confidence'] ) ? $ref['confidence'] : '';
+        $refRank   = self::CONFIDENCE_RANK[ $refConf ] ?? 0;
+
+        return $refRank > 0 && $refRank >= $floorRank;
+    }
+
+    /**
+     * The configured L2 confidence floor, validated to a known tier (default + fallback
+     * `exact`, the most conservative). Mirrors the resolver's reader.
+     */
+    private static function confidenceFloor(): string {
+        $stored = get_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR, 'exact' );
+        $stored = is_string( $stored ) ? $stored : 'exact';
+
+        return isset( self::CONFIDENCE_RANK[ $stored ] ) ? $stored : 'exact';
+    }
+
+    /**
+     * Read a ref's `srcVersification` as a string ('' when absent/non-string).
+     *
+     * @param array<string,mixed> $ref
+     */
+    private static function srcVersification( array $ref ): string {
+        $value = $ref['srcVersification'] ?? '';
+
+        return is_string( $value ) ? $value : '';
     }
 
     /**
@@ -256,6 +605,8 @@ final class CoverageAudit {
             ) . '</p>';
         }
 
+        $description .= $this->inlineDescription( $stats );
+
         return array(
             'label'       => $label,
             'status'      => $status,
@@ -264,6 +615,57 @@ final class CoverageAudit {
             'actions'     => '',
             'test'        => self::SITE_HEALTH_TEST,
         );
+    }
+
+    /**
+     * The Site Health inline corpus-gate paragraph(s), built PURELY from the persisted
+     * rollup's `inline` sub-report (no recompute, no write). Empty string when the
+     * rollup predates the 3b extension (back-compat) or carries no refs. Surfaces the
+     * inline-eligible% and — LOUDLY — the two wrong-text canaries (the unmodeled-pair
+     * counter and corpus heterogeneity), because a green parse-coverage headline must
+     * never hide a mis-versification.
+     *
+     * @param array<string,mixed> $stats
+     */
+    private function inlineDescription( array $stats ): string {
+        $inline = isset( $stats['inline'] ) && is_array( $stats['inline'] ) ? $stats['inline'] : array();
+        if ( ! isset( $inline['refs_total'] ) || (int) $inline['refs_total'] <= 0 ) {
+            return '';
+        }
+
+        $pct      = isset( $inline['inline_eligible_pct'] ) ? (float) $inline['inline_eligible_pct'] : 0.0;
+        $eligible = (int) ( $inline['inline_eligible'] ?? 0 );
+        $total    = (int) $inline['refs_total'];
+
+        $out = '<p>' . esc_html(
+            sprintf(
+                /* translators: 1: percentage, 2: eligible ref count, 3: total ref count. */
+                __( '%1$s%% of scripture references are inline-eligible (%2$d of %3$d) under the never-fail-wrong gate; the rest fall back to a link.', 'sermonator' ),
+                self::formatPercent( $pct ),
+                $eligible,
+                $total
+            )
+        ) . '</p>';
+
+        $wrongText = (int) ( $inline['unmodeled_pair_wrong_text'] ?? 0 );
+        if ( $wrongText > 0 ) {
+            $out .= '<p>' . esc_html(
+                sprintf(
+                    /* translators: %d: count of references hitting an unmodeled versification pair. */
+                    __( 'WARNING: %d reference(s) use an unmodeled source/target versification pair — proof the divergent-zone table is incomplete. Do NOT enable inline scripture at scale until these are modeled.', 'sermonator' ),
+                    $wrongText
+                )
+            ) . '</p>';
+        }
+
+        if ( ! empty( $inline['heterogeneous'] ) ) {
+            $out .= '<p>' . esc_html__(
+                'WARNING: the corpus mixes more than one source-versification tradition. The single site-wide attestation is unsafe; inline rendering could surface real-but-wrong verses for the minority tradition.',
+                'sermonator'
+            ) . '</p>';
+        }
+
+        return $out;
     }
 
     /**

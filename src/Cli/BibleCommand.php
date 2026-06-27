@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Sermonator\Cli;
 
+use Sermonator\Bible\CoverageAudit;
 use Sermonator\Frontend\Bible\BibleWarmer;
 use Sermonator\Migration\BibleChapterVendor;
 use Sermonator\Migration\BibleRefsBackfill;
@@ -19,6 +20,7 @@ use Sermonator\Schema\Identifiers as ID;
  *   wp sermonator bible flush
  *   wp sermonator bible vendor [--translation=<id>] [--write] [--force] [--limit=<n>] [--rollback]
  *   wp sermonator bible warm [--limit=<n>] [--rollback]
+ *   wp sermonator bible audit [--inline]
  *
  * Phase 3a was LINK-MODE only. Phase 3b Task 8 adds the `vendor` subcommand (vendor the
  * public-domain ENGWEBP per-chapter text to the uploads snapshot, reversibly). Phase 3b
@@ -318,5 +320,105 @@ final class BibleCommand {
             $result['failed']
         ) );
         \WP_CLI::success( sprintf( 'Warmed %d chapter(s) for %s.', $result['warmed'], $result['translation'] ) );
+    }
+
+    /**
+     * READ-ONLY corpus-gate report. Delegates to {@see CoverageAudit}, which owns the
+     * never-fail-WRONG L1–L9 classification and writes NOTHING on this path (the
+     * standalone instrument the operator runs BEFORE deciding to enable inline at scale —
+     * the §3.9 / Task 16 go/no-go).
+     *
+     * Without `--inline` it prints the persisted parse-coverage rollup (a pure read of
+     * {@see ID::OPTION_BIBLE_STATS}; recomputed only by the cron / on-save path). With
+     * `--inline` it computes the inline withheld-by-reason tally + inline-eligible% fresh
+     * over the live corpus and prints it — still WITHOUT persisting anything.
+     *
+     * ## OPTIONS
+     *
+     * [--inline]
+     * : Run the inline corpus-gate report (withheld-by-reason, inline-eligible%, and the
+     *   unmodeled-pair WRONG-TEXT canary) instead of the parse-coverage summary.
+     *
+     * ## EXAMPLES
+     *
+     *     wp sermonator bible audit
+     *     wp sermonator bible audit --inline
+     *
+     * @param array<int,string>    $args
+     * @param array<string,string> $assoc_args
+     */
+    public function audit( array $args, array $assoc_args ): void {
+        $audit = new CoverageAudit();
+
+        if ( empty( $assoc_args['inline'] ) ) {
+            $this->reportParseCoverage( CoverageAudit::stats() );
+            return;
+        }
+
+        $this->reportInline( $audit->inlineReport() );
+    }
+
+    /**
+     * Print the persisted parse-coverage rollup (pure read; never recomputed here).
+     *
+     * @param array<string,mixed> $stats
+     */
+    private function reportParseCoverage( array $stats ): void {
+        if ( ! isset( $stats['with_passage'] ) ) {
+            \WP_CLI::warning( 'Parse-coverage has not been computed yet (runs on the daily cron and on sermon save).' );
+            return;
+        }
+
+        \WP_CLI::log( sprintf(
+            'Parse-coverage: %s%% (%d of %d sermons with a passage resolve to a link).',
+            (string) ( $stats['parse_coverage'] ?? 0 ),
+            (int) ( $stats['resolved'] ?? 0 ),
+            (int) $stats['with_passage']
+        ) );
+        \WP_CLI::log( 'Pass --inline for the inline corpus-gate report.' );
+        \WP_CLI::success( 'Parse-coverage report complete (no writes).' );
+    }
+
+    /**
+     * Print the READ-ONLY inline corpus-gate report: the inline-eligible% over the
+     * corpus, the withheld-by-reason tally, and — loudly — the unmodeled-pair WRONG-TEXT
+     * canary and any source-versification heterogeneity. Writes nothing.
+     *
+     * @param array{target:string,floor:string,refs_total:int,inline_eligible:int,inline_eligible_pct:float,withheld:array<string,int>,unmodeled_pair_wrong_text:int,families:array<string,int>,dominant_family:string,heterogeneous:bool} $report
+     */
+    private function reportInline( array $report ): void {
+        \WP_CLI::log( sprintf(
+            'Inline corpus-gate (target %s, confidence floor %s):',
+            $report['target'],
+            $report['floor']
+        ) );
+        \WP_CLI::log( sprintf(
+            '  inline-eligible: %s%% (%d of %d render-ready references).',
+            (string) $report['inline_eligible_pct'],
+            $report['inline_eligible'],
+            $report['refs_total']
+        ) );
+
+        \WP_CLI::log( '  withheld by reason:' );
+        foreach ( $report['withheld'] as $reason => $count ) {
+            \WP_CLI::log( sprintf( '    - %-30s %d', $reason, $count ) );
+        }
+
+        if ( $report['unmodeled_pair_wrong_text'] > 0 ) {
+            \WP_CLI::warning( sprintf(
+                'WRONG-TEXT canary: %d reference(s) hit an UNMODELED versification pair — direct proof the divergent-zone table is incomplete. Model these before enabling inline at scale.',
+                $report['unmodeled_pair_wrong_text']
+            ) );
+        }
+
+        if ( $report['heterogeneous'] ) {
+            \WP_CLI::warning( sprintf(
+                'Source-versification HETEROGENEITY: the corpus carries %d distinct family bucket(s) (dominant: %s). The single site-wide attestation is unsafe — inline could surface real-but-wrong verses for the minority tradition.',
+                count( $report['families'] ),
+                '' === $report['dominant_family'] ? '(none)' : $report['dominant_family']
+            ) );
+        }
+
+        \WP_CLI::success( 'Inline corpus-gate report complete (read-only; no writes).' );
     }
 }
