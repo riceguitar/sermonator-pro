@@ -50,8 +50,21 @@ final class SermonMetaRegistrarTest extends TestCase {
             Identifiers::META_VIDEO_EMBED,
             Identifiers::META_NOTES,
             Identifiers::META_BULLETIN,
+            Identifiers::META_BIBLE_REFS,
         );
         $this->assertSame( $expected, $keys );
+    }
+
+    public function test_bible_refs_envelope_registered_as_rest_string_with_auth(): void {
+        ( new SermonMetaRegistrar() )->register();
+
+        $refs = $this->find( Identifiers::META_BIBLE_REFS );
+        $this->assertNotNull( $refs, 'META_BIBLE_REFS is exposed to the REST write (confirm-chip flow).' );
+        // Stored as a JSON STRING (producer/backfill/consumer + fixity parity), NOT an
+        // object — the envelope semantics are enforced by SermonRefsRestSanitizer.
+        $this->assertSame( array( 'schema' => array( 'type' => 'string' ) ), $refs['args']['show_in_rest'] );
+        $this->assertSame( '', $refs['args']['default'] );
+        $this->assertIsCallable( $refs['args']['auth_callback'] );
     }
 
     public function test_all_fields_are_single_on_sermon_post_type_and_exposed_to_rest(): void {

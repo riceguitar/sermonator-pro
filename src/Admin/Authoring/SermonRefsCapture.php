@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Sermonator\Admin\Authoring;
 
 use Sermonator\Bible\RefsCapture;
+use Sermonator\Bible\ReferenceParser;
 use Sermonator\Schema\Identifiers;
 
 /**
@@ -113,13 +114,29 @@ final class SermonRefsCapture {
      * re-derived from the CURRENT passage on every save. The producer's fill-missing
      * skip is keyed on envelope EXISTENCE, so without this an edit of the passage
      * (e.g. "John 3:16" -> "Romans 5:1") is a permanent no-op and the single-sermon
-     * scripture row keeps rendering the OLD reference + link (silently wrong). We delete
-     * the stale envelope here so the producer re-derives it — EXCEPT a Phase-3b
-     * author-CONFIRMED envelope (any ref with confidence 'exact', a value RefsCapture
-     * reserves for the confirm-chip flow and never emits on auto-parse), which is
-     * sacrosanct. The backfill caller does NOT clear, so its frozen-data idempotency is
-     * untouched. (Stale TAX_BOOK terms may linger additively on refresh — never data
-     * loss, matching reverse()'s same never-clobber trade-off.)
+     * scripture row keeps rendering the OLD reference + link (silently wrong).
+     *
+     * Phase 3b (Task 12) hardens this to operate PER-REF rather than all-or-nothing.
+     * The earlier rule — "if ANY ref is confidence:'exact', preserve the WHOLE envelope"
+     * — left an orphaned confirmed verse rendering inline TEXT after the author rewrote
+     * the passage to no longer mention it (confirm "John 3:16" → render inline → rewrite
+     * passage to "Romans 5:1" → John 3:16 verse text still shown). Under never-fail-WRONG
+     * that orphan is the one unacceptable outcome. So we now, per ref:
+     *   - auto-parse refs (confidence !== 'exact'): always DROP — the producer re-derives
+     *     them from the current passage below;
+     *   - author-confirmed refs (confidence === 'exact'): keep ONLY when their
+     *     (book, chapter, verseStart) still appears in the CURRENT passage parse; an
+     *     exact ref the passage no longer contains is an orphan and is DROPPED.
+     * If no exact ref survives we delete the whole envelope so the producer re-derives a
+     * fresh auto-parse; if some survive we rewrite the envelope down to exactly those
+     * (the producer then no-ops on the still-present envelope, so the confirmed set stays
+     * authoritative and is never auto-widened).
+     *
+     * Falling open (dropping a ref) is always free; the raw passage is preserved and the
+     * 3a link still renders. The backfill caller does NOT clear, so its frozen-data
+     * idempotency is untouched. NEVER touches META_BIBLE_PASSAGE. (Stale TAX_BOOK terms
+     * may linger additively on refresh — never data loss, matching reverse()'s same
+     * never-clobber trade-off.)
      */
     private function clearStaleAutoParseEnvelope( int $post_id ): void {
         $raw = (string) get_post_meta( $post_id, Identifiers::META_BIBLE_REFS, true );
@@ -129,12 +146,101 @@ final class SermonRefsCapture {
 
         $env  = json_decode( $raw, true );
         $refs = ( is_array( $env ) && isset( $env['refs'] ) && is_array( $env['refs'] ) ) ? $env['refs'] : array();
+        if ( array() === $refs ) {
+            // Malformed or empty envelope — clear so the producer re-derives cleanly.
+            delete_post_meta( $post_id, Identifiers::META_BIBLE_REFS );
+            return;
+        }
+
+        $passage = (string) get_post_meta( $post_id, Identifiers::META_BIBLE_PASSAGE, true );
+        $present = $this->passageVerseKeys( $passage );
+
+        $survivors = array();
         foreach ( $refs as $ref ) {
-            if ( is_array( $ref ) && ( $ref['confidence'] ?? '' ) === 'exact' ) {
-                return; // Phase-3b author-confirmed — never clobber.
+            if ( ! is_array( $ref ) ) {
+                continue;
+            }
+            if ( ( $ref['confidence'] ?? '' ) !== 'exact' ) {
+                continue; // auto-parse ref — producer re-derives from the current passage.
+            }
+            if ( $this->refStillInPassage( $ref, $present ) ) {
+                $survivors[] = $ref;
+            }
+            // else: orphaned confirmed ref — drop it (never render a verse the passage lost).
+        }
+
+        if ( array() === $survivors ) {
+            delete_post_meta( $post_id, Identifiers::META_BIBLE_REFS );
+            return;
+        }
+
+        // Preserve the original envelope version; keep only the surviving confirmed refs.
+        $version = ( is_array( $env ) && isset( $env['v'] ) ) ? $env['v'] : RefsCapture::ENVELOPE_VERSION;
+        update_post_meta(
+            $post_id,
+            Identifiers::META_BIBLE_REFS,
+            (string) wp_json_encode(
+                array(
+                    'v'    => $version,
+                    'refs' => array_values( $survivors ),
+                )
+            )
+        );
+    }
+
+    /**
+     * Build the set of (book, chapter, verseStart) keys the CURRENT passage parses to.
+     * Only verse-specific refs are keyed — a chapter-only ref has no verse to orphan.
+     *
+     * @return array<string,true>
+     */
+    private function passageVerseKeys( string $passage ): array {
+        if ( '' === trim( $passage ) ) {
+            return array();
+        }
+
+        $keys = array();
+        foreach ( ReferenceParser::parse( $passage )['segments'] as $segment ) {
+            foreach ( $segment['refs'] as $ref ) {
+                if ( ! is_array( $ref ) ) {
+                    continue;
+                }
+                $key = $this->verseKey( $ref );
+                if ( null !== $key ) {
+                    $keys[ $key ] = true;
+                }
             }
         }
 
-        delete_post_meta( $post_id, Identifiers::META_BIBLE_REFS );
+        return $keys;
+    }
+
+    /**
+     * @param array<string,mixed>  $ref
+     * @param array<string,true>   $present
+     */
+    private function refStillInPassage( array $ref, array $present ): bool {
+        $key = $this->verseKey( $ref );
+
+        return null !== $key && isset( $present[ $key ] );
+    }
+
+    /**
+     * The (book, chapter, verseStart) identity key for a ref, or null when it is not a
+     * verse-specific reference (no book or no start verse).
+     *
+     * @param array<string,mixed> $ref
+     */
+    private function verseKey( array $ref ): ?string {
+        $book  = is_string( $ref['bookUSFM'] ?? null ) ? $ref['bookUSFM'] : '';
+        $verse = ( isset( $ref['verseStart'] ) && null !== $ref['verseStart'] ) ? (int) $ref['verseStart'] : null;
+
+        if ( '' === $book || null === $verse ) {
+            return null;
+        }
+
+        $chapter = (int) ( $ref['chapterStart'] ?? 0 );
+
+        return $book . '|' . $chapter . '|' . $verse;
     }
 }

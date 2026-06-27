@@ -37,6 +37,36 @@ final class SermonMetaRegistrar {
         $this->registerString( Identifiers::META_VIDEO_EMBED );
         $this->registerString( Identifiers::META_NOTES );
         $this->registerString( Identifiers::META_BULLETIN );
+        $this->registerRefsEnvelope();
+    }
+
+    /**
+     * Expose the structured-reference envelope to the REST write so the block-editor
+     * confirm-chip flow (Phase 3b, Task 12) can submit author-confirmed refs.
+     *
+     * Stored as a JSON STRING, NOT an object: the shared {@see \Sermonator\Bible\RefsCapture}
+     * producer, the migration backfill, and every downstream consumer (plus the Verifier's
+     * fixity manifest — #1 data preservation) read it as a JSON string, and switching the
+     * storage format to a serialized object would diverge all of them. The object/envelope
+     * semantics are enforced server-side by {@see SermonRefsRestSanitizer} on
+     * rest_pre_insert, which re-decodes the submitted envelope, drops invalid refs, caps
+     * the count, and stamps the trusted provenance (source/confidence/srcVersification*)
+     * — the client's values are never trusted. The auth_callback below is the same gate
+     * as every other editable key: inert during migration AND edit_post on the object.
+     */
+    private function registerRefsEnvelope(): void {
+        register_post_meta(
+            Identifiers::POST_TYPE_SERMON,
+            Identifiers::META_BIBLE_REFS,
+            array(
+                'single'        => true,
+                'default'       => '',
+                'show_in_rest'  => array(
+                    'schema' => array( 'type' => 'string' ),
+                ),
+                'auth_callback' => $this->authCallback(),
+            )
+        );
     }
 
     private function authCallback(): callable {

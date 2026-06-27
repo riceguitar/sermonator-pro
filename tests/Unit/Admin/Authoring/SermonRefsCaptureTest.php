@@ -181,10 +181,33 @@ namespace Sermonator\Tests\Unit\Admin\Authoring {
             $this->assertSame( 'authoring', $envelope['refs'][0]['source'] );
         }
 
-        public function test_author_confirmed_exact_envelope_is_never_clobbered(): void {
-            // A Phase-3b author-CONFIRMED envelope (any ref confidence 'exact') is
-            // sacrosanct — an authoring re-save must NOT overwrite it even if the free-text
-            // passage now differs.
+        public function test_confirmed_exact_ref_preserved_when_still_in_passage(): void {
+            // A Phase-3b author-CONFIRMED ref (confidence 'exact') survives a re-save when
+            // its (book,chapter,verse) STILL appears in the current passage parse — even
+            // alongside newly-added free text.
+            $this->meta[ $this->postId ][ ID::META_BIBLE_REFS ] = json_encode( array(
+                'v'    => 1,
+                'refs' => array(
+                    array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16, 'verseEnd' => 16, 'chapterEnd' => null, 'raw' => 'John 3:16', 'source' => 'authoring', 'confidence' => 'exact', 'srcVersification' => 'ESV' ),
+                ),
+            ) );
+            $this->meta[ $this->postId ][ ID::META_BIBLE_PASSAGE ] = 'John 3:16 and Romans 5:1';
+
+            ( new SermonRefsCapture() )->capture( $this->postId, $this->post() );
+
+            $envelope = $this->envelope();
+            // The producer no-ops on the still-present envelope: only the confirmed ref
+            // remains (the confirmed set is authoritative and is never auto-widened).
+            $this->assertCount( 1, $envelope['refs'] );
+            $this->assertSame( 'JHN', $envelope['refs'][0]['bookUSFM'], 'Confirmed ref still in the passage is preserved.' );
+            $this->assertSame( 'exact', $envelope['refs'][0]['confidence'] );
+        }
+
+        public function test_orphan_exact_ref_dropped_on_passage_rewrite(): void {
+            // never-fail-WRONG: a confirmed ref the rewritten passage no longer mentions
+            // is an ORPHAN and must be dropped, so its inline verse text can never render
+            // for a passage that lost it. With no surviving confirmed ref the producer
+            // re-derives a fresh auto-parse from the new passage.
             $this->meta[ $this->postId ][ ID::META_BIBLE_REFS ] = json_encode( array(
                 'v'    => 1,
                 'refs' => array(
@@ -196,8 +219,31 @@ namespace Sermonator\Tests\Unit\Admin\Authoring {
             ( new SermonRefsCapture() )->capture( $this->postId, $this->post() );
 
             $envelope = $this->envelope();
-            $this->assertSame( 'JHN', $envelope['refs'][0]['bookUSFM'], 'Author-confirmed (exact) envelope is preserved, not refreshed.' );
-            $this->assertSame( 'exact', $envelope['refs'][0]['confidence'] );
+            $this->assertCount( 1, $envelope['refs'] );
+            $this->assertSame( 'ROM', $envelope['refs'][0]['bookUSFM'], 'Orphaned confirmed ref dropped; passage re-derived.' );
+            $this->assertSame( 'authoring', $envelope['refs'][0]['source'] );
+            $this->assertNotSame( 'exact', $envelope['refs'][0]['confidence'], 'Re-derived ref is an auto-parse, not confirmed.' );
+        }
+
+        public function test_partial_survival_keeps_present_exact_drops_orphan(): void {
+            // Two confirmed refs; the passage is rewritten to keep only one of them. The
+            // present one survives, the orphan is dropped, and the producer no-ops on the
+            // surviving envelope (no auto-widening to the new free text).
+            $this->meta[ $this->postId ][ ID::META_BIBLE_REFS ] = json_encode( array(
+                'v'    => 1,
+                'refs' => array(
+                    array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16, 'verseEnd' => 16, 'chapterEnd' => null, 'raw' => 'John 3:16', 'source' => 'authoring', 'confidence' => 'exact', 'srcVersification' => 'ESV' ),
+                    array( 'bookUSFM' => 'ROM', 'chapterStart' => 5, 'verseStart' => 1, 'verseEnd' => 1, 'chapterEnd' => null, 'raw' => 'Romans 5:1', 'source' => 'authoring', 'confidence' => 'exact', 'srcVersification' => 'ESV' ),
+                ),
+            ) );
+            $this->meta[ $this->postId ][ ID::META_BIBLE_PASSAGE ] = 'Romans 5:1';
+
+            ( new SermonRefsCapture() )->capture( $this->postId, $this->post() );
+
+            $envelope = $this->envelope();
+            $this->assertCount( 1, $envelope['refs'], 'Only the still-present confirmed ref survives.' );
+            $this->assertSame( 'ROM', $envelope['refs'][0]['bookUSFM'] );
+            $this->assertSame( 'exact', $envelope['refs'][0]['confidence'], 'Surviving ref keeps its confirmed status.' );
         }
     }
 }
