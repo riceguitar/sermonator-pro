@@ -123,6 +123,86 @@ final class RefValidator {
         return self::DIVERGENT_ZONES;
     }
 
+    /**
+     * Render-time confirmation (spec L9): is EVERY verse number in the ref's
+     * verseStart..verseEnd span physically present in the fetched, normalized
+     * chapter?
+     *
+     * $chapter is the normalized flat shape produced by ChapterNormalizer:
+     * a list of `{number:int, nodes:[...]}` entries, one per verse the public
+     * text actually contains. This is a pure presence check with NO I/O.
+     *
+     * It is the final fail-open valve of the never-fail-WRONG spine, catching
+     * two failure modes that the pure pre-filter cannot see without chapter data:
+     *   1. OUT-OF-RANGE ends — a ref whose verseEnd exceeds the chapter's last
+     *      verse (e.g. asking for v25 of a 23-verse chapter).
+     *   2. Critical-text verse-number GAPS — public-domain editions (WEB/ENGWEBP)
+     *      omit verses present in the source versification (e.g. a missing
+     *      Matthew 16:24-style omission), leaving a hole in the numbering.
+     *
+     * A SINGLE missing verse fails the WHOLE ref (returns false), so the caller
+     * falls open to the 3a link rather than rendering a partial range that would
+     * silently imply a skipped verse. Presence is NOT correspondence: this proves
+     * the numbers exist, not that they map to the same words — RENUMBER shifts are
+     * the versification gate's job, not this method's.
+     *
+     * Conservative by construction: a chapter-only ref (no verseStart) or a
+     * cross-chapter ref (chapterEnd set, which cannot be confirmed against a
+     * single chapter) returns false — withhold inline, show the link.
+     *
+     * @param array{verseStart?:?int,verseEnd?:?int,chapterEnd?:?int} $ref
+     * @param list<array{number?:int}>                                $chapter Normalized flat chapter: one entry per present verse.
+     */
+    public static function rangeWithinChapter( array $ref, array $chapter ): bool {
+        $verseStart = $ref['verseStart'] ?? null;
+        $verseEnd   = $ref['verseEnd'] ?? null;
+        $chapterEnd = $ref['chapterEnd'] ?? null;
+
+        // No specific verse, or a cross-chapter span that a single chapter cannot
+        // possibly confirm: fail open to the link.
+        if ( null === $verseStart || null !== $chapterEnd ) {
+            return false;
+        }
+
+        // A single verse when verseEnd is absent; never widen the span.
+        $end = $verseEnd ?? $verseStart;
+
+        // A descending span is meaningless to confirm: fail open.
+        if ( $end < $verseStart ) {
+            return false;
+        }
+
+        $present = self::presentVerseNumbers( $chapter );
+
+        for ( $verse = $verseStart; $verse <= $end; $verse++ ) {
+            if ( ! isset( $present[ $verse ] ) ) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Collect the set of verse numbers physically present in a normalized chapter.
+     * Returned as an int-keyed map for O(1) membership tests.
+     *
+     * @param list<array{number?:int}> $chapter
+     *
+     * @return array<int,true>
+     */
+    private static function presentVerseNumbers( array $chapter ): array {
+        $present = array();
+
+        foreach ( $chapter as $entry ) {
+            if ( is_array( $entry ) && isset( $entry['number'] ) && is_int( $entry['number'] ) ) {
+                $present[ $entry['number'] ] = true;
+            }
+        }
+
+        return $present;
+    }
+
     private static function isStructurallyValid( int $chapterStart, ?int $verseStart, ?int $verseEnd, ?int $chapterEnd ): bool {
         if ( $chapterStart < 1 ) {
             return false;

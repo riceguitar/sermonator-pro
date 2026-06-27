@@ -201,4 +201,99 @@ final class RefValidatorTest extends TestCase {
         $this->assertFalse( RefValidator::isVersificationDivergent( 'REV', 1 ) );
         $this->assertFalse( RefValidator::isVersificationDivergent( 'JHN', 3 ) );
     }
+
+    // ---------------------------------------------------------------------
+    // rangeWithinChapter (spec L9): the render-time fail-open valve.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Build a normalized flat chapter ({number, nodes}) from a list of verse
+     * numbers, in the shape ChapterNormalizer emits.
+     *
+     * @param list<int> $numbers
+     *
+     * @return list<array{number:int,nodes:list<array{type:string,text:string}>}>
+     */
+    private function chapter( array $numbers ): array {
+        return array_map(
+            static fn ( int $n ): array => array(
+                'number' => $n,
+                'nodes'  => array( array( 'type' => 'text', 'text' => "verse {$n}" ) ),
+            ),
+            $numbers
+        );
+    }
+
+    public function test_range_within_chapter_full_present_range_passes(): void {
+        // Matthew 16:24-26, all three verses present.
+        $chapter = $this->chapter( range( 1, 28 ) );
+        $ref     = $this->ref(
+            array( 'bookUSFM' => 'MAT', 'chapterStart' => 16, 'verseStart' => 24, 'verseEnd' => 26 )
+        );
+        $this->assertTrue( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_single_present_verse_passes(): void {
+        $chapter = $this->chapter( range( 1, 31 ) );
+        $ref     = $this->ref(
+            array( 'verseStart' => 16, 'verseEnd' => null )
+        );
+        $this->assertTrue( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_critical_text_gap_fails_whole_ref(): void {
+        // WEB critical-text omits 16:24 (a verse-number gap). The WHOLE ref
+        // 16:23-25 must fail open to the link, never render a partial range.
+        $chapter = $this->chapter( array( 21, 22, 23, 25, 26 ) ); // 24 is missing.
+        $ref     = $this->ref(
+            array( 'bookUSFM' => 'MAT', 'chapterStart' => 16, 'verseStart' => 23, 'verseEnd' => 25 )
+        );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_out_of_range_end_fails(): void {
+        // Chapter has only 23 verses; asking through v25 must fail.
+        $chapter = $this->chapter( range( 1, 23 ) );
+        $ref     = $this->ref(
+            array( 'verseStart' => 22, 'verseEnd' => 25 )
+        );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_out_of_range_single_verse_fails(): void {
+        $chapter = $this->chapter( range( 1, 23 ) );
+        $ref     = $this->ref(
+            array( 'verseStart' => 24, 'verseEnd' => null )
+        );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_chapter_only_ref_fails_open(): void {
+        // No verseStart: nothing to confirm -> withhold inline.
+        $chapter = $this->chapter( range( 1, 31 ) );
+        $ref     = $this->ref(
+            array( 'verseStart' => null, 'verseEnd' => null )
+        );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_cross_chapter_ref_fails_open(): void {
+        // chapterEnd set: a single chapter cannot confirm a cross-chapter span.
+        $chapter = $this->chapter( range( 1, 53 ) );
+        $ref     = $this->ref(
+            array(
+                'bookUSFM'     => 'JHN',
+                'chapterStart' => 7,
+                'verseStart'   => 53,
+                'verseEnd'     => 11,
+                'chapterEnd'   => 8,
+            )
+        );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_empty_chapter_fails(): void {
+        $ref = $this->ref( array( 'verseStart' => 1, 'verseEnd' => null ) );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, array() ) );
+    }
 }
