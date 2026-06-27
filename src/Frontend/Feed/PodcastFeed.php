@@ -72,6 +72,13 @@ final class PodcastFeed {
 
         $config = $factory->fromPost( $podcastId, $feedUrl );
 
+        // Audio/video `sermons_to_show` MODE fail-visible (spec §2.10, T9). The feed serves audio-only
+        // — today's behavior, KEPT. Legacy SM Pro also supported video / *_priority modes whose feed
+        // faithfulness is a RECORDED §63 deferral (unbuilt). For any podcast requesting a non-audio
+        // mode, fire an observable signal and KEEP (never retire) that podcast's per-feed review
+        // notice — the audio-only set still serves, but the divergence is fail-visible, not silent.
+        $this->signalUnsupportedMode( $podcastId, new PodcastModeResolver() );
+
         // Per-podcast feed SCOPE (spec §2.8, the bundle's never-fail-WRONG budget). The resolved
         // scope is fed to SermonQuery via its EXISTING `taxonomies` arg (buildTaxQuery: relation=AND
         // across taxonomies, IN within — byte-identical to Pro's filter_the_query). This is the
@@ -118,6 +125,23 @@ final class PodcastFeed {
             return array();
         }
         return $resolver->forPodcast( $podcastId );
+    }
+
+    /**
+     * Fire the fail-visible `sermonator_feed_mode_unsupported` signal when a podcast requests a
+     * non-audio `sermons_to_show` mode (spec §2.10, T9). Decoupled from render() so this §63-deferral
+     * decision is unit-testable WITHOUT the WP_Query/feed-render stack — mirroring feedScope().
+     *
+     * Audio-only / unset mode = faithful = NO signal (the feed already serves audio-only). A non-audio
+     * mode is a RECORDED §63 deferral whose feed faithfulness is unbuilt: fire the signal carrying the
+     * requested mode so the divergence is observable, and the podcast's per-feed review notice is KEPT
+     * (NOT retired) — never serving the wrong item-set as if faithful.
+     */
+    private function signalUnsupportedMode( int $podcastId, PodcastModeResolver $resolver ): void {
+        $mode = $resolver->unsupportedMode( $podcastId );
+        if ( $mode !== null ) {
+            do_action( 'sermonator_feed_mode_unsupported', $podcastId, $mode );
+        }
     }
 
     /** Number of published podcasts (capped at 2 — callers only need to know if >1). */

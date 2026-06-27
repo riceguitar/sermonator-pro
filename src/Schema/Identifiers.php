@@ -45,6 +45,18 @@ final class Identifiers {
 
     public const OPTION_PREFIX                  = 'sermonator_';
     public const META_PODCAST_SETTINGS          = 'sermonator_podcast_settings';
+
+    /**
+     * Sub-key INSIDE the {@see self::META_PODCAST_SETTINGS} blob selecting which sermon medium the
+     * feed serves (legacy Pro "Sermons to show"). Migrated VERBATIM from the legacy
+     * `sm_podcast_settings['sermons_to_show']` (it is not a taxonomy key, so {@see
+     * \Sermonator\Migration\PodcastWriter} passes it through unchanged and {@see
+     * \Sermonator\Schema\PodcastMetaSchema} preserves it). Legacy values: empty/absent = audio-only
+     * (today's faithful behavior), `video` / `audio_priority` / `video_priority` = non-audio modes
+     * whose faithfulness is a recorded §63 deferral. Read by {@see
+     * \Sermonator\Frontend\Feed\PodcastModeResolver}.
+     */
+    public const PODCAST_SETTING_FEED_MODE      = 'sermons_to_show';
     public const OPTION_DEFAULT_PODCAST         = 'sermonator_default_podcast';
     public const OPTION_TERM_IMAGES             = 'sermonator_term_images';
     public const OPTION_TERM_IMAGES_SETTINGS    = 'sermonator_term_images_settings';
