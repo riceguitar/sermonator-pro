@@ -113,16 +113,22 @@ final class CoverageAudit {
     public const INLINE_REASON_VERSE_OUT_OF_RANGE   = 'verse-out-of-range';
 
     /**
-     * Confidence tiers ranked HIGH → LOW for the L2 floor check — kept in lockstep with
-     * {@see \Sermonator\Frontend\BibleResolver}'s identical table so the audit predicts
-     * the live decision exactly. `ambiguous`/unknown/absent rank 0 and never inline.
+     * STORED confidence tiers ranked HIGH → LOW for the L2 floor check — kept in BYTE-
+     * lockstep with {@see \Sermonator\Frontend\BibleResolver::STORED_CONFIDENCE_RANK} so
+     * the audit predicts the live decision exactly. The vocabulary is **de-stored**
+     * (design §3.4): it is DISJOINT from the floor vocabulary
+     * `{exact,derived-exact,derived-exact-perseg}`. A ref is NEVER stamped `derived-exact`
+     * — that is a RENDER-TIME property derived by the shared {@see DerivedExactClassifier},
+     * not a persisted tier. So a PRE-STAMPED (smuggled) `confidence:derived-exact` is NOT a
+     * recognized stored tier → ranks 0 → clears nothing (closes the import/bulk-promote
+     * bypass the de-store exists to close). `ambiguous`/unknown/absent also rank 0.
      *
      * @var array<string,int>
      */
-    private const CONFIDENCE_RANK = array(
-        'exact'         => 3,
-        'derived-exact' => 2,
-        'probable'      => 1,
+    private const STORED_CONFIDENCE_RANK = array(
+        'exact'     => 2,
+        'probable'  => 1,
+        'ambiguous' => 0,
     );
 
     /**
@@ -283,8 +289,12 @@ final class CoverageAudit {
         $target = TranslationRegistry::current()->inlineTranslation();
         $floor  = self::confidenceFloor();
 
-        $refs          = $this->corpusRefs( $ids );
-        $families      = self::familyHistogram( $refs );
+        // Per-post grouped refs: each entry carries the ref AND its own post's envelope
+        // refCount, threaded into the L2 promotion check so the STRICT `derived-exact`
+        // singleton constraint (a compound passage's segments never promote) matches the
+        // resolver post-for-post.
+        $entries       = $this->corpusRefs( $ids );
+        $families      = self::familyHistogram( $entries );
         $dominant      = self::dominantFamily( $families );
         $heterogeneous = count( $families ) > 1;
 
@@ -301,8 +311,15 @@ final class CoverageAudit {
         );
 
         $eligible = 0;
-        foreach ( $refs as $ref ) {
-            $reason = $this->classifyInlineRef( $ref, $target, $floor, $dominant, $heterogeneous );
+        foreach ( $entries as $entry ) {
+            $reason = $this->classifyInlineRef(
+                $entry['ref'],
+                $entry['refCount'],
+                $target,
+                $floor,
+                $dominant,
+                $heterogeneous
+            );
             if ( null === $reason ) {
                 ++$eligible;
                 continue;
@@ -313,7 +330,7 @@ final class CoverageAudit {
             ++$withheld[ $key ];
         }
 
-        $refsTotal = count( $refs );
+        $refsTotal = count( $entries );
 
         return array(
             'generated_at'              => time(),
@@ -343,12 +360,13 @@ final class CoverageAudit {
      * the plain L4 `src-versification-unsupported`.
      *
      * @param array<string,mixed> $ref           In-canon, structurally-valid ref.
+     * @param int                 $refCount      The ref's OWN post envelope ref count (the STRICT singleton constraint).
      * @param string              $target        Inline target translation id (e.g. ENGWEBP).
      * @param string              $floor         L2 confidence floor.
      * @param string              $dominant      The corpus-dominant source-versification family bucket.
      * @param bool                $heterogeneous Whether the corpus carries >1 family bucket.
      */
-    private function classifyInlineRef( array $ref, string $target, string $floor, string $dominant, bool $heterogeneous ): ?string {
+    private function classifyInlineRef( array $ref, int $refCount, string $target, string $floor, string $dominant, bool $heterogeneous ): ?string {
         // L1 — pure structural inline-shape: a specific verse, not cross-chapter.
         $verseStart = $ref['verseStart'] ?? null;
         $chapterEnd = $ref['chapterEnd'] ?? null;
@@ -356,8 +374,9 @@ final class CoverageAudit {
             return self::INLINE_REASON_NOT_INLINE_ELIGIBLE;
         }
 
-        // L2 — confidence floor (default `exact`).
-        if ( ! self::confidenceClears( $ref, $floor ) ) {
+        // L2 — confidence floor (default `exact`); a stored `probable` ref may be PROMOTED
+        // here by the SAME shared render-time classifier the resolver delegates to.
+        if ( ! self::confidenceClears( $ref, $floor, $refCount ) ) {
             return self::INLINE_REASON_LOW_CONFIDENCE;
         }
 
@@ -408,12 +427,19 @@ final class CoverageAudit {
 
     /**
      * Flatten every in-canon, structurally-valid ref across the corpus (the same
-     * render-ready universe {@see self::anyResolves()} counts, but per-ref). Reads each
-     * post's refs via {@see self::refsForPost()} (stored envelope, else live parse).
+     * render-ready universe {@see self::anyResolves()} counts, but per-ref) — each PAIRED
+     * with its own post's envelope refCount. Reads each post's refs via
+     * {@see self::refsForPost()} (stored envelope, else live parse).
+     *
+     * The refCount is the count of the post's WHOLE ref list (NOT just the valid refs that
+     * survive the in-canon/structural filter), mirroring {@see
+     * \Sermonator\Frontend\BibleResolver::resolve()}'s `count( $refs )` over the full
+     * envelope — so the STRICT `derived-exact` singleton constraint (a compound passage's
+     * segments never promote) decides identically here and at render.
      *
      * @param list<int> $ids
      *
-     * @return list<array<string,mixed>>
+     * @return list<array{ref:array<string,mixed>,refCount:int}>
      */
     private function corpusRefs( array $ids ): array {
         $out = array();
@@ -425,10 +451,13 @@ final class CoverageAudit {
                 continue;
             }
 
-            foreach ( $this->refsForPost( $id, $passage ) as $ref ) {
+            $postRefs = $this->refsForPost( $id, $passage );
+            $refCount = count( $postRefs );
+
+            foreach ( $postRefs as $ref ) {
                 $flags = RefValidator::validate( $ref );
                 if ( $flags['inCanon'] && $flags['structurallyValid'] ) {
-                    $out[] = $ref;
+                    $out[] = array( 'ref' => $ref, 'refCount' => $refCount );
                 }
             }
         }
@@ -442,15 +471,15 @@ final class CoverageAudit {
      * corpus that MIXES a known English tradition with a foreign one reads as
      * heterogeneous (more than one bucket) rather than silently collapsing.
      *
-     * @param list<array<string,mixed>> $refs
+     * @param list<array{ref:array<string,mixed>,refCount:int}> $entries
      *
      * @return array<string,int>
      */
-    private static function familyHistogram( array $refs ): array {
+    private static function familyHistogram( array $entries ): array {
         $hist = array();
 
-        foreach ( $refs as $ref ) {
-            $family = VersificationGate::familyCode( self::srcVersification( $ref ) );
+        foreach ( $entries as $entry ) {
+            $family = VersificationGate::familyCode( self::srcVersification( $entry['ref'] ) );
             $bucket = '' === $family ? 'unknown' : $family;
             $hist[ $bucket ] = ( $hist[ $bucket ] ?? 0 ) + 1;
         }
@@ -479,28 +508,59 @@ final class CoverageAudit {
     }
 
     /**
-     * L2 — does the ref's `confidence` tier rank at or above the configured floor?
-     * Unknown/absent tiers rank 0 and never clear (never-fail-WRONG).
+     * L2 — does the ref clear the configured confidence floor? BYTE-lockstep with
+     * {@see \Sermonator\Frontend\BibleResolver::confidenceClears()}: the tier is
+     * **de-stored**, so promotion is delegated to the SAME shared
+     * {@see DerivedExactClassifier::promotes()} the resolver calls (re-parse-identity + the
+     * floor's sibling-count policy), never a persisted stamp.
+     *
+     *   - stored `exact`    → the top stored tier; clears EVERY floor outright;
+     *   - stored `probable` → clears a `derived-exact*` floor ONLY when `promotes()` does
+     *                         (and `promotes()` is false by construction under `exact`);
+     *   - anything else     → `ambiguous`, absent, OR a SMUGGLED pre-stamped
+     *                         `derived-exact` (not a stored tier) → clears NOTHING.
      *
      * @param array<string,mixed> $ref
+     * @param string              $floor    One of `exact` | `derived-exact` | `derived-exact-perseg`.
+     * @param int                 $refCount The ref's OWN post envelope ref count (the STRICT singleton constraint).
      */
-    private static function confidenceClears( array $ref, string $floor ): bool {
-        $floorRank = self::CONFIDENCE_RANK[ $floor ] ?? self::CONFIDENCE_RANK['exact'];
-        $refConf   = isset( $ref['confidence'] ) && is_string( $ref['confidence'] ) ? $ref['confidence'] : '';
-        $refRank   = self::CONFIDENCE_RANK[ $refConf ] ?? 0;
+    private static function confidenceClears( array $ref, string $floor, int $refCount ): bool {
+        $refConf = isset( $ref['confidence'] ) && is_string( $ref['confidence'] ) ? $ref['confidence'] : '';
+        $refRank = self::STORED_CONFIDENCE_RANK[ $refConf ] ?? 0;
 
-        return $refRank > 0 && $refRank >= $floorRank;
+        // `exact` — the top stored tier — clears every floor outright.
+        if ( $refRank >= self::STORED_CONFIDENCE_RANK['exact'] ) {
+            return true;
+        }
+
+        // `probable` — the only PROMOTABLE stored tier — defers entirely to the shared
+        // render-time classifier (which returns false for the `exact` floor).
+        if ( $refRank >= self::STORED_CONFIDENCE_RANK['probable'] ) {
+            return DerivedExactClassifier::promotes( $ref, $floor, $refCount );
+        }
+
+        // `ambiguous` / absent / a pre-stamped `derived-exact`: never clears.
+        return false;
     }
 
     /**
-     * The configured L2 confidence floor, validated to a known tier (default + fallback
-     * `exact`, the most conservative). Mirrors the resolver's reader.
+     * The configured L2 confidence FLOOR, validated against the de-stored floor vocabulary
+     * `{exact,derived-exact,derived-exact-perseg}` (default + fallback `exact`, the most
+     * conservative — promotes nothing). BYTE-lockstep with
+     * {@see \Sermonator\Frontend\BibleResolver::confidenceFloor()}; an unknown/legacy value
+     * (e.g. a stale `probable` floor) normalizes to `exact`.
      */
     private static function confidenceFloor(): string {
-        $stored = get_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR, 'exact' );
-        $stored = is_string( $stored ) ? $stored : 'exact';
+        $stored = get_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR, DerivedExactClassifier::FLOOR_EXACT );
+        $stored = is_string( $stored ) ? $stored : DerivedExactClassifier::FLOOR_EXACT;
 
-        return isset( self::CONFIDENCE_RANK[ $stored ] ) ? $stored : 'exact';
+        $valid = array(
+            DerivedExactClassifier::FLOOR_EXACT,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG,
+        );
+
+        return in_array( $stored, $valid, true ) ? $stored : DerivedExactClassifier::FLOOR_EXACT;
     }
 
     /**
