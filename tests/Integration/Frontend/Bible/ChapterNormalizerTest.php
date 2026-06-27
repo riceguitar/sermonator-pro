@@ -81,6 +81,56 @@ final class ChapterNormalizerTest extends WP_UnitTestCase {
     }
 
     /**
+     * The OTHER critical-text shape: an edition that keeps the verse NUMBER but
+     * excises its words — helloao surfaces it as a footnote-only verse (the number
+     * plus a single editorial note, no scripture). e.g. WEB John 5:4. The normalizer
+     * faithfully EMITS the bare-numbered verse, but {@see RefValidator::rangeWithinChapter}
+     * must NOT count it as present (a `note` node is not the verse's words), so a
+     * crossing range fails the WHOLE ref open to the 3a link — never a blank verse.
+     */
+    public function test_footnote_only_critical_text_verse_fails_range_open(): void {
+        // John 5: verse 4 ("an angel went down…") is omitted in WEB and surfaced as
+        // a footnote on the bare verse number; verses 3 and 5 carry real text.
+        $chapter = array(
+            'content'   => array(
+                array( 'type' => 'verse', 'number' => 3, 'content' => array( 'In these lay a great multitude of those who were sick' ) ),
+                array( 'type' => 'verse', 'number' => 4, 'content' => array( array( 'noteId' => 7 ) ) ),
+                array( 'type' => 'verse', 'number' => 5, 'content' => array( 'A certain man was there who had been sick for thirty-eight years.' ) ),
+            ),
+            'footnotes' => array(
+                array( 'noteId' => 7, 'text' => 'NU omits verse 4.' ),
+            ),
+        );
+
+        $normalized = ChapterNormalizer::normalize( $chapter );
+
+        // The verse NUMBER is emitted faithfully (lossless transform)…
+        $this->assertSame( array( 3, 4, 5 ), array_column( $normalized, 'number' ) );
+        // …but it carries only a `note` node — zero renderable scripture.
+        $verse4 = $normalized[1];
+        $this->assertSame( 4, $verse4['number'] );
+        foreach ( $verse4['nodes'] as $node ) {
+            $this->assertSame( 'note', $node['type'], 'verse 4 has no text/wordsOfJesus run' );
+        }
+
+        // L9: the crossing range 3-5 must fail OPEN — verse 4 is not renderable.
+        $this->assertFalse(
+            RefValidator::rangeWithinChapter(
+                array( 'verseStart' => 3, 'verseEnd' => 5, 'chapterEnd' => null ),
+                $normalized
+            )
+        );
+
+        // And a single ref pointing AT the excised verse also fails open.
+        $this->assertFalse(
+            RefValidator::rangeWithinChapter(
+                array( 'verseStart' => 4, 'verseEnd' => null, 'chapterEnd' => null ),
+                $normalized
+            )
+        );
+    }
+
+    /**
      * @return array<string,mixed> A small John 3 fixture in helloao chapter shape.
      */
     private static function john3(): array {

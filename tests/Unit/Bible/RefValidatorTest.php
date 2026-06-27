@@ -296,4 +296,63 @@ final class RefValidatorTest extends TestCase {
         $ref = $this->ref( array( 'verseStart' => 1, 'verseEnd' => null ) );
         $this->assertFalse( RefValidator::rangeWithinChapter( $ref, array() ) );
     }
+
+    public function test_range_within_chapter_empty_content_verse_inside_range_fails_open(): void {
+        // never-fail-WRONG: an edition that keeps the verse NUMBER but emits zero
+        // renderable nodes ({number:N, nodes:[]}) is NOT renderable scripture. If
+        // presence were keyed on the number alone, a crossing range would falsely
+        // confirm and the Renderer would surface a BLANK verse to a congregation —
+        // the exact false-positive inline L9 exists to prevent. The bare-numbered
+        // verse must read as ABSENT, failing the whole ref open to the 3a link.
+        $chapter = array(
+            array( 'number' => 3, 'nodes' => array( array( 'type' => 'text', 'text' => 'Verse three' ) ) ),
+            array( 'number' => 4, 'nodes' => array() ), // excised-but-numbered: blank.
+            array( 'number' => 5, 'nodes' => array( array( 'type' => 'text', 'text' => 'Verse five' ) ) ),
+        );
+        $ref = $this->ref(
+            array( 'bookUSFM' => 'JHN', 'chapterStart' => 5, 'verseStart' => 3, 'verseEnd' => 5 )
+        );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_footnote_only_verse_inside_range_fails_open(): void {
+        // The realistic critical-text omission: helloao surfaces an omitted verse
+        // (e.g. WEB John 5:4) as a footnote-only verse — the NUMBER plus a single
+        // `note` node ("Some manuscripts add…"), no scripture words. A `note` node
+        // is NOT the verse's words, so the verse is absent and the crossing range
+        // fails open. (Falling open to the link is always free.)
+        $chapter = array(
+            array( 'number' => 3, 'nodes' => array( array( 'type' => 'text', 'text' => 'Verse three' ) ) ),
+            array( 'number' => 4, 'nodes' => array( array( 'type' => 'note', 'text' => 'Some manuscripts add verse 4.' ) ) ),
+            array( 'number' => 5, 'nodes' => array( array( 'type' => 'text', 'text' => 'Verse five' ) ) ),
+        );
+        $ref = $this->ref(
+            array( 'bookUSFM' => 'JHN', 'chapterStart' => 5, 'verseStart' => 3, 'verseEnd' => 5 )
+        );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_single_footnote_only_verse_fails_open(): void {
+        // A single-verse ref pointing directly AT an excised, footnote-only verse
+        // must also fail open — never render the lone blank verse inline.
+        $chapter = array(
+            array( 'number' => 4, 'nodes' => array( array( 'type' => 'note', 'text' => 'Omitted by the best authorities.' ) ) ),
+        );
+        $ref = $this->ref(
+            array( 'bookUSFM' => 'JHN', 'chapterStart' => 5, 'verseStart' => 4, 'verseEnd' => null )
+        );
+        $this->assertFalse( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
+
+    public function test_range_within_chapter_words_of_jesus_node_counts_as_present(): void {
+        // A verse whose only renderable run is words-of-Jesus (red letter) IS real
+        // scripture and must confirm — the renderable-text rule must not exclude it.
+        $chapter = array(
+            array( 'number' => 16, 'nodes' => array( array( 'type' => 'wordsOfJesus', 'text' => 'For God so loved the world' ) ) ),
+        );
+        $ref = $this->ref(
+            array( 'verseStart' => 16, 'verseEnd' => null )
+        );
+        $this->assertTrue( RefValidator::rangeWithinChapter( $ref, $chapter ) );
+    }
 }

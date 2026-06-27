@@ -33,10 +33,16 @@ use Sermonator\Schema\Identifiers as ID;
  *     footnote TEXT from the chapter's `footnotes[]`. An unresolvable noteId — no
  *     matching footnote, or an empty footnote body — is DROPPED (never a placeholder
  *     or an empty node), so a missing footnote can never inject stray characters.
- *   - EMPTY TEXT RUNS are dropped (a run whose text is the empty string ''),
- *     but a verse with zero renderable nodes is still EMITTED: presence is keyed
- *     on the verse `number`, and {@see RefValidator::rangeWithinChapter()} must see
- *     that the number exists. (never-fail-WRONG is about wrong TEXT, not emptiness.)
+ *   - EMPTY TEXT RUNS are dropped (a run whose text is the empty string '').
+ *     This transform stays a FAITHFUL, lossless mapping: a verse with zero
+ *     renderable nodes (an edition that keeps the verse NUMBER but excises its
+ *     words — empty or footnote-only, e.g. WEB John 5:4) is still EMITTED here, so
+ *     the normalized shape reflects exactly what the edition contains. The
+ *     never-fail-WRONG presence judgement lives downstream, NOT here:
+ *     {@see RefValidator::rangeWithinChapter()} counts a verse as present ONLY when
+ *     it carries a renderable text/wordsOfJesus node, so an emitted-but-empty verse
+ *     fails a crossing range OPEN to the 3a link rather than rendering blank. (This
+ *     class never decides presence; it only reports the edition faithfully.)
  *   - NON-VERSE content items (headings, line_breaks, etc.) are ignored — only
  *     `type:'verse'` items become output entries.
  *
