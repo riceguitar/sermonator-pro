@@ -109,14 +109,22 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         );
     }
 
-    public function test_setting_inline_translation_bumps_cache_generation_on_create_and_update(): void {
-        update_option( Identifiers::OPTION_BIBLE_CACHE_GEN, 7 );
-
-        update_option( Identifiers::OPTION_BIBLE_INLINE_TRANSLATION, 'ENGKJV' );
-        $this->assertSame( 8, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
-
-        update_option( Identifiers::OPTION_BIBLE_INLINE_TRANSLATION, 'ENGWEBP' );
-        $this->assertSame( 9, (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN ) );
+    public function test_inline_translation_option_is_wired_to_the_cache_generation_bump(): void {
+        // Phase 3b makes ENGWEBP the SOLE inline-eligible translation, so the inline
+        // translation can no longer be toggled to a second value to drive a real
+        // update_option_ change (any ineligible code sanitizes back to ENGWEBP — a no-op
+        // write that fires no hook). Assert instead that the cache-gen bump LISTENERS are
+        // wired for the option, so when a second public-domain inline target is added a
+        // switch invalidates every warmed chapter. The end-to-end add/update bump is proven
+        // via the link-version option in the test above.
+        $this->assertNotFalse(
+            has_action( 'add_option_' . Identifiers::OPTION_BIBLE_INLINE_TRANSLATION ),
+            'A cache-gen bump must be wired on the inline-translation create path.'
+        );
+        $this->assertNotFalse(
+            has_action( 'update_option_' . Identifiers::OPTION_BIBLE_INLINE_TRANSLATION ),
+            'A cache-gen bump must be wired on the inline-translation update path.'
+        );
     }
 
     public function test_default_link_version_seeds_from_legacy_when_curated(): void {

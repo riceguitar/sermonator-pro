@@ -311,6 +311,7 @@ final class ScriptureChipBundleTest extends WP_UnitTestCase {
         $data = (string) $scripts->get_data( SermonMetaBox::HANDLE, 'data' );
         $this->assertStringContainsString( SermonMetaBox::JS_GLOBAL, $data, 'window.sermonatorMetaBox must be localized.' );
         $this->assertStringContainsString( 'restRoot', $data, 'The REST root is needed for the apiFetch bible-parse call.' );
-        $this->assertStringContainsString( '"postId":' . $post_id, $data, 'The current post id must be localized for the autosave write.' );
+        // wp_localize_script JSON-encodes scalars as strings, so postId serializes as "10", not 10.
+        $this->assertStringContainsString( '"postId":"' . $post_id . '"', $data, 'The current post id must be localized for the autosave write.' );
     }
 }
