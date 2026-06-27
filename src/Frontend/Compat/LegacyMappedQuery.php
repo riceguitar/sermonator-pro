@@ -90,9 +90,4 @@ final class LegacyMappedQuery {
 
         return $args;
     }
-
-    /** True when at least one attribute could not be certified faithful (notice required). */
-    public function hasUnfaithfulAttrs(): bool {
-        return $this->unfaithfulAttrs !== array();
-    }
 }

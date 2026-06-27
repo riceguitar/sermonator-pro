@@ -5,8 +5,9 @@ declare(strict_types=1);
 namespace Sermonator\Tests\Integration\Migration;
 
 use WP_UnitTestCase;
+use Sermonator\Migration\LegacyIdentifiers as LID;
+use Sermonator\Migration\LegacySchemaRegistrar;
 use Sermonator\Migration\PrevalenceCounter;
-use Sermonator\Schema\Identifiers as ID;
 
 /**
  * Integration coverage for the §63 prevalence counter (spec T11), driving the REAL default
@@ -16,25 +17,47 @@ use Sermonator\Schema\Identifiers as ID;
  * (no Docker / wp-env); authored to run under wp-env later.
  *
  * What the unit test cannot exercise and this does:
- *   - {@see PrevalenceCounter::queryPublishedPodcastIds()} over a real publish/draft mix;
+ *   - {@see PrevalenceCounter::queryLegacyPodcastScopes()} over a real publish/draft mix of legacy
+ *     `wpfc_sm_podcast` posts, reading the REAL per-podcast scope source (OBJECT-TERM relationships
+ *     over the legacy sermon taxonomies — NOT the migrated blob, which is empty on real SM Pro);
  *   - {@see PrevalenceCounter::queryShortcodeEmbeds()} — real `[sermons` LIKE + the regex that
  *     distinguishes `[sermons]`/`[sermons_sm]` from `[list_sermons]`/`[sermon_images]`, with
  *     real `shortcode_parse_atts()` attribute parsing;
- *   - per-podcast scope read out of the real META_PODCAST_SETTINGS blob (through the meta
- *     sanitize_callback that preserves the scope keys);
  *   - a hard NO-WRITE-ON-REPORT assertion: a row-count + content checksum snapshot of
  *     wp_posts/wp_postmeta/wp_options around tally() + renderReport(), asserted byte-identical;
  *   - run() actually persisting OPTION_MIGRATION_PREVALENCE (the write-gated path).
  */
 final class PrevalenceCounterTest extends WP_UnitTestCase {
-    /** Create a published migrated podcast with the given settings blob. */
-    private function makePodcast( array $settings, string $status = 'publish' ): int {
+    public function set_up(): void {
+        parent::set_up();
+        // The prevalence podcast tally reads the REAL scope source — legacy wpfc_sm_podcast
+        // OBJECT-TERM relationships over the legacy sermon taxonomies — so the legacy schema
+        // must be registered for the reads (and the object-term assignments below) to resolve.
+        LegacySchemaRegistrar::ensureRegistered();
+    }
+
+    /**
+     * Create a published LEGACY podcast carrying the given OBJECT-TERM scope (the real SM Pro
+     * scope source). $objectScope maps a legacy sermon taxonomy slug to a list of term names to
+     * create and assign. An empty map is an unscoped podcast.
+     *
+     * @param array<string,list<string>> $objectScope
+     */
+    private function makePodcast( array $objectScope = array(), string $status = 'publish' ): int {
         $id = (int) self::factory()->post->create( array(
-            'post_type'   => ID::POST_TYPE_PODCAST,
+            'post_type'   => LID::POST_TYPE_PODCAST,
             'post_status' => $status,
             'post_title'  => 'A Podcast',
         ) );
-        update_post_meta( $id, ID::META_PODCAST_SETTINGS, $settings );
+
+        foreach ( $objectScope as $taxonomy => $termNames ) {
+            $termIds = array();
+            foreach ( (array) $termNames as $name ) {
+                $term      = wp_insert_term( $name, $taxonomy );
+                $termIds[] = is_wp_error( $term ) ? 0 : (int) $term['term_id'];
+            }
+            wp_set_object_terms( $id, array_filter( $termIds ), $taxonomy );
+        }
 
         return $id;
     }
@@ -49,12 +72,12 @@ final class PrevalenceCounterTest extends WP_UnitTestCase {
     }
 
     public function test_run_persists_the_full_prevalence_rollup(): void {
-        // Two published podcasts: one single-axis scope, one multi-axis. One unscoped. One DRAFT
-        // (must be excluded from the published count).
-        $this->makePodcast( array( ID::TAX_SERIES => array( 10 ) ) );
-        $this->makePodcast( array( ID::TAX_PREACHER => array( 5 ), ID::TAX_TOPIC => array( 7 ) ) );
-        $this->makePodcast( array( 'title' => 'Identity only' ) );
-        $this->makePodcast( array( ID::TAX_SERIES => array( 99 ) ), 'draft' );
+        // Two published podcasts: one single-axis object-term scope, one multi-axis. One unscoped.
+        // One DRAFT (must be excluded from the published count).
+        $this->makePodcast( array( LID::TAX_SERIES => array( 'Romans' ) ) );
+        $this->makePodcast( array( LID::TAX_PREACHER => array( 'Pastor A' ), LID::TAX_TOPIC => array( 'Grace' ) ) );
+        $this->makePodcast( array() );
+        $this->makePodcast( array( LID::TAX_SERIES => array( 'Hidden' ) ), 'draft' );
 
         // Embedded [sermons] density: a 2-attr embed, a bare embed, and a decoy that must NOT match.
         $this->makePost( 'Intro [sermons per_page="5" orderby="date"] outro' );
@@ -130,7 +153,7 @@ final class PrevalenceCounterTest extends WP_UnitTestCase {
     }
 
     public function test_tally_and_report_perform_zero_writes(): void {
-        $this->makePodcast( array( ID::TAX_SERIES => array( 10 ) ) );
+        $this->makePodcast( array( LID::TAX_SERIES => array( 'Romans' ) ) );
         $this->makePost( '[sermons per_page="5"]' );
 
         // Seed the option once (the only legitimate write) so renderReport has data to read.

@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Sermonator\Migration;
 
 use Sermonator\Admin\MigrationWizard;
-use Sermonator\Frontend\Feed\PodcastScopeResolver;
 use Sermonator\Schema\Identifiers as ID;
 
 /**
@@ -44,15 +43,18 @@ use Sermonator\Schema\Identifiers as ID;
  */
 final class PrevalenceCounter {
     /**
-     * Resolves the PUBLISHED migrated-podcast ids. Injected so the tally is unit-testable
-     * without a live WP_Query; defaults to the real read-only query.
+     * Resolves ONE per-podcast scope map per published LEGACY podcast, sourced from the
+     * REAL per-podcast scope source — the `wpfc_sm_podcast` OBJECT-TERM relationships
+     * (NOT the migrated `sm_podcast_settings` blob, which is empty on real SM Pro and,
+     * at DETECT, has no migrated podcasts to read at all). Each element is one podcast's
+     * scope (legacy taxonomy slug => term ids); an empty map is an unscoped podcast.
+     * Injected so the tally is unit-testable without `$wpdb`; defaults to the real
+     * read-only object-term scan, which is meaningful from DETECT through VERIFY (legacy
+     * data is byte-immutable until Finalize).
      *
-     * @var callable():list<int>
+     * @var callable():list<array<string,list<int>>>
      */
-    private $podcastIdsProvider;
-
-    /** Reads each podcast's migrated term-filter scope. */
-    private PodcastScopeResolver $scopeResolver;
+    private $legacyPodcastScopesProvider;
 
     /**
      * Resolves one parsed-attribute map per post that embeds `[sermons]`/`[sermons_sm]`.
@@ -73,21 +75,18 @@ final class PrevalenceCounter {
     private $builderFindingsProvider;
 
     /**
-     * @param callable():list<int>|null                                  $publishedPodcastIdsProvider
-     * @param PodcastScopeResolver|null                                  $scopeResolver
+     * @param callable():list<array<string,list<int>>>|null             $legacyPodcastScopesProvider
      * @param callable():list<array<array-key,mixed>>|null               $shortcodeEmbedsProvider
      * @param callable():list<array{post_id:int,type:string}>|null       $builderFindingsProvider
      */
     public function __construct(
-        ?callable $publishedPodcastIdsProvider = null,
-        ?PodcastScopeResolver $scopeResolver = null,
+        ?callable $legacyPodcastScopesProvider = null,
         ?callable $shortcodeEmbedsProvider = null,
         ?callable $builderFindingsProvider = null
     ) {
-        $this->podcastIdsProvider      = $publishedPodcastIdsProvider ?? array( $this, 'queryPublishedPodcastIds' );
-        $this->scopeResolver           = $scopeResolver ?? new PodcastScopeResolver();
-        $this->shortcodeEmbedsProvider = $shortcodeEmbedsProvider ?? array( $this, 'queryShortcodeEmbeds' );
-        $this->builderFindingsProvider = $builderFindingsProvider ?? array( new PageBuilderScanner(), 'scan' );
+        $this->legacyPodcastScopesProvider = $legacyPodcastScopesProvider ?? array( $this, 'queryLegacyPodcastScopes' );
+        $this->shortcodeEmbedsProvider     = $shortcodeEmbedsProvider ?? array( $this, 'queryShortcodeEmbeds' );
+        $this->builderFindingsProvider     = $builderFindingsProvider ?? array( new PageBuilderScanner(), 'scan' );
     }
 
     /**
@@ -131,17 +130,22 @@ final class PrevalenceCounter {
      * Podcast prevalence: published count, scoped count, single-axis-scoped count, and whether
      * the site runs more than one published podcast.
      *
+     * The scope is counted from the REAL per-podcast scope source — the legacy
+     * `wpfc_sm_podcast` OBJECT-TERM relationships ({@see self::queryLegacyPodcastScopes()}) —
+     * NOT the migrated `sm_podcast_settings` blob, which is empty on real SM Pro and is blind
+     * at DETECT (no migrated podcasts exist yet). Counting the object-term source is correct
+     * from DETECT through VERIFY (legacy data is byte-immutable until Finalize).
+     *
      * @return array{published:int,with_scope:int,single_scoped:int,multi_podcast:bool}
      */
     private function tallyPodcasts(): array {
-        $ids       = array_map( 'intval', ( $this->podcastIdsProvider )() );
-        $published = count( $ids );
+        $scopes    = ( $this->legacyPodcastScopesProvider )();
+        $published = is_array( $scopes ) ? count( $scopes ) : 0;
 
         $withScope    = 0;
         $singleScoped = 0;
-        foreach ( $ids as $id ) {
-            $scope = $this->scopeResolver->forPodcast( $id );
-            if ( array() === $scope ) {
+        foreach ( (array) $scopes as $scope ) {
+            if ( ! is_array( $scope ) || array() === $scope ) {
                 continue;
             }
             ++$withScope;
@@ -352,22 +356,54 @@ final class PrevalenceCounter {
     }
 
     /**
-     * Default query: every PUBLISHED migrated-podcast id. Read-only.
+     * Default scan: ONE per-podcast scope map per published LEGACY `wpfc_sm_podcast`,
+     * sourced from the REAL per-podcast scope source — the OBJECT-TERM relationships
+     * (`wp_get_object_terms` over the legacy sermon taxonomies). READ-ONLY, and meaningful
+     * from DETECT (the legacy podcasts + their relationships exist before migration; the
+     * migrated blob does not). {@see LegacySchemaRegistrar} re-registers the legacy schema
+     * so the reads work with the legacy plugin DEACTIVATED.
      *
-     * @return list<int>
+     * @return list<array<string,list<int>>> one scope map per podcast (legacy taxonomy slug => term ids; [] = unscoped).
      */
-    public function queryPublishedPodcastIds(): array {
-        $query = new \WP_Query( array(
-            'post_type'              => ID::POST_TYPE_PODCAST,
+    public function queryLegacyPodcastScopes(): array {
+        LegacySchemaRegistrar::ensureRegistered();
+
+        $ids = get_posts( array(
+            'post_type'              => LegacyIdentifiers::POST_TYPE_PODCAST,
             'post_status'            => 'publish',
             'posts_per_page'         => -1,
             'fields'                 => 'ids',
+            'orderby'                => 'ID',
+            'order'                  => 'ASC',
             'no_found_rows'          => true,
             'update_post_term_cache' => false,
             'update_post_meta_cache' => false,
         ) );
 
-        return array_map( 'intval', $query->posts );
+        $taxonomies = LegacyIdentifiers::sermonTaxonomies();
+        $out        = array();
+        foreach ( (array) $ids as $id ) {
+            $scope = array();
+            foreach ( $taxonomies as $taxonomy ) {
+                $terms = wp_get_object_terms( (int) $id, $taxonomy, array( 'fields' => 'ids' ) );
+                if ( is_wp_error( $terms ) || ! is_array( $terms ) ) {
+                    continue;
+                }
+                $clean = array();
+                foreach ( $terms as $termId ) {
+                    $termId = (int) $termId;
+                    if ( $termId > 0 ) {
+                        $clean[] = $termId;
+                    }
+                }
+                if ( $clean !== array() ) {
+                    $scope[ $taxonomy ] = array_values( array_unique( $clean ) );
+                }
+            }
+            $out[] = $scope;
+        }
+
+        return $out;
     }
 
     /**

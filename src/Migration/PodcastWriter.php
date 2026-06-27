@@ -219,6 +219,13 @@ final class PodcastWriter {
         $flags = $this->stripTermCrosswalkFlags( $flags );
         $flags = array_merge( $flags, $this->applyMeta( $newId, $legacyId ) );
 
+        // MUST-FIX 1: mirror the legacy podcast's OBJECT-TERM feed scope (the REAL SM
+        // Pro source — the sm_podcast_settings blob carries NO taxonomy-scope field)
+        // into the migrated settings scope keys, MERGING with the blob refs applyMeta
+        // just wrote. Without this, per-podcast filtering is inert on real installs and
+        // a scoped single podcast over-includes every sermon to live subscribers.
+        $flags = $this->mergeObjectTermScope( $newId, $legacyId, $flags );
+
         $this->writeFlags( $newId, $flags );
 
         return array_values( array_unique( $flags ) );
@@ -251,27 +258,114 @@ final class PodcastWriter {
         // term filters). Asymmetric with applyMeta, which only deletes per target key when
         // the legacy source key is actually present. Guard: skip BOTH the delete and the
         // re-add when $values === [] so existing settings survive the self-heal intact.
-        if ( $values === array() ) {
+        // Blob-derived settings: only rewrite when the legacy blob is ACTUALLY present.
+        // An empty/absent blob is a NO-OP for the blob path (FIX 1 / B2a fix10) so the
+        // migrated settings (and any post-migration admin edit) survive the self-heal.
+        if ( $values !== array() ) {
+            delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
+
+            foreach ( $values as $value ) {
+                if ( is_string( $value ) ) {
+                    $maybe = maybe_unserialize( $value );
+                    if ( is_array( $maybe ) ) {
+                        $value = $this->remapSettingsTerms( $maybe, $flags );
+                    } else {
+                        $flags[] = 'podcast_settings_unremapped';
+                    }
+                } elseif ( is_array( $value ) ) {
+                    $value = $this->remapSettingsTerms( $value, $flags );
+                }
+                add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $value ) );
+            }
+        }
+
+        // MUST-FIX 1: the REAL SM Pro per-podcast scope lives in OBJECT-TERMS, not the
+        // blob (empty on real installs). Merge it on this self-heal path too, REGARDLESS
+        // of blob presence, so a scope-only podcast self-heals once its scope terms
+        // migrate. Merge-only — never clobbers blob refs or post-migration admin edits.
+        $flags = $this->mergeObjectTermScope( $newId, $legacyId, $flags );
+
+        return array_values( array_unique( $flags ) );
+    }
+
+    /**
+     * MUST-FIX 1 — mirror the legacy podcast's OBJECT-TERM feed scope into the migrated
+     * {@see Identifiers::META_PODCAST_SETTINGS} scope keys.
+     *
+     * Reads the legacy object-term scope READ-ONLY (legacy data byte-immutable until
+     * Finalize), crosswalks each legacy term id to its NEW term id, and MERGES the
+     * resolved new ids into the migrated settings via the WordPress-free
+     * {@see PodcastObjectTermScopeMapper} — never clobbering the blob refs already
+     * migrated nor any other settings key. Each unresolved scope term records the shared
+     * {@see Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX} flag so COMPLETE is WITHHELD and
+     * the resolver/feed fall back to UNSCOPED (never a dead-term/empty feed).
+     *
+     * REVERSIBILITY/IDEMPOTENCY: the ONLY new write is to META_PODCAST_SETTINGS (already
+     * part of the migrated record applyMeta writes and Rollback deletes wholesale) plus
+     * MIGRATION_FLAGS (already managed). NO new un-reversible write is introduced, and a
+     * re-run reproduces the identical merged array from legacy + the crosswalk.
+     *
+     * @param list<string> $flags
+     * @return list<string>
+     */
+    private function mergeObjectTermScope( int $newId, int $legacyId, array $flags ): array {
+        $legacyScope = $this->readLegacyObjectTermScope( $legacyId );
+        if ( $legacyScope === array() ) {
             return array_values( array_unique( $flags ) );
         }
 
-        delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
+        $settings = get_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, true );
+        $settings = is_array( $settings ) ? $settings : array();
 
-        foreach ( $values as $value ) {
-            if ( is_string( $value ) ) {
-                $maybe = maybe_unserialize( $value );
-                if ( is_array( $maybe ) ) {
-                    $value = $this->remapSettingsTerms( $maybe, $flags );
-                } else {
-                    $flags[] = 'podcast_settings_unremapped';
-                }
-            } elseif ( is_array( $value ) ) {
-                $value = $this->remapSettingsTerms( $value, $flags );
-            }
-            add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $value ) );
+        $result = PodcastObjectTermScopeMapper::merge(
+            $settings,
+            $legacyScope,
+            MappingContract::taxonomyMap(),
+            fn( int $legacyTermId ): ?int => $this->terms->newTermId( $legacyTermId )
+        );
+
+        if ( $result['changed'] ) {
+            // Single canonical row, delete-then-re-add (idempotent on resume); the
+            // merged settings array round-trips byte-exact through wp_slash (recurses).
+            delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
+            add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $result['settings'] ) );
         }
 
-        return array_values( array_unique( $flags ) );
+        return array_values( array_unique( array_merge( $flags, $result['flags'] ) ) );
+    }
+
+    /**
+     * Read the legacy podcast's OBJECT-TERM feed scope — the REAL SM Pro per-podcast
+     * scope source (the sm_podcast_settings blob has no taxonomy-scope field). READ-ONLY:
+     * wp_get_object_terms over the legacy sermon taxonomies, which
+     * {@see LegacySchemaRegistrar} registers so they resolve even with the legacy plugin
+     * DEACTIVATED. Reading object terms is taxonomy-scoped (wp_term_relationships), not
+     * post-type-scoped, so the legacy podcast's relationships resolve regardless of which
+     * post type the taxonomy is associated with.
+     *
+     * @return array<string,list<int>> legacy taxonomy slug => legacy term ids (non-empty axes only).
+     */
+    private function readLegacyObjectTermScope( int $legacyId ): array {
+        $scope = array();
+        foreach ( LegacyIdentifiers::sermonTaxonomies() as $legacyTaxonomy ) {
+            $terms = wp_get_object_terms( $legacyId, $legacyTaxonomy, array( 'fields' => 'ids' ) );
+            if ( is_wp_error( $terms ) || ! is_array( $terms ) ) {
+                continue;
+            }
+
+            $ids = array();
+            foreach ( $terms as $termId ) {
+                $termId = (int) $termId;
+                if ( $termId > 0 ) {
+                    $ids[] = $termId;
+                }
+            }
+            if ( $ids !== array() ) {
+                $scope[ $legacyTaxonomy ] = array_values( array_unique( $ids ) );
+            }
+        }
+
+        return $scope;
     }
 
     /**

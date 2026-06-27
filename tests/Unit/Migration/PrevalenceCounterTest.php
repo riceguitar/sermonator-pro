@@ -7,7 +7,6 @@ namespace Sermonator\Tests\Unit\Migration;
 use Brain\Monkey;
 use Brain\Monkey\Functions;
 use PHPUnit\Framework\TestCase;
-use Sermonator\Frontend\Feed\PodcastScopeResolver;
 use Sermonator\Migration\PageBuilderScanner;
 use Sermonator\Migration\PrevalenceCounter;
 use Sermonator\Schema\Identifiers as ID;
@@ -18,23 +17,19 @@ use Sermonator\Schema\Identifiers as ID;
  * Drives {@see PrevalenceCounter::tally()} with injected providers (no `$wpdb`), pins the
  * rollup SHAPE + counts, and asserts the two hard boundaries: {@see PrevalenceCounter::run()}
  * writes exactly once; {@see PrevalenceCounter::tally()} and the report read path write NOTHING.
+ *
+ * The podcast scope is sourced from the REAL per-podcast scope source — the legacy
+ * `wpfc_sm_podcast` OBJECT-TERM relationships (NOT the migrated blob, which is empty on real
+ * SM Pro and blind at DETECT) — so the injected provider yields one scope MAP per podcast.
  */
 final class PrevalenceCounterTest extends TestCase {
-    /** @var array<int,mixed> podcast id => META_PODCAST_SETTINGS blob. */
-    private array $podcastSettings = array();
+    /** @var list<array<string,list<int>>> one object-term scope map per legacy podcast. */
+    private array $podcastScopes = array();
 
     protected function setUp(): void {
         parent::setUp();
         Monkey\setUp();
-        $this->podcastSettings = array();
-
-        // PodcastScopeResolver::forPodcast() reads only this.
-        Functions\when( 'get_post_meta' )->alias( function ( $id, $key = '', $single = false ) {
-            if ( ID::META_PODCAST_SETTINGS === $key ) {
-                return $this->podcastSettings[ (int) $id ] ?? array();
-            }
-            return array();
-        } );
+        $this->podcastScopes = array();
     }
 
     protected function tearDown(): void {
@@ -43,18 +38,17 @@ final class PrevalenceCounterTest extends TestCase {
     }
 
     /**
-     * Build a counter whose podcast-id list comes from $this->podcastSettings keys, with the
+     * Build a counter whose per-podcast scope maps come from $this->podcastScopes, with the
      * given shortcode embeds and page-builder findings injected.
      *
      * @param list<array<array-key,mixed>>                   $embeds
      * @param list<array{post_id:int,type:string}>           $findings
      */
     private function counter( array $embeds = array(), array $findings = array() ): PrevalenceCounter {
-        $ids = array_map( 'intval', array_keys( $this->podcastSettings ) );
+        $scopes = $this->podcastScopes;
 
         return new PrevalenceCounter(
-            fn(): array => $ids,
-            new PodcastScopeResolver(),
+            fn(): array => $scopes,
             fn(): array => $embeds,
             fn(): array => $findings
         );
@@ -83,12 +77,12 @@ final class PrevalenceCounterTest extends TestCase {
     }
 
     public function test_podcast_scope_counts_single_axis_vs_multi_axis(): void {
-        // p1: single-axis scope (series only) → with_scope + single_scoped.
-        $this->podcastSettings[1] = array( ID::TAX_SERIES => array( 10 ) );
-        // p2: multi-axis scope (preacher AND topic) → with_scope, NOT single_scoped.
-        $this->podcastSettings[2] = array( ID::TAX_PREACHER => array( 5 ), ID::TAX_TOPIC => array( 7 ) );
-        // p3: no scope (only identity keys / empty) → neither.
-        $this->podcastSettings[3] = array( 'title' => 'My Show' );
+        // p1: single-axis object-term scope (series only) → with_scope + single_scoped.
+        $this->podcastScopes[] = array( 'wpfc_sermon_series' => array( 10 ) );
+        // p2: multi-axis object-term scope (preacher AND topic) → with_scope, NOT single_scoped.
+        $this->podcastScopes[] = array( 'wpfc_preacher' => array( 5 ), 'wpfc_sermon_topics' => array( 7 ) );
+        // p3: no object-term scope → neither.
+        $this->podcastScopes[] = array();
 
         $podcasts = $this->counter()->tally()['podcasts'];
 
@@ -99,7 +93,7 @@ final class PrevalenceCounterTest extends TestCase {
     }
 
     public function test_single_podcast_site_is_not_multi(): void {
-        $this->podcastSettings[1] = array( ID::TAX_SERIES => array( 10 ) );
+        $this->podcastScopes[] = array( 'wpfc_sermon_series' => array( 10 ) );
 
         $podcasts = $this->counter()->tally()['podcasts'];
 
@@ -188,7 +182,7 @@ final class PrevalenceCounterTest extends TestCase {
             Functions\expect( $writeFn )->never();
         }
 
-        $this->podcastSettings[1] = array( ID::TAX_SERIES => array( 10 ) );
+        $this->podcastScopes[] = array( 'wpfc_sermon_series' => array( 10 ) );
         $stats = $this->counter(
             array( array( 'per_page' => '5' ) ),
             array( array( 'post_id' => 9, 'type' => PageBuilderScanner::TYPE_BUILDER_EMBEDDED ) )
