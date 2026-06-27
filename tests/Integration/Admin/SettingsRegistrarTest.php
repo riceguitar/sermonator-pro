@@ -391,7 +391,10 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
     }
 
     public function test_perseg_floor_persists_once_ack_is_set(): void {
-        // The logged CLI spot-check sets the ack → the per-ref floor is now selectable.
+        // The logged CLI ack step ("wp sermonator bible ack-perseg --confirm",
+        // {@see \Sermonator\Cli\BibleCommand::ackPerseg()}) sets this option — the only
+        // production setter. With it set, the per-ref floor is now selectable. (An end-to-end
+        // assertion that the CLI command itself unlocks the floor lives in the Cli\BibleCommandTest.)
         update_option( Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK, true );
 
         update_option(

@@ -22,13 +22,16 @@ use Sermonator\Schema\Identifiers as ID;
  *   wp sermonator bible warm [--limit=<n>] [--rollback]
  *   wp sermonator bible audit [--inline] [--sample=<n>]
  *   wp sermonator bible attest [--force]
+ *   wp sermonator bible ack-perseg [--confirm] [--revoke]
  *
  * Phase 3a was LINK-MODE only. Phase 3b Task 8 adds the `vendor` subcommand (vendor the
  * public-domain ENGWEBP per-chapter text to the uploads snapshot, reversibly). Phase 3b
  * Task 9 adds the `warm` subcommand (prime the disposable transient chapter cache for the
  * chapters real sermons cite) — its disk-snapshot peer is `vendor`. The inline-enablement
  * Task I extends `audit --inline` to the three-floor would-promote PREVIEW (+ `--sample`
- * axis-2 spot-check) and adds `attest --force` — the single, LOGGED attestation override.
+ * axis-2 spot-check), adds `attest --force` — the single, LOGGED attestation override — and
+ * adds `ack-perseg --confirm` — the single, LOGGED axis-2 spot-check acknowledgement that
+ * unlocks the per-segment `derived-exact-perseg` confidence floor (design §4 / §5 step 4).
  */
 final class BibleCommand {
     /**
@@ -360,8 +363,9 @@ final class BibleCommand {
      * [--sample=<n>]
      * : With `--inline`, additionally print up to N PROMOTED references with their raw
      *   passage substrings — the axis-2 human spot-check the per-segment floor is gated
-     *   behind (design §4 step 4). READ-ONLY: it writes nothing (the ack itself is a
-     *   separate, deliberate step).
+     *   behind (design §4 step 4). READ-ONLY: it writes nothing. Once the printed references
+     *   have been verified, the operator records the acknowledgement with the separate,
+     *   deliberate `wp sermonator bible ack-perseg --confirm` step (which is the one write).
      *
      * ## EXAMPLES
      *
@@ -540,6 +544,104 @@ final class BibleCommand {
         \WP_CLI::success(
             'Attestation set TRUE via logged --force override (heterogeneity hard-disable bypassed; '
             . 'override recorded in the attestation audit log).'
+        );
+    }
+
+    /**
+     * LOGGED axis-2 spot-check acknowledgement (design §3.3/§3.6, §5 step 4) — the THIRD
+     * gate the per-ref `derived-exact-perseg` confidence floor is un-selectable until set
+     * ({@see ID::OPTION_BIBLE_INLINE_PERSEG_ACK}). This is the dedicated, human-confirmed
+     * SETTER the floor's gate depends on: without it the perseg floor is permanently
+     * un-selectable (the sanitize callback floors any perseg submission back to STRICT
+     * `derived-exact`), so the headline 49%→76% per-segment recall would be a gate with no
+     * key.
+     *
+     * The intended flow keeps the audit purely READ-ONLY: first run
+     * `wp sermonator bible audit --inline --sample=N` and eyeball the promoted references
+     * against their raw passage text; once satisfied they are correct, run THIS command with
+     * `--confirm` — the one deliberate WRITE, mirroring `attest --force`. It ALWAYS records a
+     * {@see ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG} entry (time, acting user, previous state,
+     * `cli-confirm`/`cli-revoke` marker), so trusting (or withdrawing trust in) per-segment
+     * promotion is never silent. This feature is RENDER-TIME only: the ack writes NOTHING to
+     * the preserved {@see ID::META_BIBLE_REFS}/{@see ID::META_BIBLE_PASSAGE} (#1 data
+     * preservation) and does not itself promote any ref — it merely unlocks the floor for
+     * selection. `--revoke` is the exact, instant reverse (the floor returns to
+     * un-selectable; a selected perseg floor is floored back to `derived-exact` on the next
+     * Settings save).
+     *
+     * Refuses without an explicit flag: the bare subcommand is READ-ONLY — it reports the
+     * current ack state (and the spot-check command to run first) and exits, writing nothing.
+     *
+     * ## OPTIONS
+     *
+     * [--confirm]
+     * : Required to set the ack. Records the axis-2 acknowledgement TRUE (run AFTER the
+     *   `audit --inline --sample=N` spot-check), making `derived-exact-perseg` selectable in
+     *   Settings, and appends a timestamped entry to the ack audit log.
+     *
+     * [--revoke]
+     * : Clear the ack (instant, reversible): `derived-exact-perseg` returns to un-selectable.
+     *   Also recorded in the ack audit log.
+     *
+     * ## EXAMPLES
+     *
+     *     wp sermonator bible ack-perseg
+     *     wp sermonator bible ack-perseg --confirm
+     *     wp sermonator bible ack-perseg --revoke
+     *
+     * @subcommand ack-perseg
+     *
+     * @param array<int,string>    $args
+     * @param array<string,string> $assoc_args
+     */
+    public function ackPerseg( array $args, array $assoc_args ): void {
+        $current = (bool) get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK, false );
+        $confirm = ! empty( $assoc_args['confirm'] );
+        $revoke  = ! empty( $assoc_args['revoke'] );
+
+        if ( $confirm && $revoke ) {
+            \WP_CLI::warning( 'Pass either --confirm or --revoke, not both. No changes made.' );
+            return;
+        }
+
+        if ( ! $confirm && ! $revoke ) {
+            \WP_CLI::log( sprintf(
+                'Per-segment (derived-exact-perseg) spot-check ack is currently %s.',
+                $current ? 'ON' : 'OFF'
+            ) );
+            \WP_CLI::warning(
+                'Recording the axis-2 ack requires the explicit --confirm flag. First run '
+                . '"wp sermonator bible audit --inline --sample=N" and verify the promoted '
+                . 'references against their raw text, then run this command with --confirm '
+                . '(use --revoke to withdraw it). No changes made.'
+            );
+            return;
+        }
+
+        // The single writing path: set/clear the ack and append the logged audit entry (the
+        // auditable record that per-segment promotion was deliberately trusted or withdrawn).
+        $next = $confirm; // true on --confirm, false on --revoke (the two are mutually exclusive above).
+        update_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK, $next );
+
+        $log = get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG, array() );
+        if ( ! is_array( $log ) ) {
+            $log = array();
+        }
+        $log[] = array(
+            'at'       => time(),
+            'user'     => function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0,
+            'via'      => $confirm ? 'cli-confirm' : 'cli-revoke',
+            'previous' => $current,
+        );
+        update_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG, $log );
+
+        \WP_CLI::success(
+            $confirm
+                ? 'Axis-2 spot-check acknowledged via logged --confirm (recorded in the ack audit log). '
+                    . 'The derived-exact-perseg confidence floor is now selectable in Settings.'
+                : 'Axis-2 spot-check ack revoked via logged --revoke (recorded in the ack audit log). '
+                    . 'The derived-exact-perseg floor is no longer selectable; a selected perseg floor '
+                    . 'falls back to derived-exact on the next Settings save.'
         );
     }
 }

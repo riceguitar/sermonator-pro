@@ -397,7 +397,7 @@ final class SettingsRegistrar {
             add_settings_error(
                 Identifiers::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR,
                 'sermonator_bible_inline_perseg_unacked',
-                __( 'Per-reference inline scripture (derived-exact-perseg) requires the human spot-check first. Run "wp sermonator bible audit --inline --sample=N", verify the promoted references against their raw text, then re-select it. The floor was set to the stricter single-segment "derived-exact" for now.', 'sermonator' ),
+                __( 'Per-reference inline scripture (derived-exact-perseg) requires the human spot-check first. Run "wp sermonator bible audit --inline --sample=N", verify the promoted references against their raw text, then record the acknowledgement with "wp sermonator bible ack-perseg --confirm" and re-select it. The floor was set to the stricter single-segment "derived-exact" for now.', 'sermonator' ),
                 'error'
             );
 
@@ -412,7 +412,10 @@ final class SettingsRegistrar {
     /**
      * Whether the axis-2 per-ref spot-check has been acknowledged (the perseg floor's third
      * gate). Read-only coercion of {@see Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK}, which
-     * is set only by the logged CLI spot-check (T-I), never a Settings-API field.
+     * is set only by the dedicated logged CLI ack step ("wp sermonator bible ack-perseg
+     * --confirm", T-I — see {@see \Sermonator\Cli\BibleCommand::ackPerseg()}), never a
+     * Settings-API field. The read-only "audit --inline --sample=N" spot-check it follows
+     * deliberately writes nothing, so the ack is always an explicit, separate confirmation.
      */
     private static function persegAcknowledged(): bool {
         return self::toBool( get_option( Identifiers::OPTION_BIBLE_INLINE_PERSEG_ACK, false ) );

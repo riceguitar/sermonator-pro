@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Sermonator\Tests\Integration\Cli;
 
 use WP_UnitTestCase;
+use Sermonator\Admin\SettingsRegistrar;
 use Sermonator\Bible\CoverageAudit;
+use Sermonator\Bible\DerivedExactClassifier;
 use Sermonator\Cli\BibleCommand;
 use Sermonator\Schema\Identifiers as ID;
 use Sermonator\Tests\Integration\Support\WpCliShim;
@@ -41,6 +43,9 @@ final class BibleCommandTest extends WP_UnitTestCase {
         delete_option( ID::OPTION_BIBLE_CACHE_GEN );
         delete_option( ID::OPTION_BIBLE_INLINE_ATTESTATION );
         delete_option( ID::OPTION_BIBLE_INLINE_ATTEST_LOG );
+        delete_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK );
+        delete_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG );
+        delete_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR );
         delete_option( ID::OPTION_BIBLE_STATS );
         update_option( ID::OPTION_BIBLE_LINK_VERSION, 'ESV' );
 
@@ -54,6 +59,9 @@ final class BibleCommandTest extends WP_UnitTestCase {
         delete_option( ID::OPTION_BIBLE_CACHE_GEN );
         delete_option( ID::OPTION_BIBLE_INLINE_ATTESTATION );
         delete_option( ID::OPTION_BIBLE_INLINE_ATTEST_LOG );
+        delete_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK );
+        delete_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG );
+        delete_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR );
         delete_option( ID::OPTION_BIBLE_STATS );
         delete_option( ID::OPTION_BIBLE_LINK_VERSION );
         parent::tearDown();
@@ -357,5 +365,102 @@ final class BibleCommandTest extends WP_UnitTestCase {
         $out = WpCliShim::output();
         $this->assertStringContainsString( 'currently OFF', $out );
         $this->assertStringContainsString( 'requires the explicit --force', $out );
+    }
+
+    // -------------------------------------------------------------------------
+    // ack-perseg (the single, LOGGED axis-2 spot-check ack setter, T-I) — the
+    // documented key for the perseg-floor gate the review found had none.
+    // -------------------------------------------------------------------------
+
+    public function test_ack_perseg_without_flag_is_read_only(): void {
+        $this->command->ackPerseg( array(), array() );
+
+        // No write: the ack stays unset and the ack log stays empty.
+        $this->assertFalse( (bool) get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK, false ) );
+        $this->assertSame( array(), get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG, array() ) );
+
+        $out = WpCliShim::output();
+        $this->assertStringContainsString( 'currently OFF', $out );
+        $this->assertStringContainsString( 'requires the explicit --confirm', $out );
+        // It points the operator at the read-only spot-check to run first.
+        $this->assertStringContainsString( 'audit --inline --sample', $out );
+    }
+
+    public function test_ack_perseg_confirm_sets_option_and_logs(): void {
+        $this->assertFalse( (bool) get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK, false ) );
+
+        $this->command->ackPerseg( array(), array( 'confirm' => true ) );
+
+        $this->assertTrue( (bool) get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK ) );
+
+        $log = get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG, array() );
+        $this->assertCount( 1, $log );
+        $this->assertSame( 'cli-confirm', $log[0]['via'] );
+        $this->assertFalse( $log[0]['previous'] );
+        $this->assertArrayHasKey( 'at', $log[0] );
+        $this->assertArrayHasKey( 'user', $log[0] );
+
+        $this->assertStringContainsString( 'Success:', WpCliShim::output() );
+        $this->assertStringContainsString( 'now selectable', WpCliShim::output() );
+    }
+
+    public function test_ack_perseg_revoke_clears_option_and_logs_previous_true(): void {
+        update_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK, true );
+
+        $this->command->ackPerseg( array(), array( 'revoke' => true ) );
+
+        $this->assertFalse( (bool) get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK ) );
+
+        $log = get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG, array() );
+        $this->assertCount( 1, $log );
+        $this->assertSame( 'cli-revoke', $log[0]['via'] );
+        $this->assertTrue( $log[0]['previous'] );
+
+        $this->assertStringContainsString( 'no longer selectable', WpCliShim::output() );
+    }
+
+    public function test_ack_perseg_refuses_both_flags(): void {
+        $this->command->ackPerseg( array(), array( 'confirm' => true, 'revoke' => true ) );
+
+        // Ambiguous request writes nothing.
+        $this->assertFalse( (bool) get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK, false ) );
+        $this->assertSame( array(), get_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG, array() ) );
+        $this->assertStringContainsString( 'not both', WpCliShim::output() );
+    }
+
+    /**
+     * End-to-end: the review's core finding — before the ack the perseg floor is dead-levered
+     * (floored to STRICT derived-exact); running the documented `ack-perseg --confirm` step
+     * is the KEY that makes `derived-exact-perseg` actually selectable through Settings.
+     */
+    public function test_ack_perseg_confirm_makes_perseg_floor_selectable(): void {
+        // admin_init/rest_api_init don't fire in this CLI harness; register directly so the
+        // confidence-floor sanitize_callback runs on update_option (mirrors SettingsRegistrarTest).
+        ( new SettingsRegistrar() )->register();
+
+        // BEFORE the ack: selecting the perseg floor is refused down to STRICT derived-exact.
+        update_option(
+            ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG
+        );
+        $this->assertSame(
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT,
+            get_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR ),
+            'Without the ack the perseg floor must floor back to STRICT derived-exact.'
+        );
+
+        // The documented ack step sets the gate's key.
+        $this->command->ackPerseg( array(), array( 'confirm' => true ) );
+
+        // AFTER the ack: the perseg floor now persists verbatim.
+        update_option(
+            ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR,
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG
+        );
+        $this->assertSame(
+            DerivedExactClassifier::FLOOR_DERIVED_EXACT_PERSEG,
+            get_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR ),
+            'After ack-perseg --confirm the perseg floor must be selectable.'
+        );
     }
 }

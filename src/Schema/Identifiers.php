@@ -107,13 +107,28 @@ final class Identifiers {
     /**
      * Axis-2 human spot-check acknowledgement (bool) — the THIRD gate the per-ref
      * `derived-exact-perseg` floor is un-selectable until set (design §3.3/§3.6, step 4).
-     * Set ONLY by the logged CLI spot-check (`wp sermonator bible audit --inline --sample=N`,
-     * T-I), never a Settings-API field: an admin lowering the floor to `derived-exact-perseg`
+     * Set ONLY by the logged CLI ack step (`wp sermonator bible ack-perseg --confirm`, T-I),
+     * never a Settings-API field: an admin lowering the floor to `derived-exact-perseg`
      * without this ack is floored back to STRICT `derived-exact` by the sanitize callback.
-     * The 49→76% perseg delta is exactly the Psalm-bearing lectionary bundles whose safety
-     * rides the single attestation boolean and which the axis-1 audit is structurally blind to.
+     * The intended operator flow is to first run the read-only spot-check
+     * (`wp sermonator bible audit --inline --sample=N`), eyeball the promoted references
+     * against their raw text, and only then run `ack-perseg --confirm` — the one deliberate
+     * write — so the audit itself stays purely read-only. The 49→76% perseg delta is exactly
+     * the Psalm-bearing lectionary bundles whose safety rides the single attestation boolean
+     * and which the axis-1 audit is structurally blind to.
      */
     public const OPTION_BIBLE_INLINE_PERSEG_ACK = 'sermonator_bible_inline_perseg_ack';
+
+    /**
+     * Append-only audit log of the logged CLI per-segment spot-check ack
+     * (`wp sermonator bible ack-perseg --confirm|--revoke`, T-I) — the ONLY way to set (or
+     * clear) {@see self::OPTION_BIBLE_INLINE_PERSEG_ACK}. Each entry records the time, acting
+     * user id, the previous ack state, and the via marker (`cli-confirm` / `cli-revoke`), so
+     * the deliberate decision to trust per-segment promotion (or to withdraw that trust) is
+     * never silent — mirroring {@see self::OPTION_BIBLE_INLINE_ATTEST_LOG}. A list of entries;
+     * never read on a render path.
+     */
+    public const OPTION_BIBLE_INLINE_PERSEG_ACK_LOG = 'sermonator_bible_inline_perseg_ack_log';
 
     /**
      * Reconciliation generation stamped at the moment inline rendering was enabled — the
