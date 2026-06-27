@@ -7,6 +7,7 @@ namespace Sermonator\Tests\Unit\Frontend;
 use PHPUnit\Framework\TestCase;
 use Brain\Monkey;
 use Brain\Monkey\Functions;
+use Sermonator\Frontend\QueryResult;
 use Sermonator\Frontend\Renderer;
 use Sermonator\Frontend\ResolvedScripture;
 use Sermonator\Frontend\SermonView;
@@ -674,5 +675,92 @@ final class RendererTest extends TestCase {
         // The escaped forms are present.
         $this->assertStringContainsString( '&lt;script&gt;', $html );
         $this->assertStringContainsString( '&lt;b&gt;ESV&lt;/b&gt;', $html );
+    }
+
+    // ---- Bundle 2 / T5: paginated list + escaped pager ----------------------------------
+
+    /** A predictable query-string add_query_arg so links are assertable in pure unit context. */
+    private function stubAddQueryArg(): void {
+        Functions\when( 'add_query_arg' )->alias(
+            static fn( $key, $value, $url ) => $url . '?' . $key . '=' . $value
+        );
+    }
+
+    public function test_pager_omitted_when_one_page_or_none(): void {
+        $r = new Renderer();
+        $this->assertSame( '', $r->pager( 1, 1, 'http://x/sermons/' ), 'A single page has nothing to page through.' );
+        $this->assertSame( '', $r->pager( 0, 1, 'http://x/sermons/' ), 'Zero pages → no pager.' );
+    }
+
+    public function test_pager_builds_sermon_page_links_on_first_page(): void {
+        $this->stubAddQueryArg();
+        $html = ( new Renderer() )->pager( 3, 1, 'http://example.test/sermons/' );
+
+        // Page 1 is the current page → a span, never a link.
+        $this->assertStringContainsString( 'aria-current="page"', $html );
+        $this->assertStringContainsString( '>1</span>', $html );
+        $this->assertStringNotContainsString( 'sermon_page=1', $html );
+
+        // Pages 2 and 3 link via the dedicated sermon_page var (NOT pretty /page/N/).
+        $this->assertStringContainsString( 'href="http://example.test/sermons/?sermon_page=2"', $html );
+        $this->assertStringContainsString( 'href="http://example.test/sermons/?sermon_page=3"', $html );
+        $this->assertStringNotContainsString( '/page/', $html );
+
+        // First page → a next link, no prev link.
+        $this->assertStringContainsString( 'sermonator-pager__link--next', $html );
+        $this->assertStringNotContainsString( 'sermonator-pager__link--prev', $html );
+    }
+
+    public function test_pager_marks_current_and_has_prev_next_in_middle(): void {
+        $this->stubAddQueryArg();
+        $html = ( new Renderer() )->pager( 5, 3, 'http://x/' );
+
+        $this->assertStringContainsString( 'sermonator-pager__link--prev', $html );
+        $this->assertStringContainsString( '?sermon_page=2', $html, 'Prev points at page 2.' );
+        $this->assertStringContainsString( 'sermonator-pager__link--next', $html );
+        $this->assertStringContainsString( '?sermon_page=4', $html, 'Next points at page 4.' );
+        // The current page renders as a span and is never linked.
+        $this->assertStringContainsString( '>3</span>', $html );
+        $this->assertStringNotContainsString( '?sermon_page=3', $html );
+    }
+
+    public function test_pager_escapes_link_url(): void {
+        $this->stubAddQueryArg();
+        Functions\when( 'esc_url' )->alias(
+            static fn( $s ) => str_replace( array( '"', '<', '>' ), array( '%22', '%3C', '%3E' ), (string) $s )
+        );
+        // A hostile base URL must not break out of the href attribute.
+        $html = ( new Renderer() )->pager( 2, 1, 'http://x/"><script>' );
+
+        $this->assertStringNotContainsString( '"><script>', $html );
+        $this->assertStringContainsString( '%22%3E%3Cscript%3E', $html );
+    }
+
+    public function test_pager_clamps_out_of_range_current_page(): void {
+        $this->stubAddQueryArg();
+        // currentPage beyond the last page clamps to the last page (it becomes the span).
+        $html = ( new Renderer() )->pager( 3, 99, 'http://x/' );
+        $this->assertStringContainsString( '>3</span>', $html );
+        $this->assertStringNotContainsString( '?sermon_page=3', $html );
+        $this->assertStringContainsString( 'sermonator-pager__link--prev', $html );
+        $this->assertStringNotContainsString( 'sermonator-pager__link--next', $html );
+    }
+
+    public function test_paginated_grid_appends_pager_to_grid(): void {
+        $this->stubAddQueryArg();
+        $result = new QueryResult( array( $this->view() ), 30, 3, 1 );
+        $html   = ( new Renderer() )->paginatedGrid( $result, 'http://x/', array( 'columns' => 3 ) );
+
+        $this->assertStringContainsString( 'sermonator-grid', $html );
+        $this->assertStringContainsString( 'sermonator-pager', $html );
+        $this->assertStringContainsString( '?sermon_page=2', $html );
+    }
+
+    public function test_paginated_grid_empty_result_has_no_pager(): void {
+        $result = new QueryResult( array(), 0, 0, 1 );
+        $html   = ( new Renderer() )->paginatedGrid( $result, 'http://x/' );
+
+        $this->assertStringContainsString( 'sermonator-grid__empty', $html );
+        $this->assertStringNotContainsString( 'sermonator-pager', $html );
     }
 }

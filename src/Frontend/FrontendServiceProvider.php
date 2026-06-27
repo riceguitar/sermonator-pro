@@ -37,6 +37,10 @@ final class FrontendServiceProvider {
 
     public function hook(): void {
         add_action( 'init', array( $this, 'onInit' ) );
+        // Register the dedicated `sermon_page` query var so the embedded paginated list's pager
+        // resolves (get_query_var returns '' for any UNregistered var → stuck on page 1 → silent
+        // tail-drop). It is distinct from the archive's main-query `paged`/`page`.
+        add_filter( 'query_vars', array( SermonQuery::class, 'registerQueryVar' ) );
         ( new ClassicTemplates() )->hook();
         ( new ScriptureRenderHook() )->hook();
         ( new ArchiveOrdering() )->hook();

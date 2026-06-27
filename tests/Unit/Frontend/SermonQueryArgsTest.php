@@ -246,4 +246,23 @@ final class SermonQueryArgsTest extends TestCase {
         $args = $this->query()->buildQueryArgs( array( 'postIn' => array( '0', 'x' ) ) );
         $this->assertArrayNotHasKey( 'post__in', $args );
     }
+
+    // ---- Bundle 2 / T5: the registered `sermon_page` query var --------------------------
+
+    public function test_page_query_var_constant_is_sermon_page(): void {
+        // The pager + read-path both reference this constant; it must not be the main query's
+        // `paged`/`page` (reserved for the archive).
+        $this->assertSame( 'sermon_page', SermonQuery::PAGE_QUERY_VAR );
+        $this->assertNotSame( 'paged', SermonQuery::PAGE_QUERY_VAR );
+        $this->assertNotSame( 'page', SermonQuery::PAGE_QUERY_VAR );
+    }
+
+    public function test_register_query_var_appends_sermon_page_idempotently(): void {
+        $vars = SermonQuery::registerQueryVar( array( 'foo', 'bar' ) );
+        $this->assertContains( 'sermon_page', $vars );
+        $this->assertSame( array( 'foo', 'bar', 'sermon_page' ), $vars );
+
+        // A double-hook must not duplicate the entry.
+        $this->assertSame( $vars, SermonQuery::registerQueryVar( $vars ) );
+    }
 }

@@ -28,9 +28,45 @@ use Sermonator\Schema\Identifiers as ID;
  */
 final class SermonQuery {
     /**
+     * The DEDICATED query var that carries an embedded paginated-list's current page.
+     *
+     * It is deliberately NOT `paged`/`page` (those are the MAIN query's, reserved for the sermon
+     * ARCHIVE): on a static page that embeds `[sermons per_page=N]` the main query's `paged` is 1,
+     * so reusing it would pin the list on page 1 and silently drop the long tail. This var MUST be
+     * registered on the public whitelist via the `query_vars` filter ({@see self::registerQueryVar})
+     * — `get_query_var()` returns '' for ANY unregistered var, which would defeat the pager the
+     * same way (stuck on page 1 → silent tail-drop).
+     */
+    public const PAGE_QUERY_VAR = 'sermon_page';
+
+    /**
      * @param int|null $now Override for "now" (the PREACHED future-cap and tests). Defaults to time().
      */
     public function __construct( private readonly ?int $now = null ) {}
+
+    /**
+     * Register {@see self::PAGE_QUERY_VAR} on WP's public query-vars whitelist. Wired to the
+     * `query_vars` filter by {@see \Sermonator\Frontend\FrontendServiceProvider}. Idempotent so a
+     * double-hook cannot duplicate the entry.
+     *
+     * @param list<string> $vars
+     * @return list<string>
+     */
+    public static function registerQueryVar( array $vars ): array {
+        if ( ! in_array( self::PAGE_QUERY_VAR, $vars, true ) ) {
+            $vars[] = self::PAGE_QUERY_VAR;
+        }
+        return $vars;
+    }
+
+    /**
+     * The current embedded-list page, read from the registered {@see self::PAGE_QUERY_VAR}
+     * (always >= 1). Impure (reads the WP query var); the pure builder never reads globals.
+     */
+    public static function currentPage(): int {
+        $page = (int) get_query_var( self::PAGE_QUERY_VAR );
+        return $page > 0 ? $page : 1;
+    }
 
     /**
      * @param array{
@@ -46,7 +82,14 @@ final class SermonQuery {
      * } $args
      */
     public function run( array $args = array() ): QueryResult {
-        $page    = isset( $args['page'] ) ? max( 1, (int) $args['page'] ) : 1;
+        if ( ! array_key_exists( 'page', $args ) ) {
+            // Read-path pin (spec §2.2): an embedded paginated list sources its current page from
+            // the dedicated, registered `sermon_page` query var — NOT GridArgs::currentPage()'s
+            // `paged`/`page` (reserved for the sermon archive). Callers that DO pass an explicit
+            // `page` (the native grid via GridArgs) are untouched.
+            $args['page'] = self::currentPage();
+        }
+        $page    = max( 1, (int) $args['page'] );
         $wpQuery = new \WP_Query( $this->buildQueryArgs( $args ) );
 
         $data    = new TemplateData();
