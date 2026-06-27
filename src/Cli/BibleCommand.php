@@ -20,14 +20,28 @@ use Sermonator\Schema\Identifiers as ID;
  *   wp sermonator bible flush
  *   wp sermonator bible vendor [--translation=<id>] [--write] [--force] [--limit=<n>] [--rollback]
  *   wp sermonator bible warm [--limit=<n>] [--rollback]
- *   wp sermonator bible audit [--inline]
+ *   wp sermonator bible audit [--inline] [--sample=<n>]
+ *   wp sermonator bible attest [--force]
  *
  * Phase 3a was LINK-MODE only. Phase 3b Task 8 adds the `vendor` subcommand (vendor the
  * public-domain ENGWEBP per-chapter text to the uploads snapshot, reversibly). Phase 3b
  * Task 9 adds the `warm` subcommand (prime the disposable transient chapter cache for the
- * chapters real sermons cite) — its disk-snapshot peer is `vendor`.
+ * chapters real sermons cite) — its disk-snapshot peer is `vendor`. The inline-enablement
+ * Task I extends `audit --inline` to the three-floor would-promote PREVIEW (+ `--sample`
+ * axis-2 spot-check) and adds `attest --force` — the single, LOGGED attestation override.
  */
 final class BibleCommand {
+    /**
+     * Optional {@see CoverageAudit} seam: the `audit` path constructs its own read-only
+     * audit by default, but tests inject one (e.g. with a warm-chapter resolver) so the
+     * promoted-ref `--sample` becomes exercisable without vendored text. Never used by any
+     * write path; carries no logic of its own.
+     */
+    private ?CoverageAudit $coverageAudit;
+
+    public function __construct( ?CoverageAudit $coverageAudit = null ) {
+        $this->coverageAudit = $coverageAudit;
+    }
     /**
      * Backfill the structured {@see ID::META_BIBLE_REFS} envelope (and the
      * {@see ID::TAX_BOOK} dual-write) for legacy sermons from the preserved free-text
@@ -330,20 +344,24 @@ final class BibleCommand {
      *
      * Without `--inline` it prints the persisted parse-coverage rollup (a pure read of
      * {@see ID::OPTION_BIBLE_STATS}; recomputed only by the cron / on-save path). With
-     * `--inline` it computes the inline withheld-by-reason tally + inline-eligible% fresh
-     * over the live corpus and prints it — still WITHOUT persisting anything.
+     * `--inline` it computes the would-promote PREVIEW (T-E) fresh over the live corpus —
+     * the would-promote count + inline-eligible% under EACH of the three confidence floors
+     * (exact / derived-exact / derived-exact-perseg, assume-attested ceiling), the
+     * withheld-by-reason breakdown, and the heterogeneity + unmodeled-pair WRONG-TEXT
+     * canaries — and prints it WITHOUT persisting anything.
      *
      * ## OPTIONS
      *
      * [--inline]
-     * : Run the inline corpus-gate report (withheld-by-reason, inline-eligible%, and the
-     *   unmodeled-pair WRONG-TEXT canary) instead of the parse-coverage summary.
+     * : Run the three-floor would-promote PREVIEW (per-floor would-promote count +
+     *   inline-eligible%, the withheld-by-reason tally, and the heterogeneity / unmodeled-
+     *   pair WRONG-TEXT canaries) instead of the parse-coverage summary.
      *
      * [--sample=<n>]
-     * : With `--inline`, print the would-promote PREVIEW (the would-promote count +
-     *   inline-eligible% under each of the three confidence floors, assume-attested) plus
-     *   up to N PROMOTED references with their raw passage substrings — the axis-2 human
-     *   spot-check the per-segment floor is gated behind (design §4 step 4).
+     * : With `--inline`, additionally print up to N PROMOTED references with their raw
+     *   passage substrings — the axis-2 human spot-check the per-segment floor is gated
+     *   behind (design §4 step 4). READ-ONLY: it writes nothing (the ack itself is a
+     *   separate, deliberate step).
      *
      * ## EXAMPLES
      *
@@ -355,19 +373,20 @@ final class BibleCommand {
      * @param array<string,string> $assoc_args
      */
     public function audit( array $args, array $assoc_args ): void {
-        $audit = new CoverageAudit();
-
         if ( empty( $assoc_args['inline'] ) ) {
             $this->reportParseCoverage( CoverageAudit::stats() );
             return;
         }
 
-        if ( array_key_exists( 'sample', $assoc_args ) ) {
-            $this->reportPromotionPreview( $audit->promotionPreview( true, (int) $assoc_args['sample'] ) );
-            return;
-        }
+        $audit = $this->coverageAudit ?? new CoverageAudit();
 
-        $this->reportInline( $audit->inlineReport() );
+        // `--inline` is now the three-floor would-promote PREVIEW (delegating to the shared
+        // CoverageAudit preview, T-E). `--sample=N` adds up to N promoted refs + raw; both
+        // are READ-ONLY (the preview classifies and counts but persists nothing).
+        $withSample = array_key_exists( 'sample', $assoc_args );
+        $sampleSize = $withSample ? max( 0, (int) $assoc_args['sample'] ) : 0;
+
+        $this->reportPromotionPreview( $audit->promotionPreview( true, $sampleSize ), $withSample );
     }
 
     /**
@@ -376,8 +395,9 @@ final class BibleCommand {
      * canaries, and the axis-2 promoted-ref sample (raw passage substrings). Writes nothing.
      *
      * @param array{target:string,assume_attested:bool,refs_total:int,heterogeneous:bool,families:array<string,int>,dominant_family:string,unmodeled_pair_wrong_text:int,floors:array<string,array{floor:string,would_promote:int,inline_eligible:int,inline_eligible_pct:float,withheld:array<string,int>}>,sample:list<array<string,mixed>>} $preview
+     * @param bool                                                                                                                                                                                                                                                                                                          $withSample Whether `--sample` was requested (prints the axis-2 promoted-ref section).
      */
-    private function reportPromotionPreview( array $preview ): void {
+    private function reportPromotionPreview( array $preview, bool $withSample = false ): void {
         \WP_CLI::log( sprintf(
             'Would-promote preview (target %s, assume-attested %s, %d render-ready references):',
             $preview['target'],
@@ -393,6 +413,10 @@ final class BibleCommand {
                 (string) $floor['inline_eligible_pct'],
                 $floor['inline_eligible']
             ) );
+            \WP_CLI::log( '    withheld by reason:' );
+            foreach ( $floor['withheld'] as $reason => $count ) {
+                \WP_CLI::log( sprintf( '      - %-30s %d', $reason, $count ) );
+            }
         }
 
         if ( $preview['unmodeled_pair_wrong_text'] > 0 ) {
@@ -410,18 +434,20 @@ final class BibleCommand {
             ) );
         }
 
-        if ( array() === $preview['sample'] ) {
-            \WP_CLI::log( '  No promoted references to sample.' );
-        } else {
-            \WP_CLI::log( sprintf( '  Axis-2 spot-check sample (%d promoted reference(s)):', count( $preview['sample'] ) ) );
-            foreach ( $preview['sample'] as $entry ) {
-                \WP_CLI::log( sprintf(
-                    '    - %s  [%s %s:%s]',
-                    (string) ( $entry['raw'] ?? '' ),
-                    (string) ( $entry['bookUSFM'] ?? '' ),
-                    (string) ( $entry['chapterStart'] ?? '' ),
-                    (string) ( $entry['verseStart'] ?? '' )
-                ) );
+        if ( $withSample ) {
+            if ( array() === $preview['sample'] ) {
+                \WP_CLI::log( '  No promoted references to sample.' );
+            } else {
+                \WP_CLI::log( sprintf( '  Axis-2 spot-check sample (%d promoted reference(s)):', count( $preview['sample'] ) ) );
+                foreach ( $preview['sample'] as $entry ) {
+                    \WP_CLI::log( sprintf(
+                        '    - %s  [%s %s:%s]',
+                        (string) ( $entry['raw'] ?? '' ),
+                        (string) ( $entry['bookUSFM'] ?? '' ),
+                        (string) ( $entry['chapterStart'] ?? '' ),
+                        (string) ( $entry['verseStart'] ?? '' )
+                    ) );
+                }
             }
         }
 
@@ -445,50 +471,75 @@ final class BibleCommand {
             (int) ( $stats['resolved'] ?? 0 ),
             (int) $stats['with_passage']
         ) );
-        \WP_CLI::log( 'Pass --inline for the inline corpus-gate report.' );
+        \WP_CLI::log( 'Pass --inline for the three-floor would-promote preview.' );
         \WP_CLI::success( 'Parse-coverage report complete (no writes).' );
     }
 
     /**
-     * Print the READ-ONLY inline corpus-gate report: the inline-eligible% over the
-     * corpus, the withheld-by-reason tally, and — loudly — the unmodeled-pair WRONG-TEXT
-     * canary and any source-versification heterogeneity. Writes nothing.
+     * LOGGED attestation override (design §4). Sets the L6 admin attestation
+     * ({@see ID::OPTION_BIBLE_INLINE_ATTESTATION}) TRUE, bypassing the Settings-API
+     * heterogeneity hard-disable in {@see \Sermonator\Admin\SettingsRegistrar::sanitizeAttestation()}
+     * — the rare-false-positive escape hatch, never a silent UI bypass. It is the ONLY
+     * writing path in this command and it ALWAYS records a {@see ID::OPTION_BIBLE_INLINE_ATTEST_LOG}
+     * entry (time, acting user, previous state, `cli-force` marker), then bumps the cache
+     * generation so the resolver re-evaluates L6 immediately.
      *
-     * @param array{target:string,floor:string,refs_total:int,inline_eligible:int,inline_eligible_pct:float,withheld:array<string,int>,unmodeled_pair_wrong_text:int,families:array<string,int>,dominant_family:string,heterogeneous:bool} $report
+     * Refuses without the explicit `--force` flag: the bare subcommand is READ-ONLY — it
+     * reports the current attestation state and exits, writing nothing. Unlike the Settings
+     * checkbox, `--force` does NOT consult the live audit — the bypass is the whole point —
+     * so the operator owns the recorded judgment that the single-tradition premise holds.
+     *
+     * ## OPTIONS
+     *
+     * [--force]
+     * : Required to write. Set the attestation TRUE despite any heterogeneity signal,
+     *   recording a timestamped override entry in the attestation audit log.
+     *
+     * ## EXAMPLES
+     *
+     *     wp sermonator bible attest
+     *     wp sermonator bible attest --force
+     *
+     * @param array<int,string>    $args
+     * @param array<string,string> $assoc_args
      */
-    private function reportInline( array $report ): void {
-        \WP_CLI::log( sprintf(
-            'Inline corpus-gate (target %s, confidence floor %s):',
-            $report['target'],
-            $report['floor']
-        ) );
-        \WP_CLI::log( sprintf(
-            '  inline-eligible: %s%% (%d of %d render-ready references).',
-            (string) $report['inline_eligible_pct'],
-            $report['inline_eligible'],
-            $report['refs_total']
-        ) );
+    public function attest( array $args, array $assoc_args ): void {
+        $current = (bool) get_option( ID::OPTION_BIBLE_INLINE_ATTESTATION, false );
 
-        \WP_CLI::log( '  withheld by reason:' );
-        foreach ( $report['withheld'] as $reason => $count ) {
-            \WP_CLI::log( sprintf( '    - %-30s %d', $reason, $count ) );
+        if ( empty( $assoc_args['force'] ) ) {
+            \WP_CLI::log( sprintf( 'Inline attestation is currently %s.', $current ? 'ON' : 'OFF' ) );
+            \WP_CLI::warning(
+                'Setting attestation from the CLI requires the explicit --force override flag '
+                . '(the normal path is the Settings checkbox, which is hard-disabled on a '
+                . 'heterogeneous corpus). No changes made.'
+            );
+            return;
         }
 
-        if ( $report['unmodeled_pair_wrong_text'] > 0 ) {
-            \WP_CLI::warning( sprintf(
-                'WRONG-TEXT canary: %d reference(s) hit an UNMODELED versification pair — direct proof the divergent-zone table is incomplete. Model these before enabling inline at scale.',
-                $report['unmodeled_pair_wrong_text']
-            ) );
-        }
+        // The single writing path: set the option TRUE and append the logged override entry
+        // (the auditable record that the heterogeneity hard-disable was bypassed deliberately).
+        update_option( ID::OPTION_BIBLE_INLINE_ATTESTATION, true );
 
-        if ( $report['heterogeneous'] ) {
-            \WP_CLI::warning( sprintf(
-                'Source-versification HETEROGENEITY: the corpus carries %d distinct family bucket(s) (dominant: %s). The single site-wide attestation is unsafe — inline could surface real-but-wrong verses for the minority tradition.',
-                count( $report['families'] ),
-                '' === $report['dominant_family'] ? '(none)' : $report['dominant_family']
-            ) );
+        $log = get_option( ID::OPTION_BIBLE_INLINE_ATTEST_LOG, array() );
+        if ( ! is_array( $log ) ) {
+            $log = array();
         }
+        $log[] = array(
+            'at'       => time(),
+            'user'     => function_exists( 'get_current_user_id' ) ? (int) get_current_user_id() : 0,
+            'via'      => 'cli-force',
+            'previous' => $current,
+        );
+        update_option( ID::OPTION_BIBLE_INLINE_ATTEST_LOG, $log );
 
-        \WP_CLI::success( 'Inline corpus-gate report complete (read-only; no writes).' );
+        // Mirror the settings-save bump on a bible-axis change so the resolver re-evaluates
+        // L6 on the next render (a stale cached link must not survive the attestation).
+        $gen = (int) get_option( ID::OPTION_BIBLE_CACHE_GEN, 0 );
+        update_option( ID::OPTION_BIBLE_CACHE_GEN, $gen + 1 );
+
+        \WP_CLI::success(
+            'Attestation set TRUE via logged --force override (heterogeneity hard-disable bypassed; '
+            . 'override recorded in the attestation audit log).'
+        );
     }
 }

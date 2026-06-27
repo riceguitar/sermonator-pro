@@ -126,6 +126,17 @@ final class Identifiers {
     public const OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN = 'sermonator_bible_inline_enabled_audit_gen';
 
     /**
+     * Append-only audit log of the logged CLI attestation override
+     * (`wp sermonator bible attest --force`, T-I) — the ONLY way to set the L6 attestation
+     * TRUE while the Settings-API heterogeneity hard-disable would refuse it. Each entry
+     * records the time, acting user id, the previous attestation state, and the via marker
+     * (`cli-force`), so the deliberate bypass of the single-tradition safety premise is
+     * never silent (design §4 — "a logged escape hatch, never a silent UI bypass"). A list
+     * of entries; never read on a render path.
+     */
+    public const OPTION_BIBLE_INLINE_ATTEST_LOG = 'sermonator_bible_inline_attest_log';
+
+    /**
      * Stamped into every vendored/normalized per-chapter JSON file and folded into
      * the chapter-cache transient key. Bump to invalidate every cached chapter when
      * the normalized node shape changes (design §3.4 / §3.6). Distinct from the
