@@ -161,3 +161,80 @@
 .sermonator-meta-grid__item > .components-base-control:first-child {
 	margin-top: 0;
 }
+
+/* Scripture confirm-chip panel */
+.sermonator-scripture-refs {
+	margin-top: 12px;
+}
+
+.sermonator-scripture-refs__intro {
+	margin: 0 0 8px;
+	font-size: 12px;
+	color: #646970;
+}
+
+.sermonator-scripture-chip-list {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.sermonator-scripture-chip {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 8px;
+	border: 1px solid #dcdcde;
+	border-radius: 4px;
+	background: #fff;
+}
+
+.sermonator-scripture-chip.is-removed {
+	opacity: 0.55;
+}
+
+.sermonator-scripture-chip.is-removed .sermonator-scripture-chip__main {
+	text-decoration: line-through;
+}
+
+.sermonator-scripture-chip__main {
+	flex: 1 1 auto;
+	min-width: 140px;
+}
+
+.sermonator-scripture-chip__edit {
+	flex: 1 1 100%;
+}
+
+.sermonator-scripture-chip__actions {
+	display: flex;
+	gap: 8px;
+	margin-top: 4px;
+}
+
+.sermonator-scripture-chip__status {
+	font-size: 11px;
+	line-height: 1.4;
+	padding: 2px 8px;
+	border-radius: 10px;
+	white-space: normal;
+}
+
+.sermonator-scripture-chip__status[data-status='inline'] {
+	background: #edfaef;
+	color: #00450c;
+}
+
+.sermonator-scripture-chip__status[data-status='link'] {
+	background: #f0f0f1;
+	color: #50575e;
+}
+
+.sermonator-scripture-chip__status[data-status='invalid'] {
+	background: #fcf0f1;
+	color: #8a1f11;
+}

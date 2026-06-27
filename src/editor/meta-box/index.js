@@ -3,22 +3,29 @@
  *
  * React-powered form rendered inside a WordPress meta box. All changes are
  * serialized to a single hidden input (sermonator_meta_json) and saved by PHP.
+ *
+ * The @wordpress/* imports are externalized by @wordpress/scripts to the runtime
+ * window.wp.* globals AND emitted into index.asset.php as the script dependency list, so
+ * WordPress enqueues wp-element/wp-components/wp-media-utils/etc. before this bundle runs
+ * (wp-media-utils is NOT auto-loaded — MediaUpload would be undefined without the
+ * declared dependency).
  */
-(function () {
-	const { createElement: el, render, useState, useEffect, useRef } = wp.element;
-	const { __ } = wp.i18n;
-	const {
-		TextControl,
-		TextareaControl,
-		Button,
-		BaseControl,
-		Notice,
-		Spinner,
-	} = wp.components;
-	const { MediaUpload } = wp.mediaUtils;
-	const { dateI18n, getDate } = wp.date;
-	const apiFetch = wp.apiFetch;
+import { createElement as el, render, useState, useEffect, useRef } from '@wordpress/element';
+import { __ } from '@wordpress/i18n';
+import {
+	TextControl,
+	TextareaControl,
+	Button,
+	BaseControl,
+	CheckboxControl,
+	Notice,
+	Spinner,
+} from '@wordpress/components';
+import { MediaUpload } from '@wordpress/media-utils';
+import { dateI18n, getDate } from '@wordpress/date';
+import apiFetch from '@wordpress/api-fetch';
 
+(function () {
 	const config = window.sermonatorMetaBox || {};
 	const initialMeta = config.initialData || {};
 	const editingAllowed = config.editingAllowed !== false;
@@ -35,7 +42,151 @@
 		videoEmbed: 'sermonator_video_embed',
 		notes: 'sermonator_notes',
 		bulletin: 'sermonator_bulletin',
+		refs: 'sermonator_bible_refs',
 	};
+
+	/**
+	 * Stable structural identity for a parsed ref, used to remember the author's
+	 * keep/remove decisions across re-parses of the passage (mirrors the server-side
+	 * per-ref clearStaleAutoParseEnvelope preservation).
+	 *
+	 * @param {Object} ref
+	 * @return {string}
+	 */
+	function refKey(ref) {
+		return [
+			ref.bookUSFM || '',
+			ref.chapterStart !== null ? ref.chapterStart : '',
+			ref.verseStart !== null ? ref.verseStart : '',
+			ref.verseEnd !== null ? ref.verseEnd : '',
+			ref.chapterEnd !== null ? ref.chapterEnd : '',
+		].join('|');
+	}
+
+	/**
+	 * Best-effort human label for a ref when the parser did not echo the raw text.
+	 *
+	 * @param {Object} ref
+	 * @return {string}
+	 */
+	function formatRef(ref) {
+		if (ref.raw) {
+			return ref.raw;
+		}
+		let label = (ref.bookUSFM || '') + ' ' + (ref.chapterStart || '');
+		if (ref.verseStart !== null) {
+			label += ':' + ref.verseStart;
+			if (ref.verseEnd !== null && ref.verseEnd !== ref.verseStart) {
+				label += '-' + ref.verseEnd;
+			}
+		}
+		return label.trim();
+	}
+
+	/**
+	 * PRE-FILTER eligibility preview for one parsed ref. Honest by construction: this is
+	 * only the pure structural pre-filter the server exposes (L1/L3) — the final inline
+	 * decision additionally depends on the source→target versification relation resolved
+	 * off the render path and on site settings. Returns a status + an author-readable,
+	 * never-color-only label.
+	 *
+	 * @param {Object} ref
+	 * @return {{status: string, inline: boolean, label: string}}
+	 */
+	function eligibilityFor(ref) {
+		const v = ref.validation || {};
+
+		if (!v.inCanon || !v.structurallyValid) {
+			return {
+				status: 'invalid',
+				inline: false,
+				label: __('Not a recognized reference — will not be saved', 'sermonator'),
+			};
+		}
+
+		if (v.inlineEligible) {
+			return {
+				status: 'inline',
+				inline: true,
+				label: __('Will show inline', 'sermonator'),
+			};
+		}
+
+		if (ref.verseStart === null) {
+			return {
+				status: 'link',
+				inline: false,
+				label: __('Shown as a link (whole-chapter reference)', 'sermonator'),
+			};
+		}
+
+		if (ref.chapterEnd !== null) {
+			return {
+				status: 'link',
+				inline: false,
+				label: __('Shown as a link (spans multiple chapters)', 'sermonator'),
+			};
+		}
+
+		return {
+			status: 'link',
+			inline: false,
+			label: __(
+				'Shown as a link because verse numbering differs between translations',
+				'sermonator'
+			),
+		};
+	}
+
+	/**
+	 * Assemble the META_BIBLE_REFS write value from the author's kept chips. Only the
+	 * whitelisted STRUCTURAL fields are sent; the server (SermonRefsRestSanitizer) is the
+	 * sole authority for provenance (source/confidence/srcVersification*) and re-stamps
+	 * exact/authoring/authored on save — client values are never trusted. Returns '' when
+	 * nothing is kept (reads server-side as "no envelope", a safe fall-open to the link).
+	 *
+	 * @param {Object[]} chips
+	 * @return {string}
+	 */
+	function buildRefsEnvelope(chips) {
+		const refs = chips
+			.filter(function (chip) {
+				return chip.kept && !chip.invalid && chip.eligibility.status !== 'invalid';
+			})
+			.map(function (chip) {
+				const ref = chip.ref;
+				return {
+					bookUSFM: ref.bookUSFM || '',
+					chapterStart: ref.chapterStart || 0,
+					verseStart: ref.verseStart !== null ? ref.verseStart : null,
+					verseEnd: ref.verseEnd !== null ? ref.verseEnd : null,
+					chapterEnd: ref.chapterEnd !== null ? ref.chapterEnd : null,
+					raw: ref.raw || formatRef(ref),
+				};
+			});
+
+		if (!refs.length) {
+			return '';
+		}
+
+		return JSON.stringify({ refs: refs });
+	}
+
+	/**
+	 * Fetch the live parse of a free-text passage from the read-only preview endpoint.
+	 *
+	 * @param {string} passage
+	 * @return {Promise<Object[]>} candidate refs (each carrying a `validation` block)
+	 */
+	function fetchParse(passage) {
+		return apiFetch({
+			path:
+				'/sermonator/v1/bible-parse?' +
+				new URLSearchParams({ passage: passage }).toString(),
+		}).then(function (result) {
+			return result && Array.isArray(result.refs) ? result.refs : [];
+		});
+	}
 
 	/**
 	 * Convert a date-only picker value (YYYY-MM-DD) into a Unix timestamp for the start
@@ -199,6 +350,315 @@
 					  )
 					: null
 			)
+		);
+	}
+
+	/**
+	 * Confirm-chip Scripture authoring panel.
+	 *
+	 * Fetches the live parse of the current Scripture passage and renders each candidate
+	 * reference as an editable confirm CHIP, flagged with its pure pre-filter eligibility
+	 * label ("will show inline" vs "shown as a link …"). The author can keep, edit, or
+	 * remove chips; the kept chips feed META_BIBLE_REFS, which the server stamps
+	 * exact/authoring/authored on save. The panel never writes META_BIBLE_REFS until the
+	 * author actually interacts with a chip, so simply opening a sermon never clobbers a
+	 * previously curated envelope. props.onRefsChange is called with the envelope JSON
+	 * string (or '' when nothing is kept).
+	 *
+	 * @param {Object}   props
+	 * @param {string}   props.passage
+	 * @param {boolean}  props.editingAllowed
+	 * @param {Function} props.onRefsChange
+	 */
+	function ScriptureReferences(props) {
+		const passage = props.passage || '';
+		const canEdit = props.editingAllowed;
+		const onRefsChange = props.onRefsChange;
+
+		const [chips, setChips] = useState([]);
+		const [isLoading, setIsLoading] = useState(false);
+		const [error, setError] = useState('');
+
+		// Has the author interacted with a chip? Until then the panel is read-only
+		// preview and writes nothing, so opening a sermon cannot overwrite saved refs.
+		const touchedRef = useRef(false);
+		// refKey -> true for chips the author removed; preserved across re-parses.
+		const dismissedRef = useRef({});
+		// The passage string the current chips were built from (avoids redundant fetches).
+		const builtFromRef = useRef(null);
+
+		const buildChips = function (refs) {
+			return refs.map(function (ref, index) {
+				const key = refKey(ref);
+				return {
+					id: key + '#' + index,
+					key: key,
+					ref: ref,
+					raw: ref.raw || formatRef(ref),
+					eligibility: eligibilityFor(ref),
+					kept: !dismissedRef.current[key],
+					editing: false,
+					editText: ref.raw || formatRef(ref),
+					invalid: false,
+				};
+			});
+		};
+
+		// Re-parse whenever the passage changes (debounced). The render-time fetch is the
+		// read-only preview endpoint; it writes nothing.
+		useEffect(
+			function () {
+				if (builtFromRef.current === passage) {
+					return;
+				}
+
+				if (!passage.trim()) {
+					builtFromRef.current = passage;
+					setError('');
+					setIsLoading(false);
+					setChips([]);
+					return;
+				}
+
+				let cancelled = false;
+				setIsLoading(true);
+				setError('');
+
+				const timeoutId = setTimeout(function () {
+					fetchParse(passage)
+						.then(function (refs) {
+							if (cancelled) {
+								return;
+							}
+							builtFromRef.current = passage;
+							setChips(buildChips(refs));
+						})
+						.catch(function (err) {
+							if (cancelled) {
+								return;
+							}
+							setError(
+								err && err.message
+									? err.message
+									: __('Could not read Scripture references.', 'sermonator')
+							);
+							setChips([]);
+						})
+						.finally(function () {
+							if (!cancelled) {
+								setIsLoading(false);
+							}
+						});
+				}, 400);
+
+				return function () {
+					cancelled = true;
+					clearTimeout(timeoutId);
+				};
+			},
+			[passage]
+		);
+
+		// Push the envelope to the parent meta ONLY after the author has touched a chip.
+		useEffect(
+			function () {
+				if (!touchedRef.current) {
+					return;
+				}
+				onRefsChange(buildRefsEnvelope(chips));
+			},
+			// onRefsChange is a stable updateMeta wrapper; fire only on chip changes.
+			// eslint-disable-next-line react-hooks/exhaustive-deps
+			[chips]
+		);
+
+		const updateChip = function (id, changes) {
+			touchedRef.current = true;
+			setChips(function (prev) {
+				return prev.map(function (chip) {
+					return chip.id === id ? Object.assign({}, chip, changes) : chip;
+				});
+			});
+		};
+
+		const toggleKeep = function (chip) {
+			return function (kept) {
+				dismissedRef.current[chip.key] = !kept;
+				updateChip(chip.id, { kept: kept });
+			};
+		};
+
+		const startEdit = function (chip) {
+			return function () {
+				updateChip(chip.id, { editing: true, editText: chip.raw });
+			};
+		};
+
+		const cancelEdit = function (chip) {
+			return function () {
+				updateChip(chip.id, { editing: false, editText: chip.raw, invalid: false });
+			};
+		};
+
+		const changeEditText = function (chip) {
+			return function (value) {
+				updateChip(chip.id, { editText: value });
+			};
+		};
+
+		const confirmEdit = function (chip) {
+			return function () {
+				const text = (chip.editText || '').trim();
+				if (!text) {
+					updateChip(chip.id, { invalid: true });
+					return;
+				}
+				fetchParse(text)
+					.then(function (refs) {
+						const ref = refs[0];
+						if (!ref) {
+							updateChip(chip.id, { invalid: true });
+							return;
+						}
+						updateChip(chip.id, {
+							ref: ref,
+							raw: ref.raw || formatRef(ref),
+							editText: ref.raw || formatRef(ref),
+							eligibility: eligibilityFor(ref),
+							editing: false,
+							invalid: false,
+							key: refKey(ref),
+						});
+					})
+					.catch(function () {
+						updateChip(chip.id, { invalid: true });
+					});
+			};
+		};
+
+		const renderChip = function (chip) {
+			const classes = ['sermonator-scripture-chip'];
+			if (!chip.kept) {
+				classes.push('is-removed');
+			}
+			if (chip.invalid) {
+				classes.push('is-invalid');
+			}
+
+			if (chip.editing) {
+				return el(
+					'li',
+					{ className: classes.join(' '), key: chip.id },
+					el(
+						'div',
+						{ className: 'sermonator-scripture-chip__edit' },
+						el(TextControl, {
+							label: __('Edit reference', 'sermonator'),
+							value: chip.editText,
+							onChange: changeEditText(chip),
+							disabled: !canEdit,
+						}),
+						chip.invalid
+							? el(
+									'span',
+									{ className: 'sermonator-scripture-chip__status', 'data-status': 'invalid' },
+									__('Not a recognized reference', 'sermonator')
+							  )
+							: null,
+						el(
+							'div',
+							{ className: 'sermonator-scripture-chip__actions' },
+							el(
+								Button,
+								{ variant: 'secondary', onClick: confirmEdit(chip), disabled: !canEdit },
+								__('Apply', 'sermonator')
+							),
+							el(
+								Button,
+								{ variant: 'link', onClick: cancelEdit(chip) },
+								__('Cancel', 'sermonator')
+							)
+						)
+					)
+				);
+			}
+
+			return el(
+				'li',
+				{ className: classes.join(' '), key: chip.id },
+				el(
+					'div',
+					{ className: 'sermonator-scripture-chip__main' },
+					el(CheckboxControl, {
+						label: chip.raw,
+						checked: chip.kept,
+						onChange: toggleKeep(chip),
+						disabled: !canEdit || chip.eligibility.status === 'invalid',
+						__nextHasNoMarginBottom: true,
+					})
+				),
+				el(
+					'span',
+					{
+						className: 'sermonator-scripture-chip__status',
+						'data-status': chip.eligibility.status,
+					},
+					chip.eligibility.label
+				),
+				el(
+					Button,
+					{
+						variant: 'link',
+						onClick: startEdit(chip),
+						disabled: !canEdit,
+						className: 'sermonator-scripture-chip__edit-toggle',
+					},
+					__('Edit', 'sermonator')
+				)
+			);
+		};
+
+		return el(
+			'div',
+			{ className: 'sermonator-scripture-refs' },
+			el(
+				'p',
+				{ className: 'sermonator-scripture-refs__intro' },
+				__(
+					'Confirm which references are saved with this sermon. Inline display also depends on site settings and translation.',
+					'sermonator'
+				)
+			),
+			isLoading
+				? el(
+						'span',
+						{ className: 'sermonator-fetching' },
+						el(Spinner),
+						__('Reading references…', 'sermonator')
+				  )
+				: null,
+			error ? el(Notice, { status: 'error', isDismissible: false }, error) : null,
+			!isLoading && !error && !chips.length && passage.trim()
+				? el(
+						'p',
+						{ className: 'sermonator-meta-empty' },
+						__('No recognizable references in this passage.', 'sermonator')
+				  )
+				: null,
+			!passage.trim()
+				? el(
+						'p',
+						{ className: 'sermonator-meta-empty' },
+						__('Enter a Scripture passage above to see references.', 'sermonator')
+				  )
+				: null,
+			chips.length
+				? el(
+						'ul',
+						{ className: 'sermonator-scripture-chip-list' },
+						chips.map(renderChip)
+				  )
+				: null
 		);
 	}
 
@@ -406,6 +866,13 @@
 							},
 							placeholder: __('e.g. John 1:1-14', 'sermonator'),
 							disabled: !editingAllowed,
+						}),
+						el(ScriptureReferences, {
+							passage: meta[META_KEYS.passage] || '',
+							editingAllowed: editingAllowed,
+							onRefsChange: function (envelope) {
+								updateMeta(META_KEYS.refs, envelope);
+							},
 						})
 					)
 				)
