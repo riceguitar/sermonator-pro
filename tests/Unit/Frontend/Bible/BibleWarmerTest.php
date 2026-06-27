@@ -54,6 +54,9 @@ final class BibleWarmerTest extends TestCase {
             if ( ID::OPTION_BIBLE_INLINE_TRANSLATION === $name ) {
                 return 'ENGWEBP';
             }
+            if ( ID::OPTION_BIBLE_INLINE_ENABLED === $name ) {
+                return true;
+            }
             if ( ID::OPTION_BIBLE_CACHE_GEN === $name ) {
                 return 4;
             }
@@ -214,6 +217,35 @@ final class BibleWarmerTest extends TestCase {
         $this->assertTrue( $result['gated'], 'Warming is gated during an active migration.' );
         $this->assertSame( 0, $result['warmed'] );
         $this->assertSame( array(), $this->resolverCalls, 'A gated warm never touches the resolver.' );
+    }
+
+    public function test_warm_for_post_is_inert_when_inline_is_disabled(): void {
+        // The default install state: inline OFF. Warm-on-save must NOT fire synchronous
+        // live fetches (no render consumer until enabled) — the pre-enable bulk warm is
+        // the CLI's job.
+        Functions\when( 'get_option' )->alias( function ( $name, $default = false ) {
+            if ( ID::OPTION_MIGRATION_STATE === $name ) {
+                return array( 'phase' => 'none' );
+            }
+            if ( ID::OPTION_BIBLE_INLINE_TRANSLATION === $name ) {
+                return 'ENGWEBP';
+            }
+            if ( ID::OPTION_BIBLE_INLINE_ENABLED === $name ) {
+                return false;
+            }
+            return $default;
+        } );
+
+        $this->refsByPost[ 7 ] = $this->envelope( array( $this->ref( 'JHN', 3 ) ) );
+
+        $result = ( new BibleWarmer( null, $this->resolver() ) )->warmForPost( 7 );
+
+        $this->assertSame( 0, $result['warmed'] );
+        $this->assertSame(
+            array(),
+            $this->resolverCalls,
+            'Inline disabled → warm-on-save never touches the resolver (no synchronous fetch).'
+        );
     }
 
     // ── chunked CLI sweep ───────────────────────────────────────────────────

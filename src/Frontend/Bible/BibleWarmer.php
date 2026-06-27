@@ -54,6 +54,13 @@ use Sermonator\Schema\Identifiers as ID;
  */
 final class BibleWarmer {
     /**
+     * Upper bound on chapters warmed SYNCHRONOUSLY in a single sermon-save request, so a
+     * scripture-dense sermon cannot serialize dozens of 5s live fetches into one save (the
+     * off-render-path fan-out, on the editor path). The chunked CLI backfill drains the rest.
+     */
+    private const SAVE_WARM_CHAPTER_LIMIT = 6;
+
+    /**
      * Resolves the candidate sermon ids (those carrying a {@see ID::META_BIBLE_REFS}
      * envelope). Injected so the sweep is unit-testable without a live WP_Query.
      *
@@ -123,13 +130,28 @@ final class BibleWarmer {
     public function warmForPost( int $post_id ): array {
         $translation = $this->inlineTranslation();
 
+        // Warm-on-save has NO render consumer until inline is enabled (the render path is
+        // independently kill-switched). Warming pre-enable would fire SYNCHRONOUS live
+        // helloao fetches on every sermon save on a default (cold disk+cache) install —
+        // serializing one 5s fetch per cited chapter into the save request, the exact
+        // N-serial fan-out the off-render-path design forbids, now on the editor path. The
+        // pre-enable bulk warm is the CLI's job (the un-enableable gate requires a full
+        // vendor+warm pass first; once vendored, the fill-missing disk check makes
+        // warm-on-save a near no-op anyway).
+        if ( ! get_option( ID::OPTION_BIBLE_INLINE_ENABLED, false ) ) {
+            return $this->gatedResult( $translation );
+        }
+
         // Never warm a moving target: the same gate every other cache/meta write path uses.
         if ( ! MigrationGuard::editingAllowed() ) {
             return $this->gatedResult( $translation );
         }
 
+        // Bound the SYNCHRONOUS per-save warm so a single scripture-dense sermon can never
+        // serialize dozens of 5s fetches into one save request; the chunked CLI backfill
+        // (wp sermonator bible warm) drains any remainder.
         $chapters = $this->citedChaptersForPost( $post_id );
-        $result   = $this->warmChapters( $translation, $chapters, 0 );
+        $result   = $this->warmChapters( $translation, $chapters, self::SAVE_WARM_CHAPTER_LIMIT );
         $result['gated'] = false;
 
         return $result;

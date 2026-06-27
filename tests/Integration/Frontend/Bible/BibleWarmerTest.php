@@ -214,6 +214,8 @@ final class BibleWarmerTest extends WP_UnitTestCase {
     // -------------------------------------------------------------------------
 
     public function test_warm_for_post_primes_just_that_sermons_chapters(): void {
+        // Warm-on-save only fires once inline is enabled (no render consumer before then).
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
         $id = $this->sermonWithRefs( array( $this->ref( 'LUK', 2 ) ) );
 
         $result = ( new BibleWarmer( null, $this->resolver() ) )->warmForPost( $id );
