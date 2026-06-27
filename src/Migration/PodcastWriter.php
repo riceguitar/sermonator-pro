@@ -61,13 +61,15 @@ final class PodcastWriter {
             }
 
             if ( $this->isComplete( $existing ) ) {
-                // COMPLETE — normally a no-op skip. But a podcast's feed-scope term
-                // references live inside settings meta; if a record was somehow
-                // stamped COMPLETE while a filter-term crosswalk was still missing
-                // (e.g. an older writer that did not withhold COMPLETE), re-run ONLY
-                // the meta remap so the now-available term self-heals and the open
-                // missing_podcast_term_crosswalk flag clears. A completed record with
-                // NO open term flag is left entirely untouched (no re-write).
+                // COMPLETE — a podcast's feed-scope term references live inside settings
+                // meta, so this branch still reconciles scope. If a record was stamped
+                // COMPLETE while a filter-term crosswalk was still missing (an older
+                // writer that did not withhold COMPLETE), re-run the BLOB meta remap so
+                // the now-available term self-heals and the open
+                // missing_podcast_term_crosswalk flag clears. A record with NO open term
+                // flag still gets a MERGE-ONLY object-term scope reconcile (below) so a
+                // pre-fix COMPLETE record that never read object-terms picks up its
+                // per-podcast scope in place rather than over-including every sermon.
                 // Idempotently ensure the durable map carries this pair even for a
                 // record completed by an OLDER writer that predates map population.
                 $this->recordLegacyPodcastMap( $legacyId, $existing );
@@ -81,7 +83,32 @@ final class PodcastWriter {
                     }
                     return new WriteResult( $existing, false, $flags, false );
                 }
-                return new WriteResult( $existing, false, $persisted, false );
+
+                // IMPORTANT (B2-deep-compat fix): COMPLETE with NO open term flag is NOT
+                // automatically a no-op. A record stamped MIGRATION_COMPLETE by a PRE-FIX
+                // writer (which never read object-terms) carries NEITHER the migrated
+                // object-term scope NOR a missing flag — yet a scoped feed would keep
+                // over-including the FULL site-wide sermon set to live subscribers, the
+                // exact over-inclusion this fix exists to close, with no fail-visible
+                // signal. The elaborate in-place resume machinery never reaches these
+                // records without a full Rollback. Reconcile the object-term scope IN
+                // PLACE so an already-complete record self-heals across the version
+                // boundary. mergeObjectTermScope is MERGE-ONLY (admin-edit safe, never
+                // re-derives the blob like applyScopedSettingsRemap) and gates its meta
+                // write on an actual diff — a true no-op for records already carrying the
+                // correct scope (the common case), so this adds no churn.
+                $reconciled = $this->mergeObjectTermScope( $existing, $legacyId, $persisted );
+                if ( $reconciled !== $persisted ) {
+                    $this->writeFlags( $existing, $reconciled );
+                }
+                // If the reconcile turned up an UNRESOLVED scope term, WITHHOLD COMPLETE
+                // (mirror the forward-path discipline) so the record drops back into the
+                // resume leg and self-heals once the term migrates — rather than serving
+                // a feed scoped to a dead term, stamped-complete-and-skipped-forever.
+                if ( $this->hasOpenTermCrosswalkFlag( $reconciled ) ) {
+                    delete_post_meta( $existing, Crosswalk::MIGRATION_COMPLETE );
+                }
+                return new WriteResult( $existing, false, $reconciled, false );
             }
 
             // Stamped but PARTIAL — RESUME on the existing post (never insert).
@@ -314,21 +341,43 @@ final class PodcastWriter {
             return array_values( array_unique( $flags ) );
         }
 
-        $settings = get_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, true );
-        $settings = is_array( $settings ) ? $settings : array();
+        // IMPORTANT (B2-deep-compat fix): read the FULL multiset, not just row-1.
+        // applyMeta() DELIBERATELY preserves >1 META_PODCAST_SETTINGS rows under this
+        // target key (the FIX IMPORTANT #9 union logic / meta_key_collision flag): a
+        // legacy podcast carrying duplicate sm_podcast_settings rows, or a stray
+        // verbatim sermonator_podcast_settings row alongside the renamed one, migrates
+        // as >1 rows. The previous get_post_meta(...,true) read only row-1 and the
+        // delete-all-then-add-one below then COLLAPSED the multiset, permanently
+        // dropping rows 2..N on every spine pass (unrecoverable after Finalize). Read
+        // every row so the count is preserved.
+        $rows = get_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, false );
+        $rows = is_array( $rows ) ? array_values( $rows ) : array();
+
+        // The feed-functional row is the FIRST (canonical) one — the resolver reads
+        // ONLY row-1 via get_post_meta(...,true). Merge the object-term scope into THAT
+        // row only; rows 2..N are byte-immutable carry-through.
+        $canonical = $rows === array() ? array() : $rows[0];
+        $canonical = is_array( $canonical ) ? $canonical : array();
 
         $result = PodcastObjectTermScopeMapper::merge(
-            $settings,
+            $canonical,
             $legacyScope,
             MappingContract::taxonomyMap(),
             fn( int $legacyTermId ): ?int => $this->terms->newTermId( $legacyTermId )
         );
 
         if ( $result['changed'] ) {
-            // Single canonical row, delete-then-re-add (idempotent on resume); the
-            // merged settings array round-trips byte-exact through wp_slash (recurses).
+            // Delete-then-re-add the ENTIRE list (merged canonical row first, then rows
+            // 2..N verbatim) so the row COUNT is preserved — never collapsed to one.
+            // Idempotent on resume; each value round-trips byte-exact through wp_slash
+            // (recurses into arrays). When there were zero existing rows this writes the
+            // single merged row, matching the prior fresh-podcast behaviour.
+            $rest = array_slice( $rows, 1 );
             delete_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS );
             add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $result['settings'] ) );
+            foreach ( $rest as $row ) {
+                add_post_meta( $newId, Identifiers::META_PODCAST_SETTINGS, wp_slash( $row ) );
+            }
         }
 
         return array_values( array_unique( array_merge( $flags, $result['flags'] ) ) );

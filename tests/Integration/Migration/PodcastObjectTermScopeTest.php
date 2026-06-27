@@ -224,4 +224,94 @@ final class PodcastObjectTermScopeTest extends WP_UnitTestCase {
         $this->assertSame( 1, $stats['podcasts']['single_scoped'] );
         $this->assertTrue( $stats['podcasts']['multi_podcast'] );
     }
+
+    // =========================================================================
+    // Adversarial-review fix 1: object-term scope merge must PRESERVE a settings
+    // multiset (>1 META_PODCAST_SETTINGS rows), never collapse it to a single row.
+    // =========================================================================
+
+    public function test_object_term_scope_merge_preserves_settings_multiset(): void {
+        [ $legacyTermId, $newTermId ] = $this->migratedSeriesTerm( 'Multiset Series' );
+
+        // A legacy podcast that yields >1 META_PODCAST_SETTINGS rows on the migrated
+        // record: the renamed sm_podcast_settings row UNIONED with a stray verbatim
+        // sermonator_podcast_settings row (applyMeta's FIX IMPORTANT #9 union logic).
+        $legacyPodcast = $this->fixture->createPodcastWithSettings(
+            array( 'itunes_author' => 'Canonical' ),
+            'Multiset Feed'
+        );
+        add_post_meta( $legacyPodcast, ID::META_PODCAST_SETTINGS, array( 'itunes_author' => 'Stray' ) );
+        wp_set_object_terms( $legacyPodcast, array( $legacyTermId ), LID::TAX_SERIES );
+
+        $result = ( new PodcastWriter() )->write( $legacyPodcast );
+
+        // The multiset row COUNT must be preserved — the merge must not drop rows 2..N.
+        $rows = get_post_meta( $result->newId, ID::META_PODCAST_SETTINGS, false );
+        $this->assertCount( 2, $rows, 'settings multiset must survive the object-term scope merge' );
+
+        // The scope is merged into the canonical (row-1) value the resolver reads.
+        $canonical = get_post_meta( $result->newId, ID::META_PODCAST_SETTINGS, true );
+        $this->assertIsArray( $canonical );
+        $this->assertSame( array( $newTermId ), array_map( 'intval', (array) $canonical[ ID::TAX_SERIES ] ) );
+
+        // The stray second row survives verbatim (no scope key injected into it).
+        $second = $rows[1];
+        $this->assertIsArray( $second );
+        $this->assertArrayNotHasKey( ID::TAX_SERIES, $second );
+
+        // Re-run (resume/self-heal) must remain idempotent on the row count.
+        ( new PodcastWriter() )->write( $legacyPodcast );
+        $rowsAgain = get_post_meta( $result->newId, ID::META_PODCAST_SETTINGS, false );
+        $this->assertCount( 2, $rowsAgain, 'a resume pass must not grow or shrink the multiset' );
+    }
+
+    // =========================================================================
+    // Adversarial-review fix 2: an already-COMPLETE record with NO open term flag
+    // must reconcile object-term scope IN PLACE (self-heal across the version
+    // boundary) rather than over-including every sermon forever.
+    // =========================================================================
+
+    public function test_complete_record_self_heals_object_term_scope_in_place(): void {
+        [ $legacyTermId, $newTermId ] = $this->migratedSeriesTerm( 'Late Scope Series' );
+
+        // Simulate a record migrated by the PRE-FIX writer: written + stamped COMPLETE
+        // with NO object-term scope (and therefore no missing flag).
+        $legacyPodcast = $this->fixture->createPodcastWithSettings( array(), 'Late Scope Feed' );
+        $result        = ( new PodcastWriter() )->write( $legacyPodcast );
+        $this->assertSame( '1', (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+        $scopeBefore = ( new PodcastScopeResolver() )->forPodcast( $result->newId );
+        $this->assertSame( array(), $scopeBefore, 'pre-fix record starts with NO scope (over-inclusive)' );
+
+        // The per-podcast scope now exists in object-terms (the real SM Pro source).
+        wp_set_object_terms( $legacyPodcast, array( $legacyTermId ), LID::TAX_SERIES );
+
+        // Re-run the writer (a spine pass over an already-COMPLETE record): the scope
+        // must reconcile in place WITHOUT a Rollback.
+        $second = ( new PodcastWriter() )->write( $legacyPodcast );
+        $this->assertSame( $result->newId, $second->newId );
+
+        $scopeAfter = ( new PodcastScopeResolver() )->forPodcast( $second->newId );
+        $this->assertSame( array( ID::TAX_SERIES => array( $newTermId ) ), $scopeAfter, 'COMPLETE record must self-heal scope in place' );
+        $this->assertSame( '1', (string) get_post_meta( $second->newId, Crosswalk::MIGRATION_COMPLETE, true ), 'a resolvable scope leaves COMPLETE stamped' );
+    }
+
+    public function test_complete_record_with_unresolvable_object_term_withholds_complete_on_reconcile(): void {
+        // Pre-fix COMPLETE record (no scope, no flag).
+        $legacyPodcast = $this->fixture->createPodcastWithSettings( array(), 'Dead Late Feed' );
+        $result        = ( new PodcastWriter() )->write( $legacyPodcast );
+        $this->assertSame( '1', (string) get_post_meta( $result->newId, Crosswalk::MIGRATION_COMPLETE, true ) );
+
+        // An object-term scope appears, but its term is NEVER migrated (no crosswalk).
+        $legacyTermId = $this->fixture->createTerm( LID::TAX_SERIES, 'Never Migrated' );
+        wp_set_object_terms( $legacyPodcast, array( $legacyTermId ), LID::TAX_SERIES );
+
+        // The reconcile records the missing flag AND WITHHOLDS COMPLETE so the record
+        // drops back into the resume leg — never a feed scoped to a dead term, stamped
+        // complete-and-skipped-forever.
+        $second = ( new PodcastWriter() )->write( $legacyPodcast );
+        $flags  = get_post_meta( $second->newId, Crosswalk::MIGRATION_FLAGS, true );
+        $this->assertContains( Crosswalk::MISSING_PODCAST_TERM_FLAG_PREFIX . $legacyTermId, (array) $flags );
+        $this->assertSame( '', (string) get_post_meta( $second->newId, Crosswalk::MIGRATION_COMPLETE, true ), 'an unresolved reconcile must withhold COMPLETE' );
+        $this->assertTrue( ( new PodcastScopeResolver() )->hasIncompleteScope( $second->newId ) );
+    }
 }
