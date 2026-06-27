@@ -957,24 +957,67 @@ final class CoverageAudit {
     }
 
     /**
+     * Stable CORPUS-CONTENT signature of an inline sub-report — the drift fingerprint
+     * (design §3.6, decision 6 / spec T-K; adversarial-review fix). It hashes ONLY the
+     * safety-relevant corpus fields — `refs_total`, the (key-sorted) source-versification
+     * `families` map, the `dominant_family`, the `heterogeneous` flag, and the
+     * `unmodeled_pair_wrong_text` count — and DELIBERATELY EXCLUDES `generated_at`.
+     *
+     * `generated_at` is a wall-clock {@see time()} re-stamped by {@see self::run()} on EVERY
+     * recompute (the daily cron and every sermon save), independent of any corpus change.
+     * Keying drift off it produced a permanent FALSE POSITIVE: the first routine re-audit
+     * after enable advanced the timestamp past the enable stamp and the advisory fired
+     * forever, with zero corpus change. Hashing the corpus CONTENT instead means a routine
+     * recompute over an UNCHANGED corpus yields an IDENTICAL signature (silent), while a
+     * genuine change (a new family bucket, a different ref count, a newly-unmodeled pair)
+     * advances it (warns) — so the equal/silent steady state is actually REACHABLE in
+     * production. Pure: deterministic, no WP, no I/O, never throws.
+     *
+     * @param array<string,mixed> $inline An inline sub-report (or {@see self::inlineReport()} shape).
+     */
+    public static function inlineSignature( array $inline ): string {
+        $families   = isset( $inline['families'] ) && is_array( $inline['families'] ) ? $inline['families'] : array();
+        $normalized = array();
+        foreach ( $families as $bucket => $count ) {
+            $normalized[ (string) $bucket ] = (int) $count;
+        }
+        ksort( $normalized );
+
+        $payload = array(
+            'refs_total'                => (int) ( $inline['refs_total'] ?? 0 ),
+            'families'                  => $normalized,
+            'dominant_family'           => isset( $inline['dominant_family'] ) && is_string( $inline['dominant_family'] )
+                ? $inline['dominant_family']
+                : '',
+            'heterogeneous'             => ! empty( $inline['heterogeneous'] ),
+            'unmodeled_pair_wrong_text' => (int) ( $inline['unmodeled_pair_wrong_text'] ?? 0 ),
+        );
+
+        return hash( 'sha256', (string) json_encode( $payload ) );
+    }
+
+    /**
      * The Site-Health CORPUS-DRIFT advisory (design §3.6, decision 6 / spec T-K), built
      * PURELY from already-persisted options (no recompute, no write — the same pure-reader
      * boundary the rest of {@see self::siteHealthResult()} honors). It fires when, with
-     * inline rendering ENABLED, the LIVE audit generation (the persisted rollup's `inline`
-     * sub-report `generated_at`) has advanced PAST the reconciliation generation stamped at
-     * enable-time ({@see ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN}, written by the enable
-     * soft-gate in {@see \Sermonator\Admin\SettingsRegistrar::sanitizeInlineEnabled()}).
+     * inline rendering ENABLED, the LIVE corpus-content signature (derived from the persisted
+     * rollup's `inline` sub-report via {@see self::inlineSignature()}) DIFFERS from the
+     * reconciliation signature stamped at enable-time
+     * ({@see ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN}, written by the enable soft-gate in
+     * {@see \Sermonator\Admin\SettingsRegistrar::sanitizeInlineEnabled()}).
      *
-     * A later, post-enable advance of the audit generation means the corpus changed (an
-     * import / new sermons) AFTER the operator reconciled + enabled — so a freshly imported
-     * sub-corpus could have drifted heterogeneous or onto an unmodeled versification pair
-     * that the enable-moment reconciliation never saw. The advisory tells the operator to
-     * re-audit; it NEVER disables inline (instant rollback stays the floor/attestation lever).
+     * The signal is a corpus-content fingerprint, NOT a wall-clock timestamp: a routine
+     * cron/on-save re-audit over an UNCHANGED corpus reproduces the SAME signature and stays
+     * silent. Only a genuine corpus change — a freshly imported sub-corpus that drifted
+     * heterogeneous, landed on an unmodeled versification pair, or merely changed the
+     * ref/family makeup the enable-moment reconciliation never saw — advances the signature
+     * and surfaces the advisory. The advisory tells the operator to re-audit (which re-stamps
+     * the signature once the corpus is safe again — {@see \Sermonator\Cli\BibleCommand::audit()});
+     * it NEVER disables inline (instant rollback stays the floor/attestation lever).
      *
-     * Empty string (silent) unless ALL hold: inline is enabled; a reconciliation stamp
-     * exists (> 0 — an enable actually happened); and the live generation is STRICTLY
-     * GREATER than the stamp. Equal (reconciled against the live corpus) or behind (the
-     * persisted rollup predates the enable's fresh reconciliation audit) → silent.
+     * Empty string (silent) unless ALL hold: inline is enabled; a reconciliation signature
+     * exists (an enable actually happened); the persisted rollup carries an inline sub-report
+     * (a pre-3b rollup never falsely drifts); and the live signature DIFFERS from the stamp.
      *
      * @param array<string,mixed> $stats The persisted rollup (already read by the caller).
      */
@@ -984,19 +1027,24 @@ final class CoverageAudit {
             return '';
         }
 
-        // The generation the enable reconciled against. Absent/0 → no enable happened → silent.
-        $stampedGen = (int) get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 );
-        if ( $stampedGen <= 0 ) {
+        // The corpus-content signature the enable reconciled against. Absent/'' (or a legacy
+        // non-string stamp) → no usable enable reconciliation → silent.
+        $stamped = get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, '' );
+        $stamped = is_string( $stamped ) ? $stamped : '';
+        if ( '' === $stamped ) {
             return '';
         }
 
-        // The LIVE audit generation: the persisted inline sub-report's `generated_at`, the
-        // same value shape the enable soft-gate stamped from its fresh inlineReport(). A
-        // pre-3b rollup (no inline key) reads 0 → never falsely drifts.
-        $inline  = isset( $stats['inline'] ) && is_array( $stats['inline'] ) ? $stats['inline'] : array();
-        $liveGen = isset( $inline['generated_at'] ) ? (int) $inline['generated_at'] : 0;
+        // The LIVE corpus signature, derived from the persisted inline sub-report. A pre-3b
+        // rollup (no inline key / no refs_total) carries no signal → never falsely drifts.
+        $inline = isset( $stats['inline'] ) && is_array( $stats['inline'] ) ? $stats['inline'] : array();
+        if ( ! isset( $inline['refs_total'] ) ) {
+            return '';
+        }
 
-        if ( $liveGen <= $stampedGen ) {
+        // Decoupled from wall-clock entirely: equal signature (corpus unchanged since enable,
+        // INCLUDING after any number of routine re-audits) → silent; different → warn.
+        if ( self::inlineSignature( $inline ) === $stamped ) {
             return '';
         }
 

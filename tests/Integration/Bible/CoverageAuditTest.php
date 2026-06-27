@@ -227,42 +227,54 @@ final class CoverageAuditTest extends WP_UnitTestCase {
     }
 
     // ----------------------------------------------------------------------------------
-    // T-K — Site Health CORPUS-DRIFT advisory.
+    // T-K — Site Health CORPUS-DRIFT advisory (adversarial-review fix).
     //
     // NOT run in this environment (no Docker / wp-env) — authored to run under wp-env.
-    // Drives the REAL options API + the Site Health filter wiring: the warning fires when
-    // the persisted live audit generation has advanced PAST the reconciliation generation
-    // stamped at enable-time (a later import/new sermons since the operator reconciled +
-    // enabled), and is silent when the two generations are equal. Pure read — never writes.
+    // Drives the REAL options API + the Site Health filter wiring. The drift signal is a
+    // CORPUS-CONTENT signature ({@see CoverageAudit::inlineSignature()}), NOT a wall-clock
+    // timestamp: the advisory fires when the live persisted corpus signature DIFFERS from
+    // the one stamped at enable, and — critically — stays SILENT after a routine re-audit
+    // over an unchanged corpus (the false-positive the timestamp proxy produced). Pure read.
     // ----------------------------------------------------------------------------------
 
-    /** A green-coverage rollup whose inline sub-report is stamped at $liveGen. */
-    private function seedRollupAtGen( int $liveGen ): void {
+    /**
+     * A green-coverage rollup whose inline sub-report carries the given corpus fields. The
+     * `generated_at` is set to a moving value to PROVE it is irrelevant to drift.
+     *
+     * @param array<string,mixed> $inlineOverrides
+     *
+     * @return array<string,mixed> The persisted inline sub-report (for signature derivation).
+     */
+    private function seedRollupWithInline( array $inlineOverrides = array() ): array {
+        $inline = array_merge( array(
+            'generated_at'              => time(),
+            'refs_total'                => 4,
+            'inline_eligible'           => 4,
+            'inline_eligible_pct'       => 100.0,
+            'withheld'                  => array(),
+            'unmodeled_pair_wrong_text' => 0,
+            'families'                  => array( 'eng-protestant' => 4 ),
+            'dominant_family'           => 'eng-protestant',
+            'heterogeneous'             => false,
+        ), $inlineOverrides );
+
         update_option( ID::OPTION_BIBLE_STATS, array(
-            'generated_at'   => $liveGen,
             'total'          => 4,
             'with_passage'   => 4,
             'resolved'       => 4,
             'parse_coverage' => 100.0,
             'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
-            'inline'         => array(
-                'generated_at'              => $liveGen,
-                'refs_total'                => 4,
-                'inline_eligible'           => 4,
-                'inline_eligible_pct'       => 100.0,
-                'withheld'                  => array(),
-                'unmodeled_pair_wrong_text' => 0,
-                'families'                  => array( 'eng-protestant' => 4 ),
-                'dominant_family'           => 'eng-protestant',
-                'heterogeneous'             => false,
-            ),
+            'inline'         => $inline,
         ) );
+
+        return $inline;
     }
 
-    public function test_site_health_drift_fires_when_live_gen_passed_the_enable_stamp(): void {
+    public function test_site_health_drift_fires_when_corpus_signature_differs_from_enable_stamp(): void {
         update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
-        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 1000 );
-        $this->seedRollupAtGen( 2000 ); // corpus re-audited past the enable reconciliation.
+        // Enable reconciled against a 4-ref corpus; the live rollup now carries 5.
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, CoverageAudit::inlineSignature( $this->seedRollupWithInline() ) );
+        $this->seedRollupWithInline( array( 'refs_total' => 5, 'inline_eligible' => 5 ) );
 
         $audit = new CoverageAudit();
         $audit->hook();
@@ -277,10 +289,10 @@ final class CoverageAuditTest extends WP_UnitTestCase {
         $this->assertSame( $before, get_option( ID::OPTION_BIBLE_STATS ) );
     }
 
-    public function test_site_health_drift_is_silent_when_live_gen_equals_the_enable_stamp(): void {
+    public function test_site_health_drift_is_silent_when_corpus_signature_matches_enable_stamp(): void {
         update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
-        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 2000 );
-        $this->seedRollupAtGen( 2000 ); // reconciled against the live corpus → no drift.
+        $inline = $this->seedRollupWithInline();
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, CoverageAudit::inlineSignature( $inline ) );
 
         $audit = new CoverageAudit();
         $audit->hook();
@@ -292,10 +304,35 @@ final class CoverageAuditTest extends WP_UnitTestCase {
         $this->assertSame( 'good', $result['status'] );
     }
 
+    public function test_site_health_drift_is_silent_after_unchanged_corpus_run(): void {
+        // The REAL lifecycle the wall-clock proxy got wrong: enable stamps the corpus
+        // signature; a later run() over an UNCHANGED corpus re-persists the rollup with a
+        // fresh generated_at. Drift must stay silent (no false positive within 24h of enable).
+        $sermon = $this->sermon( 'publish', array(
+            ID::META_BIBLE_PASSAGE => 'John 3:16',
+            ID::META_BIBLE_REFS    => $this->envelope( array(
+                array( 'bookUSFM' => 'JHN', 'chapterStart' => 3, 'verseStart' => 16, 'verseEnd' => null, 'chapterEnd' => null, 'confidence' => 'exact', 'srcVersification' => 'ESV' ),
+            ) ),
+        ) );
+
+        // Enable-time reconciliation: stamp the signature of a fresh audit over this corpus.
+        $atEnable = ( new CoverageAudit() )->inlineReport();
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, CoverageAudit::inlineSignature( $atEnable ) );
+
+        // A later routine recompute over the SAME corpus (new generated_at, same content).
+        ( new CoverageAudit() )->run();
+
+        $result = ( new CoverageAudit() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        unset( $sermon );
+    }
+
     public function test_site_health_drift_is_silent_when_inline_disabled(): void {
         update_option( ID::OPTION_BIBLE_INLINE_ENABLED, false );
-        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 1000 );
-        $this->seedRollupAtGen( 2000 );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, CoverageAudit::inlineSignature( $this->seedRollupWithInline() ) );
+        $this->seedRollupWithInline( array( 'refs_total' => 5 ) );
 
         $result = ( new CoverageAudit() )->siteHealthResult();
 

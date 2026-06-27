@@ -555,19 +555,24 @@ final class CoverageAuditTest extends TestCase {
     }
 
     // ----------------------------------------------------------------------------------
-    // T-K — Site Health DRIFT WARNING: the live audit generation advanced past the one
-    // the enable reconciled against (corpus changed since enable → re-audit).
+    // T-K — Site Health DRIFT WARNING (adversarial-review fix): drift is keyed off a
+    // CORPUS-CONTENT signature ({@see CoverageAudit::inlineSignature()}), NOT a wall-clock
+    // `generated_at`. A routine re-audit over an unchanged corpus reproduces the same
+    // signature (silent); only a genuine corpus change advances it (warns).
     // ----------------------------------------------------------------------------------
 
-    /** A green-coverage rollup carrying an inline subreport stamped at $liveGen. */
-    private function seedInlineRollupAt( int $liveGen ): void {
-        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
-            'with_passage'   => 4,
-            'resolved'       => 4,
-            'parse_coverage' => 100.0,
-            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
-            'inline'         => array(
-                'generated_at'              => $liveGen,
+    /**
+     * One inline sub-report. `generated_at` is set to a DIFFERENT value than any stamp on
+     * purpose: it must be IRRELEVANT to drift (the whole point of the fix).
+     *
+     * @param array<string,mixed> $overrides
+     *
+     * @return array<string,mixed>
+     */
+    private function inlineSub( array $overrides = array() ): array {
+        return array_merge(
+            array(
+                'generated_at'              => 999999,
                 'refs_total'                => 4,
                 'inline_eligible'           => 4,
                 'inline_eligible_pct'       => 100.0,
@@ -577,13 +582,26 @@ final class CoverageAuditTest extends TestCase {
                 'dominant_family'           => 'eng-protestant',
                 'heterogeneous'             => false,
             ),
+            $overrides
         );
     }
 
-    public function test_site_health_drift_warns_when_live_audit_gen_passed_the_enable_stamp(): void {
-        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
-        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 1000;
-        $this->seedInlineRollupAt( 2000 ); // live gen advanced past the enable stamp.
+    /** A green-coverage rollup carrying the given inline subreport. */
+    private function seedRollupWithInline( array $inline ): void {
+        $this->options[ ID::OPTION_BIBLE_STATS ] = array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => $inline,
+        );
+    }
+
+    public function test_site_health_drift_warns_when_corpus_signature_differs_from_enable_stamp(): void {
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ] = true;
+        // Enable reconciled against a 4-ref corpus; the live rollup now carries 5 refs.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
 
         $result = $this->auditOver( array() )->siteHealthResult();
 
@@ -592,10 +610,26 @@ final class CoverageAuditTest extends TestCase {
         $this->assertSame( 'recommended', $result['status'] );
     }
 
-    public function test_site_health_drift_is_silent_when_live_audit_gen_equals_the_enable_stamp(): void {
+    public function test_site_health_drift_warns_when_corpus_becomes_heterogeneous(): void {
         $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
-        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 2000;
-        $this->seedInlineRollupAt( 2000 ); // equal → reconciled against the live corpus.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        // A second source-versification family appeared after enable.
+        $this->seedRollupWithInline( $this->inlineSub( array(
+            'families'      => array( 'eng-protestant' => 3, 'eng-catholic' => 1 ),
+            'heterogeneous' => true,
+        ) ) );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+        $this->assertSame( 'recommended', $result['status'] );
+    }
+
+    public function test_site_health_drift_is_silent_when_corpus_signature_matches_enable_stamp(): void {
+        $inline = $this->inlineSub();
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $inline );
+        $this->seedRollupWithInline( $inline );
 
         $result = $this->auditOver( array() )->siteHealthResult();
 
@@ -603,11 +637,16 @@ final class CoverageAuditTest extends TestCase {
         $this->assertSame( 'good', $result['status'] );
     }
 
-    public function test_site_health_drift_is_silent_when_live_audit_gen_is_behind_the_stamp(): void {
-        // The persisted rollup predates the enable's fresh reconciliation audit — not drift.
+    public function test_site_health_drift_is_silent_after_unchanged_corpus_recompute(): void {
+        // The REAL lifecycle the prior wall-clock proxy got wrong: enable stamps the corpus
+        // signature; a routine cron/on-save re-audit later re-persists the rollup with a FRESH
+        // `generated_at` but the SAME corpus content. Drift must stay silent (no false positive).
+        $atEnable = $this->inlineSub( array( 'generated_at' => 1000 ) );
         $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
-        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 3000;
-        $this->seedInlineRollupAt( 2000 );
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $atEnable );
+
+        // The later recompute: identical corpus fields, only the timestamp moved forward.
+        $this->seedRollupWithInline( $this->inlineSub( array( 'generated_at' => 9999999 ) ) );
 
         $result = $this->auditOver( array() )->siteHealthResult();
 
@@ -616,10 +655,10 @@ final class CoverageAuditTest extends TestCase {
     }
 
     public function test_site_health_drift_is_silent_when_inline_is_disabled(): void {
-        // No enable ever happened: a live gen past a stale stamp is not a drift to surface.
+        // No enable in effect: a changed corpus against a stale stamp is not a drift to surface.
         $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = false;
-        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 1000;
-        $this->seedInlineRollupAt( 2000 );
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
 
         $result = $this->auditOver( array() )->siteHealthResult();
 
@@ -628,7 +667,36 @@ final class CoverageAuditTest extends TestCase {
 
     public function test_site_health_drift_is_silent_when_never_enabled_no_stamp(): void {
         $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ] = true; // enabled but no recon stamp.
-        $this->seedInlineRollupAt( 2000 );
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
+
+    public function test_site_health_drift_is_silent_for_pre_3b_rollup_even_with_a_stamp(): void {
+        // A rollup persisted before the 3b extension has no `inline` key → no live signature →
+        // never falsely drifts, even with an enable stamp present.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        $this->options[ ID::OPTION_BIBLE_STATS ]                    = array(
+            'with_passage'   => 1,
+            'resolved'       => 1,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 1, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+        );
+
+        $result = $this->auditOver( array() )->siteHealthResult();
+
+        $this->assertStringNotContainsString( 'corpus has changed since inline scripture was enabled', $result['description'] );
+    }
+
+    public function test_site_health_drift_is_silent_for_legacy_non_string_stamp(): void {
+        // A legacy integer stamp (pre-fix) is not a usable signature → treated as no stamp →
+        // silent (the safe direction: never a false positive). Re-enabling re-stamps a signature.
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 1700000000; // legacy int.
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
 
         $result = $this->auditOver( array() )->siteHealthResult();
 
@@ -637,13 +705,46 @@ final class CoverageAuditTest extends TestCase {
 
     public function test_site_health_drift_warning_does_not_write(): void {
         $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED ]           = true;
-        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = 1000;
-        $this->seedInlineRollupAt( 2000 );
+        $this->options[ ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] = CoverageAudit::inlineSignature( $this->inlineSub() );
+        $this->seedRollupWithInline( $this->inlineSub( array( 'refs_total' => 5 ) ) );
         $before = $this->options;
 
         $this->auditOver( array() )->siteHealthResult();
 
         $this->assertSame( $before, $this->options );
+    }
+
+    public function test_inline_signature_excludes_wall_clock_but_tracks_corpus_fields(): void {
+        $base = $this->inlineSub();
+
+        // generated_at is IRRELEVANT to the signature (the fix).
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $base ),
+            CoverageAudit::inlineSignature( array_merge( $base, array( 'generated_at' => 424242 ) ) )
+        );
+
+        // Each safety-relevant corpus field MOVES the signature.
+        foreach (
+            array(
+                array( 'refs_total' => 5 ),
+                array( 'families' => array( 'eng-protestant' => 3, 'eng-catholic' => 1 ) ),
+                array( 'dominant_family' => 'eng-catholic' ),
+                array( 'heterogeneous' => true ),
+                array( 'unmodeled_pair_wrong_text' => 1 ),
+            ) as $change
+        ) {
+            $this->assertNotSame(
+                CoverageAudit::inlineSignature( $base ),
+                CoverageAudit::inlineSignature( array_merge( $base, $change ) ),
+                'Changing ' . key( $change ) . ' must move the corpus signature.'
+            );
+        }
+
+        // Family key ORDER is irrelevant (the map is key-sorted before hashing).
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $this->inlineSub( array( 'families' => array( 'a' => 1, 'b' => 2 ) ) ) ),
+            CoverageAudit::inlineSignature( $this->inlineSub( array( 'families' => array( 'b' => 2, 'a' => 1 ) ) ) )
+        );
     }
 
     // ----------------------------------------------------------------------------------

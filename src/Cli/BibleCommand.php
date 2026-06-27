@@ -391,6 +391,73 @@ final class BibleCommand {
         $sampleSize = $withSample ? max( 0, (int) $assoc_args['sample'] ) : 0;
 
         $this->reportPromotionPreview( $audit->promotionPreview( true, $sampleSize ), $withSample );
+
+        // T-K remediation (adversarial-review fix): this is the command the Site-Health drift
+        // advisory tells the operator to re-run. When inline is enabled and the corpus has
+        // drifted back to a SAFE state, re-stamp the reconciliation signature so the advisory
+        // actually clears (the prior text was un-clearable by its own instructions).
+        $this->reconcileDriftStamp();
+    }
+
+    /**
+     * Reconcile the Site-Health corpus-drift advisory (T-K) after a re-audit — the documented
+     * remediation for that warning ("re-run audit --inline and re-confirm"). The advisory fires
+     * when the LIVE corpus-content signature has moved past the one stamped at enable
+     * ({@see ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN}). This re-stamps that signature to the
+     * current persisted corpus ONLY when ALL hold: inline is ENABLED; a reconciliation stamp
+     * already exists; the persisted rollup carries an inline sub-report; the corpus signature
+     * has ACTUALLY drifted from the stamp; AND the current corpus is SAFE — homogeneous, zero
+     * unmodeled-pair wrong text, and at least one inline-eligible ref (the same canaries the
+     * enable soft-gate required). On an UNSAFE drift it writes nothing and warns the operator to
+     * resolve the heterogeneity / unmodeled pairs first (so re-auditing can never silently bless
+     * a now-dangerous corpus). It reads the SAME persisted rollup the drift warning compares
+     * against, so a successful re-stamp deterministically clears the advisory.
+     *
+     * This re-stamp is operational reconciliation state ONLY — it never touches the preserved
+     * {@see ID::META_BIBLE_PASSAGE}/{@see ID::META_BIBLE_REFS} (#1 data preservation), and it
+     * never promotes any ref (render-time only).
+     */
+    private function reconcileDriftStamp(): void {
+        if ( ! (bool) get_option( ID::OPTION_BIBLE_INLINE_ENABLED, false ) ) {
+            return; // drift is only surfaced for an enabled site; nothing to reconcile.
+        }
+
+        $stamped = get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, '' );
+        $stamped = is_string( $stamped ) ? $stamped : '';
+        if ( '' === $stamped ) {
+            return; // no enable reconciliation to refresh.
+        }
+
+        $stats  = CoverageAudit::stats();
+        $inline = isset( $stats['inline'] ) && is_array( $stats['inline'] ) ? $stats['inline'] : array();
+        if ( ! isset( $inline['refs_total'] ) ) {
+            return; // no persisted inline rollup to reconcile against yet (pre-3b / never run).
+        }
+
+        $liveSig = CoverageAudit::inlineSignature( $inline );
+        if ( $liveSig === $stamped ) {
+            return; // no drift — nothing to reconcile (and no spurious write).
+        }
+
+        $heterogeneous = ! empty( $inline['heterogeneous'] );
+        $wrongText     = (int) ( $inline['unmodeled_pair_wrong_text'] ?? 0 );
+        $eligible      = (int) ( $inline['inline_eligible'] ?? 0 );
+
+        if ( $heterogeneous || $wrongText > 0 || $eligible <= 0 ) {
+            \WP_CLI::warning(
+                'Corpus drift detected since inline was enabled, but the current corpus is NOT safe '
+                . 'to reconcile (heterogeneous, on an unmodeled versification pair, or zero '
+                . 'inline-eligible references). Resolve the warnings above; the Site-Health drift '
+                . 'advisory stays until the corpus is safe again. No changes made.'
+            );
+            return;
+        }
+
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, $liveSig );
+        \WP_CLI::success(
+            'Corpus drift reconciled: re-stamped the enable-time reconciliation signature to the '
+            . 'current (safe) corpus. The Site-Health drift advisory is now cleared.'
+        );
     }
 
     /**

@@ -131,12 +131,17 @@ final class Identifiers {
     public const OPTION_BIBLE_INLINE_PERSEG_ACK_LOG = 'sermonator_bible_inline_perseg_ack_log';
 
     /**
-     * Reconciliation generation stamped at the moment inline rendering was enabled — the
-     * {@see \Sermonator\Bible\CoverageAudit} report `generated_at` of the fresh audit the
-     * enable soft-gate reconciled against (design §3.6, decision 6). Lets Site Health
-     * (T-K) warn when the LIVE audit generation has moved past the one enable reconciled
-     * against (corpus drift between audit and enable). Stamped by `sanitizeInlineEnabled`
-     * on a successful enable, alongside the {@see self::OPTION_BIBLE_CACHE_GEN} bump.
+     * Reconciliation signature stamped at the moment inline rendering was enabled — the
+     * {@see \Sermonator\Bible\CoverageAudit::inlineSignature()} CORPUS-CONTENT fingerprint of
+     * the fresh audit the enable soft-gate reconciled against (design §3.6, decision 6). Lets
+     * Site Health (T-K) warn when the LIVE corpus signature DIFFERS from the one enable
+     * reconciled against (corpus drift between audit and enable). It is a content hash, NOT a
+     * wall-clock `generated_at`: a routine cron/on-save re-audit over an unchanged corpus
+     * reproduces the identical signature, so the drift advisory stays silent until the corpus
+     * actually changes (the adversarial-review fix for the permanent-false-positive timestamp
+     * proxy). Stamped by `sanitizeInlineEnabled` on a successful enable (and re-stamped by the
+     * documented `wp sermonator bible audit --inline` reconcile once a drifted corpus is safe
+     * again), alongside the {@see self::OPTION_BIBLE_CACHE_GEN} bump.
      */
     public const OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN = 'sermonator_bible_inline_enabled_audit_gen';
 

@@ -6,6 +6,7 @@ namespace Sermonator\Tests\Integration\Admin;
 
 use WP_UnitTestCase;
 use Sermonator\Admin\SettingsRegistrar;
+use Sermonator\Bible\CoverageAudit;
 use Sermonator\Bible\DerivedExactClassifier;
 use Sermonator\Migration\BibleChapterVendor;
 use Sermonator\Schema\BibleTranslations;
@@ -213,11 +214,17 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
             'Enabling must be honored once the snapshot is complete and the audit reconciles.'
         );
 
-        // The reconciliation generation is stamped against the audit it reconciled with.
-        $this->assertGreaterThan(
-            0,
-            (int) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 ),
-            'A successful enable must stamp the reconciliation generation.'
+        // The reconciliation signature is stamped against the corpus content it reconciled
+        // with (a CORPUS-CONTENT fingerprint, NOT a wall-clock generated_at — the T-K fix).
+        $stamp = get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, '' );
+        $this->assertIsString( $stamp );
+        $this->assertNotSame( '', $stamp, 'A successful enable must stamp the reconciliation signature.' );
+        // Over the unchanged corpus, a freshly recomputed signature equals the stamp (the
+        // equal/silent steady state the timestamp proxy could never reach).
+        $this->assertSame(
+            CoverageAudit::inlineSignature( ( new CoverageAudit() )->inlineReport() ),
+            $stamp,
+            'The stamp must be the corpus-content signature of the reconciling audit.'
         );
     }
 
@@ -235,9 +242,9 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         $codes = wp_list_pluck( get_settings_errors( Identifiers::OPTION_BIBLE_INLINE_ENABLED ), 'code' );
         $this->assertContains( 'sermonator_bible_inline_audit_unreconciled', $codes );
         $this->assertSame(
-            0,
-            (int) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 ),
-            'A refused enable must not stamp the reconciliation generation.'
+            '',
+            (string) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, '' ),
+            'A refused enable must not stamp the reconciliation signature.'
         );
     }
 
@@ -285,9 +292,9 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
             'Precondition: the genuine false->true enable must be honored.'
         );
 
-        $stampAtEnable = (int) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 );
+        $stampAtEnable = (string) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, '' );
         $genAtEnable   = (int) get_option( Identifiers::OPTION_BIBLE_CACHE_GEN, 0 );
-        $this->assertGreaterThan( 0, $stampAtEnable, 'Precondition: the enable stamped a recon generation.' );
+        $this->assertNotSame( '', $stampAtEnable, 'Precondition: the enable stamped a recon signature.' );
 
         // Drift the corpus AFTER enable: add a second source-versification family bucket so a
         // fresh audit would now report heterogeneous (and would refuse a first-time enable).
@@ -306,8 +313,8 @@ final class SettingsRegistrarTest extends WP_UnitTestCase {
         );
         $this->assertSame(
             $stampAtEnable,
-            (int) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, 0 ),
-            'A re-save while enabled must NOT re-stamp the reconciliation generation (the T-K drift baseline).'
+            (string) get_option( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, '' ),
+            'A re-save while enabled must NOT re-stamp the reconciliation signature (the T-K drift baseline).'
         );
         $this->assertSame(
             $genAtEnable,

@@ -321,11 +321,16 @@ final class SettingsRegistrar {
             return false;
         }
 
-        // Reconciliation stamp: record the audit generation this enable reconciled against,
-        // then bump the cache generation so warmed chapters built under the prior mode drop.
+        // Reconciliation stamp: record the CORPUS-CONTENT signature this enable reconciled
+        // against (NOT the wall-clock `generated_at`, which advances on every routine re-audit
+        // and would make T-K's drift advisory a permanent false positive — adversarial-review
+        // fix). {@see CoverageAudit::inlineSignature()} hashes the safety-relevant fields, so a
+        // later cron/on-save recompute over an UNCHANGED corpus reproduces the SAME signature
+        // (drift stays silent) while a genuine corpus change advances it. Then bump the cache
+        // generation so warmed chapters built under the prior mode drop.
         update_option(
             Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN,
-            (int) ( $audit['generated_at'] ?? 0 )
+            CoverageAudit::inlineSignature( $audit )
         );
         $this->bumpCacheGen();
 

@@ -47,6 +47,8 @@ final class BibleCommandTest extends WP_UnitTestCase {
         delete_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG );
         delete_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR );
         delete_option( ID::OPTION_BIBLE_STATS );
+        delete_option( ID::OPTION_BIBLE_INLINE_ENABLED );
+        delete_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN );
         update_option( ID::OPTION_BIBLE_LINK_VERSION, 'ESV' );
 
         $this->command = new BibleCommand();
@@ -63,6 +65,8 @@ final class BibleCommandTest extends WP_UnitTestCase {
         delete_option( ID::OPTION_BIBLE_INLINE_PERSEG_ACK_LOG );
         delete_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR );
         delete_option( ID::OPTION_BIBLE_STATS );
+        delete_option( ID::OPTION_BIBLE_INLINE_ENABLED );
+        delete_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN );
         delete_option( ID::OPTION_BIBLE_LINK_VERSION );
         parent::tearDown();
     }
@@ -462,5 +466,110 @@ final class BibleCommandTest extends WP_UnitTestCase {
             get_option( ID::OPTION_BIBLE_INLINE_CONFIDENCE_FLOOR ),
             'After ack-perseg --confirm the perseg floor must be selectable.'
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // audit --inline DRIFT RECONCILE (T-K remediation; adversarial-review fix)
+    //
+    // The Site-Health corpus-drift advisory keys off a CORPUS-CONTENT signature,
+    // not a wall-clock timestamp. `audit --inline` is the documented remediation:
+    // when inline is enabled and the corpus has drifted back to a safe state, it
+    // re-stamps the reconciliation signature so the advisory actually clears.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Persist an inline rollup (the {@see CoverageAudit::stats()} `inline` sub-report
+     * the reconcile reads), with corpus-content overrides.
+     *
+     * @param array<string,mixed> $inlineOverrides
+     */
+    private function seedInlineRollup( array $inlineOverrides = array() ): array {
+        $inline = array_merge( array(
+            'generated_at'              => 1000,
+            'target'                    => 'ENGWEBP',
+            'floor'                     => 'exact',
+            'refs_total'                => 4,
+            'inline_eligible'           => 4,
+            'inline_eligible_pct'       => 100.0,
+            'withheld'                  => array(),
+            'unmodeled_pair_wrong_text' => 0,
+            'families'                  => array( 'eng-protestant' => 4 ),
+            'dominant_family'           => 'eng-protestant',
+            'heterogeneous'             => false,
+        ), $inlineOverrides );
+
+        update_option( ID::OPTION_BIBLE_STATS, array(
+            'with_passage'   => 4,
+            'resolved'       => 4,
+            'parse_coverage' => 100.0,
+            'breakdown'      => array( 'resolved' => 4, 'withheld_low_confidence' => 0, 'parse_fail' => 0, 'empty' => 0 ),
+            'inline'         => $inline,
+        ) );
+
+        return $inline;
+    }
+
+    public function test_audit_inline_reconciles_drift_stamp_when_enabled_and_safe(): void {
+        // Enable reconciled against a 4-ref corpus; the live persisted rollup now carries 5
+        // refs (a safe drift — still homogeneous, no wrong text, eligible > 0).
+        $atEnable = $this->seedInlineRollup();
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, CoverageAudit::inlineSignature( $atEnable ) );
+
+        $live = $this->seedInlineRollup( array( 'refs_total' => 5, 'inline_eligible' => 5 ) );
+
+        $this->command->audit( array(), array( 'inline' => true ) );
+
+        // The stamp is re-written to the current (safe) corpus signature → drift clears.
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $live ),
+            get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN )
+        );
+        $this->assertStringContainsString( 'Corpus drift reconciled', WpCliShim::output() );
+    }
+
+    public function test_audit_inline_refuses_reconcile_on_unsafe_drift(): void {
+        // Enable reconciled against a clean corpus; the live corpus drifted HETEROGENEOUS.
+        $atEnable = $this->seedInlineRollup();
+        $stamp    = CoverageAudit::inlineSignature( $atEnable );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, $stamp );
+
+        $this->seedInlineRollup( array(
+            'families'      => array( 'eng-protestant' => 3, 'eng-catholic' => 1 ),
+            'heterogeneous' => true,
+        ) );
+
+        $this->command->audit( array(), array( 'inline' => true ) );
+
+        // The stamp is NOT advanced — a re-audit must never silently bless an unsafe corpus.
+        $this->assertSame( $stamp, get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ) );
+        $this->assertStringContainsString( 'NOT safe to reconcile', WpCliShim::output() );
+    }
+
+    public function test_audit_inline_does_not_reconcile_when_inline_disabled(): void {
+        // Inline OFF: audit --inline stays fully read-only (the pre-enable exploration case).
+        $atEnable = $this->seedInlineRollup();
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, CoverageAudit::inlineSignature( $atEnable ) );
+        $this->seedInlineRollup( array( 'refs_total' => 5 ) );
+        $before = get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN );
+
+        $this->command->audit( array(), array( 'inline' => true ) );
+
+        $this->assertSame( $before, get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ) );
+        $this->assertStringNotContainsString( 'Corpus drift reconciled', WpCliShim::output() );
+    }
+
+    public function test_audit_inline_no_reconcile_write_when_no_drift(): void {
+        // The live corpus matches the stamp: audit --inline writes nothing (no spurious stamp).
+        $inline = $this->seedInlineRollup();
+        $stamp  = CoverageAudit::inlineSignature( $inline );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED, true );
+        update_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, $stamp );
+
+        $this->command->audit( array(), array( 'inline' => true ) );
+
+        $this->assertSame( $stamp, get_option( ID::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ) );
+        $this->assertStringNotContainsString( 'Corpus drift reconciled', WpCliShim::output() );
     }
 }

@@ -8,6 +8,7 @@ use PHPUnit\Framework\TestCase;
 use Brain\Monkey;
 use Brain\Monkey\Functions;
 use Sermonator\Admin\SettingsRegistrar;
+use Sermonator\Bible\CoverageAudit;
 use Sermonator\Bible\DerivedExactClassifier;
 use Sermonator\Schema\BibleTranslations;
 use Sermonator\Schema\Identifiers;
@@ -449,14 +450,34 @@ final class SettingsRegistrarTest extends TestCase {
         );
         Functions\expect( 'add_settings_error' )->never();
 
+        // The audit carries the corpus-content fields the signature is derived from. The
+        // wall-clock `generated_at` is DELIBERATELY irrelevant to the stamp (adversarial-review
+        // fix: stamping the timestamp made T-K's drift advisory a permanent false positive).
+        $audit = self::passingInlineAudit( array(
+            'generated_at'              => 1717000000,
+            'refs_total'                => 9,
+            'families'                  => array( 'eng-protestant' => 9 ),
+            'dominant_family'           => 'eng-protestant',
+        ) );
+
         $registrar = new SettingsRegistrar(
             static fn( string $translation ): bool => true,
-            static fn(): array => self::passingInlineAudit( array( 'generated_at' => 1717000000 ) )
+            static fn(): array => $audit
         );
 
         $this->assertTrue( $registrar->sanitizeInlineEnabled( '1' ) );
         $this->assertArrayHasKey( Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN, $stamped );
-        $this->assertSame( 1717000000, $stamped[ Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] );
+        // The stamp is the CORPUS-CONTENT signature, NOT the wall-clock generated_at.
+        $this->assertSame(
+            CoverageAudit::inlineSignature( $audit ),
+            $stamped[ Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ]
+        );
+        $this->assertNotSame( 1717000000, $stamped[ Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ] );
+        // The stamp ignores the timestamp: the same corpus with a later generated_at stamps equal.
+        $this->assertSame(
+            CoverageAudit::inlineSignature( array_merge( $audit, array( 'generated_at' => 1799999999 ) ) ),
+            $stamped[ Identifiers::OPTION_BIBLE_INLINE_ENABLED_AUDIT_GEN ]
+        );
         // The cache generation is also bumped on a successful enable.
         $this->assertArrayHasKey( Identifiers::OPTION_BIBLE_CACHE_GEN, $stamped );
     }
