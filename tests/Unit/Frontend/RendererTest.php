@@ -276,6 +276,109 @@ final class RendererTest extends TestCase {
         $this->assertSame( $expected, ( new Renderer() )->scripture( $this->view(), $resolved ) );
     }
 
+    /**
+     * INSTANT-ROLLBACK GUARANTEE (T-J / spec §5): disabling inline returns every
+     * sermon to its 3a link, byte-for-byte unchanged. We prove it by rendering the
+     * SAME ref twice — once WITH a full inline payload (inline enabled), once with
+     * `inline => null` (the resolver's output when inline is disabled, floor=exact,
+     * or any L1–L9 layer withholds) — and asserting the inline-off render is
+     * byte-identical to the canonical 3a link string, while the inline render
+     * genuinely differs. The toggle is therefore the ONLY difference and rollback
+     * is exact: nothing about the stored ref changes, only the render-time payload.
+     */
+    public function test_scripture_inline_off_is_byte_identical_to_3a_link_rollback(): void {
+        $ref = array(
+            'label'          => 'John 3:16',
+            'linkUrl'        => 'https://www.biblegateway.com/passage/?search=John%203%3A16&version=ESV',
+            'version'        => 'ESV',
+            'inlineEligible' => true,
+        );
+
+        // Inline ENABLED: the resolver handed us a payload for this ref.
+        $on = ( new Renderer() )->scripture(
+            $this->view(),
+            new ResolvedScripture( array(
+                $ref + array(
+                    'inline' => array(
+                        'translation' => 'ENGWEBP',
+                        'attribution' => 'World English Bible',
+                        'verses'      => array(
+                            array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'For God so loved the world' ) ) ),
+                        ),
+                    ),
+                ),
+            ) )
+        );
+
+        // Inline DISABLED/withheld: the resolver hands us inline === null (rollback).
+        $off = ( new Renderer() )->scripture(
+            $this->view(),
+            new ResolvedScripture( array( $ref + array( 'inline' => null ) ) )
+        );
+
+        $expected3aLink = '<section class="sermonator-scripture">'
+            . '<h2 class="sermonator-scripture__heading">Scripture</h2>'
+            . '<ul class="sermonator-scripture__list">'
+            . '<li class="sermonator-scripture__ref">'
+            . '<a class="sermonator-scripture__link" href="https://www.biblegateway.com/passage/?search=John%203%3A16&version=ESV">John 3:16</a>'
+            . ' <span class="sermonator-scripture__version">(ESV)</span>'
+            . '</li>'
+            . '</ul></section>';
+
+        // Rollback is exact: inline-off === the shipped 3a link, to the byte.
+        $this->assertSame( $expected3aLink, $off );
+        // And the inline payload genuinely changed the output (so the pin is meaningful).
+        $this->assertNotSame( $off, $on );
+        $this->assertStringContainsString( 'sermonator-scripture__ref--inline', $on );
+    }
+
+    /**
+     * ZERO-WRITE on render (T-J / #1 data preservation): the entire inline render
+     * path is read-only with respect to the stored Bible meta. The Renderer is the
+     * ONLY class that builds piece-HTML and it is PURE — render-time promotion
+     * mutates NOTHING. A meta-mutation spy proves no write touches
+     * META_BIBLE_REFS / META_BIBLE_PASSAGE (nor any other meta) while rendering BOTH
+     * the inline payload branch AND the 3a link branch.
+     */
+    public function test_scripture_inline_render_performs_zero_meta_writes(): void {
+        // SPY: any meta write during render fails the test. (Reads are allowed; the
+        // resolver reads meta upstream — the Renderer here writes none, ever.)
+        Functions\expect( 'update_post_meta' )->never();
+        Functions\expect( 'add_post_meta' )->never();
+        Functions\expect( 'delete_post_meta' )->never();
+        Functions\expect( 'update_metadata' )->never();
+        Functions\expect( 'add_metadata' )->never();
+        Functions\expect( 'delete_metadata' )->never();
+
+        $renderer = new Renderer();
+
+        // Inline payload branch (render-time promotion path).
+        $renderer->scripture( $this->view(), new ResolvedScripture( array(
+            array(
+                'label'          => 'John 3:16',
+                'linkUrl'        => 'http://x/a',
+                'version'        => 'ESV',
+                'inlineEligible' => true,
+                'inline'         => array(
+                    'translation' => 'ENGWEBP',
+                    'attribution' => 'World English Bible',
+                    'verses'      => array(
+                        array( 'number' => 16, 'nodes' => array( array( 'type' => 'text', 'text' => 'For God so loved the world' ) ) ),
+                    ),
+                ),
+            ),
+        ) ) );
+
+        // 3a link branch (inline withheld).
+        $renderer->scripture( $this->view(), new ResolvedScripture( array(
+            array( 'label' => 'John 3:16', 'linkUrl' => 'http://x/a', 'version' => 'ESV', 'inlineEligible' => false, 'inline' => null ),
+        ) ) );
+
+        // Brain Monkey verifies the ->never() expectations on tearDown; assert so the
+        // test is not risky when the expectations alone carry the proof.
+        $this->assertTrue( true );
+    }
+
     public function test_scripture_renders_inline_payload_badge_and_typed_nodes(): void {
         $resolved = new ResolvedScripture( array(
             array(
