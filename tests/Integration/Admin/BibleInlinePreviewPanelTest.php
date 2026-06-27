@@ -212,16 +212,107 @@ final class BibleInlinePreviewPanelTest extends WP_UnitTestCase {
         $this->assertMatchesRegularExpression( '/name="' . preg_quote( ID::OPTION_BIBLE_INLINE_ATTESTATION, '/' ) . '" value="1"[^>]*checked/', $html );
     }
 
-    public function test_attestation_checkbox_hard_disabled_on_heterogeneous_corpus(): void {
+    public function test_attestation_checkbox_hard_disabled_on_heterogeneous_corpus_reflects_stored_false(): void {
+        // Heterogeneous corpus, attestation NOT set (default false): the box is disabled and the
+        // companion reflects the stored false (value="0"). The companion is NOT suppressed —
+        // suppressing it would make the key absent from a Form-1 POST, and options.php writes
+        // null for absent registered options (sanitizeAttestation(null) → false); reflecting the
+        // stored value round-trips it instead.
         $this->sermonWithRefs( array( $this->ref( 16, 'John 3:16', 'exact', array( 'srcVersification' => 'ESV' ) ) ) );
         $this->sermonWithRefs( array( $this->ref( 16, 'John 3:16', 'exact', array( 'srcVersification' => 'RVR1960' ) ) ) );
 
         $html = $this->renderAttestationField( $this->warmPanel() );
 
         $this->assertMatchesRegularExpression( '/type="checkbox"[^>]*disabled/', $html );
-        // Hidden companion suppressed when disabled, so an unrelated save can't auto-clear.
-        $this->assertStringNotContainsString( '<input type="hidden" name="' . ID::OPTION_BIBLE_INLINE_ATTESTATION . '" value="0">', $html );
+        $this->assertStringContainsString( '<input type="hidden" name="' . ID::OPTION_BIBLE_INLINE_ATTESTATION . '" value="0">', $html );
         $this->assertStringContainsString( 'Attestation disabled:', $html );
+    }
+
+    public function test_attestation_checkbox_disabled_reflects_force_attested_true(): void {
+        // A heterogeneous corpus where attestation was force-set true via the logged CLI override
+        // (wp sermonator bible attest --force, design §4): the box is disabled but the hidden
+        // companion REFLECTS the stored true (value="1") so a Form-1 save round-trips it through
+        // sanitizeAttestation's no-op guard and PRESERVES the deliberate override.
+        update_option( ID::OPTION_BIBLE_INLINE_ATTESTATION, true );
+        $this->sermonWithRefs( array( $this->ref( 16, 'John 3:16', 'exact', array( 'srcVersification' => 'ESV' ) ) ) );
+        $this->sermonWithRefs( array( $this->ref( 16, 'John 3:16', 'exact', array( 'srcVersification' => 'RVR1960' ) ) ) );
+
+        $html = $this->renderAttestationField( $this->warmPanel() );
+
+        $this->assertMatchesRegularExpression( '/type="checkbox"[^>]*disabled/', $html );
+        $this->assertStringContainsString( '<input type="hidden" name="' . ID::OPTION_BIBLE_INLINE_ATTESTATION . '" value="1">', $html );
+        // The companion must NOT post "0" — that would clear the override on the next save.
+        $this->assertStringNotContainsString( '<input type="hidden" name="' . ID::OPTION_BIBLE_INLINE_ATTESTATION . '" value="0">', $html );
+    }
+
+    /**
+     * The core defect: a previously-set (force) attestation must SURVIVE an unrelated Form-1 save
+     * while the box is disabled (corpus drifted heterogeneous). This drives the value the field
+     * actually renders through the SettingsRegistrar sanitize + persist that options.php would run
+     * for the posted companion, and asserts the post-save get_option — not just the markup.
+     */
+    public function test_disabled_attestation_survives_form1_save_post_save_get_option(): void {
+        update_option( ID::OPTION_BIBLE_INLINE_ATTESTATION, true );
+
+        $hetero = array(
+            $this->sermonWithRefs( array( $this->ref( 16, 'John 3:16', 'exact', array( 'srcVersification' => 'ESV' ) ) ) ),
+            $this->sermonWithRefs( array( $this->ref( 16, 'John 3:16', 'exact', array( 'srcVersification' => 'RVR1960' ) ) ) ),
+        );
+        $this->assertNotEmpty( $hetero );
+
+        // Extract the value the disabled field actually posts.
+        $html = $this->renderAttestationField( $this->warmPanel() );
+        $this->assertSame(
+            1,
+            preg_match(
+                '/<input type="hidden" name="' . preg_quote( ID::OPTION_BIBLE_INLINE_ATTESTATION, '/' ) . '" value="([01])">/',
+                $html,
+                $m
+            )
+        );
+        $posted = $m[1];
+
+        // Simulate options.php saving that posted value through the registered sanitize_callback.
+        $registrar = new \Sermonator\Admin\SettingsRegistrar( null, static fn(): array => array( 'heterogeneous' => true ) );
+        update_option( ID::OPTION_BIBLE_INLINE_ATTESTATION, $registrar->sanitizeAttestation( $posted ) );
+
+        // The deliberate, logged override survives the unrelated Form-1 save.
+        $this->assertTrue( (bool) get_option( ID::OPTION_BIBLE_INLINE_ATTESTATION ) );
+    }
+
+    /**
+     * Regression for the absent-key withdrawal: if the field WRONGLY suppressed its companion
+     * (or posted "0") while disabled, an options.php save would update_option(option, null) for
+     * the absent key, and sanitizeAttestation(null) returns false at the toBool early-return —
+     * silently clearing a force override. Prove sanitize(null) is false (the unsafe path the
+     * companion exists to avoid).
+     */
+    public function test_sanitize_attestation_null_clears_proving_companion_is_required(): void {
+        update_option( ID::OPTION_BIBLE_INLINE_ATTESTATION, true );
+
+        $registrar = new \Sermonator\Admin\SettingsRegistrar( null, static fn(): array => array( 'heterogeneous' => true ) );
+        // options.php passes null when the key is absent from POST.
+        $this->assertFalse( $registrar->sanitizeAttestation( null ) );
+    }
+
+    // -------------------------------------------------------------------------
+    // Verbatim theological claim — single-source pin (ATTESTATION_CLAIM)
+    // -------------------------------------------------------------------------
+
+    public function test_attestation_claim_constant_matches_design_copy(): void {
+        // The verbatim §4 theological claim. Any drift in the constant fails here.
+        $this->assertSame(
+            'I affirm every sermon\'s reference uses the same English versification tradition (ESV/NIV/NASB/NKJV/KJV/WEB number identically). If you have Septuagint/Vulgate/Catholic-canon-Psalm-numbered references, do NOT attest — inline could show real-but-wrong verses.',
+            BibleInlinePreviewPanel::ATTESTATION_CLAIM
+        );
+    }
+
+    public function test_rendered_attestation_field_contains_the_claim_constant(): void {
+        // Pins the rendered/translated label to the single-source constant: if the esc_html__()
+        // literal drifts from ATTESTATION_CLAIM, this fails (the constant is no longer dead code).
+        $html = $this->renderAttestationField( new BibleInlinePreviewPanel() );
+
+        $this->assertStringContainsString( BibleInlinePreviewPanel::ATTESTATION_CLAIM, $html );
     }
 
     // -------------------------------------------------------------------------

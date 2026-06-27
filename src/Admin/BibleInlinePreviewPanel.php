@@ -46,8 +46,15 @@ final class BibleInlinePreviewPanel {
     /**
      * The VERBATIM theological attestation claim (design §4). Shown as the checkbox label so the
      * operator affirms the single-English-tradition premise the L6 gate rides on — and is warned
-     * off it for Septuagint/Vulgate/Catholic-Psalm numbering. Kept as a single source so the
-     * settings UI and any test pin the exact wording.
+     * off it for Septuagint/Vulgate/Catholic-Psalm numbering.
+     *
+     * Single-source PIN: WordPress i18n needs a string LITERAL inside {@see esc_html__()} for
+     * extraction, so {@see self::renderAttestationField()} repeats the wording in its
+     * `esc_html__()` call rather than interpolating this constant. To keep that literal from
+     * silently drifting from this constant, the test suite asserts both (a) this constant equals
+     * the verbatim design §4 copy and (b) the rendered field CONTAINS this constant
+     * (BibleInlinePreviewPanelTest::test_attestation_claim_constant_matches_design_copy +
+     * ::test_rendered_attestation_field_contains_the_claim_constant) — so any drift fails a test.
      */
     public const ATTESTATION_CLAIM = 'I affirm every sermon\'s reference uses the same English versification tradition (ESV/NIV/NASB/NKJV/KJV/WEB number identically). If you have Septuagint/Vulgate/Catholic-canon-Psalm-numbered references, do NOT attest — inline could show real-but-wrong verses.';
 
@@ -138,24 +145,43 @@ final class BibleInlinePreviewPanel {
     /**
      * Render the attestation checkbox — the ONE form control this panel owns. It posts to the
      * SettingsRegistrar-owned {@see Identifiers::OPTION_BIBLE_INLINE_ATTESTATION} through the
-     * Settings API (this panel registers nothing). The label is the VERBATIM theological claim.
-     * Hard-disabled (and the hidden companion suppressed) when the live preview reports the
-     * corpus is heterogeneous, mirroring {@see SettingsRegistrar::sanitizeAttestation()} so the UI
-     * never offers an attestation the write boundary would refuse.
+     * Settings API (this panel registers nothing). The label is the VERBATIM theological claim
+     * ({@see self::ATTESTATION_CLAIM}). Hard-disabled when the live preview reports the corpus is
+     * heterogeneous, mirroring {@see SettingsRegistrar::sanitizeAttestation()} so the UI never
+     * offers an attestation the write boundary would refuse.
+     *
+     * The hidden companion ALWAYS posts a value (never suppressed). This is a Form-1 /
+     * options.php (Settings API) field, and options.php iterates EVERY whitelisted option in the
+     * group and calls update_option($option, null) for any key ABSENT from POST — it does NOT
+     * skip absent options (core options.php, the save loop). A disabled checkbox submits nothing,
+     * so without a companion the key is absent → update_option(option, null) →
+     * sanitizeAttestation(null) coerces to false at its toBool early-return, BEFORE the no-op
+     * guard — silently withdrawing a previously-set attestation (including one set via the
+     * sanctioned, logged `wp sermonator bible attest --force` override, design §4) on the very
+     * next unrelated save. (The cited podcast checkbox's "untouched on absence" property is
+     * specific to PodcastIdentityController's admin-post.php array_key_exists merge — Form 2 —
+     * and does NOT transfer to the Settings API.) So:
+     *   - Enabled (homogeneous): standard companion value="0" — a checked box posts "1" and wins,
+     *     an unchecked box falls through to "0" (the operator can un-attest).
+     *   - Disabled (heterogeneous): the box submits nothing, so the companion REFLECTS THE STORED
+     *     VALUE — a force-attested true posts "1", round-trips through sanitizeAttestation's no-op
+     *     guard (stored true → returns true) and is PRESERVED; a stored false posts "0" and stays
+     *     false (the disabled box still prevents the operator flipping it on). This upholds
+     *     {@see SettingsRegistrar::sanitizeAttestation()}'s "never auto-withdrawn on an unrelated
+     *     save" invariant under the Settings API. The clearing it prevents was always the SAFE
+     *     direction (un-attest withholds inline → never-fail-WRONG holds), but it silently undid a
+     *     deliberate, logged admin decision.
      */
     public function renderAttestationField(): void {
         $option        = Identifiers::OPTION_BIBLE_INLINE_ATTESTATION;
         $attested      = $this->attestationEnabled();
         $heterogeneous = ! empty( $this->ceiling()['heterogeneous'] );
 
-        // The standard WP hidden companion lets an unchecked box clear the flag (checked posts
-        // "1", unchecked posts the hidden "0", last value wins). Suppressed when hard-disabled:
-        // a disabled checkbox plus a "0" companion would silently clear a prior attestation on an
-        // unrelated save; suppressing it leaves the stored value untouched (mirrors the read-only
-        // podcast checkbox pattern).
-        if ( ! $heterogeneous ) {
-            echo '<input type="hidden" name="' . esc_attr( $option ) . '" value="0">';
-        }
+        // Always emit a companion (see method docblock): enabled → "0" (standard last-value-wins
+        // un-attest); disabled → reflect the stored value so a Form-1 save round-trips it through
+        // sanitize rather than clearing it via options.php's null-write-for-absent-key behavior.
+        $companion = $heterogeneous ? ( $attested ? '1' : '0' ) : '0';
+        echo '<input type="hidden" name="' . esc_attr( $option ) . '" value="' . esc_attr( $companion ) . '">';
 
         echo '<label><input type="checkbox" id="' . esc_attr( $option ) . '" name="' . esc_attr( $option ) . '" value="1"'
             . checked( $attested, true, false )
