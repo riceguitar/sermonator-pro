@@ -5,35 +5,57 @@ declare(strict_types=1);
 namespace Sermonator\Migration;
 
 /**
- * Pure reconciliation of the body. The canonical body going forward is the old
- * sermon_description (→ post_content). The old auto-generated post_content blob
- * is discarded, EXCEPT when it holds substantive text not represented in the
- * description — that text is preserved as a backup and flagged, never dropped.
+ * Pure reconciliation of the sermon body, capturing BOTH places Sermon Manager
+ * stored it. SM kept the body in the `sermon_description` meta AND/OR the native
+ * `post_content`: a sermon's text could live in either or both. SM-free's
+ * `post_content_enabled` debug option (default on) and the SM-Pro editor hijack
+ * (which mirrors the description into post_content and stashes prior content in
+ * post_content_temp) mean real corpora hold the body in different columns from
+ * sermon to sermon. The migration must therefore render either case.
  *
- * post_content_temp has its OWN single canonical home: the writer copies it
- * verbatim as its own meta row. It is therefore NEVER routed to the backup body
- * here (that would be a second home + a double-flag). It is fed in only as an
- * additional "already-represented" corpus, so that an $oldPostContent fragment
- * whose substantive text is already captured by the temp row is recognised as
- * preserved and is not redundantly backed up either.
+ * The canonical visible body going forward is the old sermon_description, but any
+ * unique-substantive legacy post_content (real text or a media/shortcode payload
+ * NOT already represented in the description) is MERGED INTO the visible body — not
+ * hidden — so a sermon whose text lived in the post_content (with an empty/short
+ * description) still renders. When the description is empty, the legacy post_content
+ * BECOMES the body. A degraded auto-generated post_content that merely repeats the
+ * description is recognised as already-represented and dropped (no duplicate).
+ *
+ * The verbatim merged legacy post_content is ALSO kept as a flagged backup (audit
+ * trail / reversibility): `backup` is the merged piece, `flag` marks that a merge
+ * happened. Both 'content' and 'backup' carry it; nothing visible is ever lost.
+ *
+ * post_content_temp has its OWN single canonical home: the writer copies it verbatim
+ * as its own meta row. It is NEVER merged or backed up here (that would be a second
+ * home + a double-flag). It is fed in only as an additional "already-represented"
+ * corpus, so an $oldPostContent fragment already captured by the temp row is not
+ * redundantly merged/backed-up.
+ *
+ * Deliberate bias — data-preservation over faithfulness: the reconciler has no
+ * signal to tell "post_content was shown to visitors" from "post_content was
+ * dormant" (e.g. an SM-free sermon whose the_content was replaced by the
+ * description render). It merges any unique post_content into the body regardless,
+ * erring toward SHOWING first-party, edit-rights text the author wrote rather than
+ * leaving it dark. The verbatim original is always retained in the flagged backup,
+ * so the choice never costs data either way.
  */
 final class PostContentReconciler {
     /**
      * @return array{content: string, backup: ?string, flag: bool}
      */
     public static function reconcile( string $oldPostContent, ?string $description, ?string $postContentTemp = null ): array {
-        $content = $description ?? '';
+        $content = (string) $description;
 
         // The corpus already preserved elsewhere: the canonical description body
         // PLUS the post_content_temp row (its own canonical home). $oldPostContent
-        // is backed up only if it is substantive relative to BOTH.
+        // is unique only if substantive relative to BOTH.
         $representedCorpus = (string) $description;
         if ( $postContentTemp !== null && trim( $postContentTemp ) !== '' ) {
             $representedCorpus .= "\n\n" . $postContentTemp;
         }
 
-        // Only $oldPostContent can land in the backup. post_content_temp is never
-        // backed up (single canonical home = its own meta row → no double-flag).
+        // Only $oldPostContent can be merged/backed-up. post_content_temp is never
+        // touched here (single canonical home = its own meta row → no double-flag).
         $pieces = array();
         if ( self::isUniqueSubstantive( $oldPostContent, $representedCorpus ) ) {
             // A structural payload (iframe/audio/video/img/embed/object/shortcode)
@@ -47,11 +69,17 @@ final class PostContentReconciler {
             }
         }
 
-        // Build backup and flag.
-        $backup = count( $pieces ) > 0 ? implode( "\n\n", $pieces ) : null;
-        $flag = count( $pieces ) > 0;
+        $unique = count( $pieces ) > 0 ? implode( "\n\n", $pieces ) : null;
 
-        return array( 'content' => $content, 'backup' => $backup, 'flag' => $flag );
+        // MERGE the unique legacy post_content INTO the visible body (capture both
+        // sources). When the description is empty/whitespace the post_content BECOMES
+        // the body; otherwise it is appended after it. Nothing visible is hidden.
+        if ( null !== $unique ) {
+            $content = '' === trim( $content ) ? $unique : $content . "\n\n" . $unique;
+        }
+
+        // Keep the merged piece as the flagged backup too (verbatim audit trail).
+        return array( 'content' => $content, 'backup' => $unique, 'flag' => null !== $unique );
     }
 
     /**
@@ -79,16 +107,6 @@ final class PostContentReconciler {
         $hasShortcode = (bool) preg_match( '/\[[a-z][a-z0-9_\-]*[\s\]]/i', $blob );
         $hasMediaHtml = (bool) preg_match( '/<(iframe|audio|video|img|script|embed|object)\b/i', $blob );
         return $hasShortcode || $hasMediaHtml;
-    }
-
-    /** True if the blob's visible text is a substring of the description's visible text. */
-    private static function isContainedIn( string $blob, string $description ): bool {
-        $needle   = self::visibleText( $blob );
-        $haystack = self::visibleText( $description );
-        if ( '' === $needle ) {
-            return true;
-        }
-        return str_contains( $haystack, $needle );
     }
 
     /** Strip tags and collapse whitespace for a text-only comparison. */

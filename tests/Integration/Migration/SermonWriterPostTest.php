@@ -115,7 +115,10 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertSame( 7, (int) $new->menu_order );
         $this->assertSame( 'A short excerpt.', $new->post_excerpt );
         $this->assertSame( 'secret', $new->post_password );
-        $this->assertSame( '<p>The real body.</p>', $new->post_content );
+        // The body captures BOTH sources: the sermon_description meta AND the distinct
+        // editor post_content ('Auto blob') merged in — neither is dropped.
+        $this->assertStringContainsString( '<p>The real body.</p>', $new->post_content );
+        $this->assertStringContainsString( 'Auto blob', $new->post_content, 'editor post_content is merged into the body, not hidden' );
         // Sweep: last-modified + content_filtered preserved (not re-stamped/dropped).
         $this->assertSame( '2021-07-09 12:00:00', $new->post_modified, 'post_modified must be preserved' );
         $this->assertSame( '2021-07-09 12:00:00', $new->post_modified_gmt, 'post_modified_gmt must be preserved' );
@@ -145,6 +148,12 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertStringContainsString( 'allowfullscreen', $backup );
         $this->assertStringContainsString( '[audio', $backup );
         $this->assertContains( 'post_content_preserved', $result->flags );
+
+        // The description was empty, so this media body BECOMES the visible body —
+        // it must survive KSES-off into the rendered post_content, not only the backup.
+        $new = get_post( $result->newId );
+        $this->assertStringContainsString( '<iframe', $new->post_content, 'media-only post_content body now renders (merged)' );
+        $this->assertStringContainsString( '[audio', $new->post_content );
     }
 
     public function test_iframe_in_description_survives_kses_into_reconciled_post_content(): void {
@@ -288,7 +297,7 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
             'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
             'post_title'   => 'Tricky Body',
             'post_status'  => 'publish',
-            'post_content' => 'blob',
+            'post_content' => '', // body lives in the description; assert it survives verbatim
         ) );
         // add_post_meta unslashes, so slash the seed to land $desc verbatim in
         // the DB — mirroring how WordPress actually stores meta.
