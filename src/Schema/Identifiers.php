@@ -58,6 +58,29 @@ final class Identifiers {
      */
     public const PODCAST_SETTING_FEED_MODE      = 'sermons_to_show';
     public const OPTION_DEFAULT_PODCAST         = 'sermonator_default_podcast';
+
+    /*
+     * Migrated Sermon Manager FREE option-podcast config keys. SM-Free's built-in podcast is
+     * OPTION-based (no podcast post): each setting is stored flat as `sermonmanager_<id>`, which
+     * the migration prefix-swaps to `sermonator_<id>` ({@see \Sermonator\Migration\MappingContract}).
+     * Read by {@see \Sermonator\Frontend\Feed\PodcastConfigFactory::fromOptions()} so a migrated
+     * SM-Free church's iTunes feed (`?feed=rss2&post_type=wpfc_sermon`, routed by
+     * {@see \Sermonator\Frontend\Feed\LegacyFeedRouter}) keeps serving — preserving live
+     * Apple/Spotify subscribers, a hard backward-compatibility requirement.
+     */
+    public const OPTION_PODCAST_TITLE              = 'sermonator_title';
+    public const OPTION_PODCAST_DESCRIPTION        = 'sermonator_description';
+    public const OPTION_PODCAST_WEBSITE_LINK       = 'sermonator_website_link';
+    public const OPTION_PODCAST_LANGUAGE           = 'sermonator_language';
+    public const OPTION_PODCAST_COPYRIGHT          = 'sermonator_copyright';
+    public const OPTION_PODCAST_ITUNES_AUTHOR      = 'sermonator_itunes_author';
+    public const OPTION_PODCAST_ITUNES_SUBTITLE    = 'sermonator_itunes_subtitle';
+    public const OPTION_PODCAST_ITUNES_SUMMARY     = 'sermonator_itunes_summary';
+    public const OPTION_PODCAST_ITUNES_OWNER_NAME  = 'sermonator_itunes_owner_name';
+    public const OPTION_PODCAST_ITUNES_OWNER_EMAIL = 'sermonator_itunes_owner_email';
+    public const OPTION_PODCAST_ITUNES_COVER_IMAGE = 'sermonator_itunes_cover_image';
+    public const OPTION_PODCAST_ITUNES_SUB_CATEGORY = 'sermonator_itunes_sub_category';
+
     public const OPTION_TERM_IMAGES             = 'sermonator_term_images';
     public const OPTION_TERM_IMAGES_SETTINGS    = 'sermonator_term_images_settings';
     public const OPTION_MIGRATION_STATE         = 'sermonator_migration_state';

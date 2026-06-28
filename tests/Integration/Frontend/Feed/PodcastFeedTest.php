@@ -14,9 +14,27 @@ use Sermonator\Schema\Identifiers as ID;
 final class PodcastFeedTest extends WP_UnitTestCase {
     protected function tearDown(): void {
         delete_option( ID::OPTION_DEFAULT_PODCAST );
+        foreach ( array(
+            ID::OPTION_PODCAST_TITLE,
+            ID::OPTION_PODCAST_ITUNES_AUTHOR,
+            ID::OPTION_PODCAST_ITUNES_SUMMARY,
+            ID::OPTION_PODCAST_ITUNES_OWNER_EMAIL,
+            ID::OPTION_PODCAST_ITUNES_COVER_IMAGE,
+        ) as $k ) {
+            delete_option( $k );
+        }
         unset( $_GET['podcast'] );
         set_query_var( SermonQuery::PAGE_QUERY_VAR, '' );
         parent::tearDown();
+    }
+
+    /** Seed a migrated SM-Free option-podcast config (no podcast post). */
+    private function seedSmFreeOptions(): void {
+        update_option( ID::OPTION_PODCAST_TITLE, 'My SM-Free Podcast' );
+        update_option( ID::OPTION_PODCAST_ITUNES_AUTHOR, 'Pastor Jane' );
+        update_option( ID::OPTION_PODCAST_ITUNES_SUMMARY, 'Weekly sermons from our church.' );
+        update_option( ID::OPTION_PODCAST_ITUNES_OWNER_EMAIL, 'podcast@church.example' );
+        update_option( ID::OPTION_PODCAST_ITUNES_COVER_IMAGE, 'http://church.example/cover.jpg' );
     }
 
     private function podcast(): int {
@@ -145,6 +163,48 @@ final class PodcastFeedTest extends WP_UnitTestCase {
         $config = ( new PodcastConfigFactory() )->fromPost( $id, 'http://example.com/feed/' );
         $this->assertSame( 'Bare Cast', $config->title );
         $this->assertSame( 'Religion & Spirituality', $config->category );
+    }
+
+    // ---- SM-Free option-podcast continuity (no podcast post; backward-compat) ----------------
+
+    public function test_smfree_option_podcast_feed_serves_all_sermons_from_options(): void {
+        // SM-Free: NO podcast post, NO default podcast — only the migrated option-podcast config.
+        // Its single iTunes feed served ALL sermons; that must continue, sourced from the options.
+        $this->seedSmFreeOptions();
+        $this->sermonWithAudio( 1000, 'First' );
+        $this->sermonWithAudio( 2000, 'Second' );
+
+        $xml = $this->capture();
+
+        $this->assertNotFalse( simplexml_load_string( $xml ), 'option-podcast feed must be well-formed XML' );
+        $this->assertSame( 2, substr_count( $xml, '<item>' ), 'all sermons must serve (SM-Free implicit single podcast)' );
+        $this->assertStringContainsString( '<title>My SM-Free Podcast</title>', $xml );
+        $this->assertStringContainsString( '<itunes:author>Pastor Jane</itunes:author>', $xml );
+        $this->assertStringContainsString( 'Weekly sermons from our church.', $xml );
+        $this->assertStringContainsString( 'http://church.example/cover.jpg', $xml );
+    }
+
+    public function test_smfree_option_podcast_feed_preserves_legacy_guid(): void {
+        // GUID continuity: a migrated episode stamped with its durable legacy GUID must emit THAT
+        // guid, so already-subscribed apps never re-download the back catalogue after the switch.
+        $this->seedSmFreeOptions();
+        $id = $this->sermonWithAudio( 1500, 'Migrated Ep' );
+        update_post_meta( $id, ID::META_LEGACY_GUID, 'legacy-guid-xyz' );
+
+        $xml = $this->capture();
+
+        $this->assertStringContainsString( 'legacy-guid-xyz', $xml, 'feed must reuse the durable legacy GUID' );
+    }
+
+    public function test_no_option_podcast_and_no_post_does_not_flood_items(): void {
+        // Regression guard: a fresh sermonator site (no option-podcast, no podcast post) must serve a
+        // valid EMPTY channel even when sermons exist — the all-sermons fallback is SM-Free-only.
+        $this->sermonWithAudio( 1000, 'Orphan' );
+
+        $xml = $this->capture();
+
+        $this->assertNotFalse( simplexml_load_string( $xml ) );
+        $this->assertSame( 0, substr_count( $xml, '<item>' ), 'no option-podcast → no default all-sermons feed' );
     }
 
     private function capture(): string {

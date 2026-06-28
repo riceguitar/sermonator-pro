@@ -66,7 +66,18 @@ final class PodcastFeed {
         $factory   = new PodcastConfigFactory();
 
         if ( $podcastId <= 0 ) {
-            echo ( new FeedBuilder() )->build( $factory->emptyConfig( $feedUrl ), array() ); // phpcs:ignore WordPress.Security.EscapeOutput
+            // SM-Free option-podcast continuity. A migrated Sermon Manager FREE site has NO podcast
+            // post — its podcast is option-based and its single iTunes feed served ALL sermons. That
+            // feed URL (?feed=rss2&post_type=wpfc_sermon) is routed here by LegacyFeedRouter; serving
+            // an empty channel would silently kill live Apple/Spotify subscriptions. So when the
+            // migrated SM-Free podcast options are present, build the channel from them and serve the
+            // full sermon set (no scope) — the same MAX_ITEMS + GUID-continuity path as a real
+            // podcast. A fresh sermonator site (no option-podcast) still serves a valid empty channel.
+            $items = $factory->hasOptionPodcast() ? $this->items() : array();
+            $config = $factory->hasOptionPodcast()
+                ? $factory->fromOptions( $feedUrl )
+                : $factory->emptyConfig( $feedUrl );
+            echo ( new FeedBuilder() )->build( $config, $items ); // phpcs:ignore WordPress.Security.EscapeOutput
             return;
         }
 
