@@ -7,8 +7,11 @@ namespace Sermonator\Migration;
 /**
  * Pure reconciliation of the sermon body, capturing BOTH places Sermon Manager
  * stored it. SM kept the body in the `sermon_description` meta AND/OR the native
- * `post_content` (the `post_content_enabled` option — default on): a sermon's text
- * could live in either or both. The migration therefore must render either case.
+ * `post_content`: a sermon's text could live in either or both. SM-free's
+ * `post_content_enabled` debug option (default on) and the SM-Pro editor hijack
+ * (which mirrors the description into post_content and stashes prior content in
+ * post_content_temp) mean real corpora hold the body in different columns from
+ * sermon to sermon. The migration must therefore render either case.
  *
  * The canonical visible body going forward is the old sermon_description, but any
  * unique-substantive legacy post_content (real text or a media/shortcode payload
@@ -27,6 +30,14 @@ namespace Sermonator\Migration;
  * home + a double-flag). It is fed in only as an additional "already-represented"
  * corpus, so an $oldPostContent fragment already captured by the temp row is not
  * redundantly merged/backed-up.
+ *
+ * Deliberate bias — data-preservation over faithfulness: the reconciler has no
+ * signal to tell "post_content was shown to visitors" from "post_content was
+ * dormant" (e.g. an SM-free sermon whose the_content was replaced by the
+ * description render). It merges any unique post_content into the body regardless,
+ * erring toward SHOWING first-party, edit-rights text the author wrote rather than
+ * leaving it dark. The verbatim original is always retained in the flagged backup,
+ * so the choice never costs data either way.
  */
 final class PostContentReconciler {
     /**
@@ -96,16 +107,6 @@ final class PostContentReconciler {
         $hasShortcode = (bool) preg_match( '/\[[a-z][a-z0-9_\-]*[\s\]]/i', $blob );
         $hasMediaHtml = (bool) preg_match( '/<(iframe|audio|video|img|script|embed|object)\b/i', $blob );
         return $hasShortcode || $hasMediaHtml;
-    }
-
-    /** True if the blob's visible text is a substring of the description's visible text. */
-    private static function isContainedIn( string $blob, string $description ): bool {
-        $needle   = self::visibleText( $blob );
-        $haystack = self::visibleText( $description );
-        if ( '' === $needle ) {
-            return true;
-        }
-        return str_contains( $haystack, $needle );
     }
 
     /** Strip tags and collapse whitespace for a text-only comparison. */

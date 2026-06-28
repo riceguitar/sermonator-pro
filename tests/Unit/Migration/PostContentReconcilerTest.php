@@ -42,11 +42,28 @@ final class PostContentReconcilerTest extends TestCase {
     }
 
     public function test_merges_BOTH_when_description_and_post_content_differ(): void {
-        // Both sources carry distinct substantive text → both must be visible.
+        // Both sources carry distinct substantive text → both must be visible,
+        // description FIRST then the post_content (the order SM showed them).
         $out = PostContentReconciler::reconcile( 'Editor-only paragraph', '<p>Meta description</p>' );
         $this->assertStringContainsString( 'Meta description', $out['content'] );
         $this->assertStringContainsString( 'Editor-only paragraph', $out['content'] );
+        $this->assertLessThan(
+            strpos( $out['content'], 'Editor-only paragraph' ),
+            strpos( $out['content'], 'Meta description' ),
+            'description must precede the merged post_content'
+        );
         $this->assertSame( 'Editor-only paragraph', $out['backup'] );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_partial_overlap_keeps_both_even_if_it_duplicates(): void {
+        // Known, accepted behavior: when the post_content shares text with the
+        // description but is not fully contained, the whole post_content is merged
+        // (duplicating the shared part) — over-showing beats silently dropping the
+        // unique remainder. Rare on real SM-Pro data (the hijack keeps them equal).
+        $out = PostContentReconciler::reconcile( 'Shared text plus extra', '<p>Shared text</p>' );
+        $this->assertStringContainsString( 'Shared text', $out['content'] );
+        $this->assertStringContainsString( 'plus extra', $out['content'] );
         $this->assertTrue( $out['flag'] );
     }
 

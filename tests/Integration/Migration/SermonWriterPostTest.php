@@ -148,6 +148,12 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertStringContainsString( 'allowfullscreen', $backup );
         $this->assertStringContainsString( '[audio', $backup );
         $this->assertContains( 'post_content_preserved', $result->flags );
+
+        // The description was empty, so this media body BECOMES the visible body —
+        // it must survive KSES-off into the rendered post_content, not only the backup.
+        $new = get_post( $result->newId );
+        $this->assertStringContainsString( '<iframe', $new->post_content, 'media-only post_content body now renders (merged)' );
+        $this->assertStringContainsString( '[audio', $new->post_content );
     }
 
     public function test_iframe_in_description_survives_kses_into_reconciled_post_content(): void {
