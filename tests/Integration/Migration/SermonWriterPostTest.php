@@ -115,7 +115,10 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
         $this->assertSame( 7, (int) $new->menu_order );
         $this->assertSame( 'A short excerpt.', $new->post_excerpt );
         $this->assertSame( 'secret', $new->post_password );
-        $this->assertSame( '<p>The real body.</p>', $new->post_content );
+        // The body captures BOTH sources: the sermon_description meta AND the distinct
+        // editor post_content ('Auto blob') merged in — neither is dropped.
+        $this->assertStringContainsString( '<p>The real body.</p>', $new->post_content );
+        $this->assertStringContainsString( 'Auto blob', $new->post_content, 'editor post_content is merged into the body, not hidden' );
         // Sweep: last-modified + content_filtered preserved (not re-stamped/dropped).
         $this->assertSame( '2021-07-09 12:00:00', $new->post_modified, 'post_modified must be preserved' );
         $this->assertSame( '2021-07-09 12:00:00', $new->post_modified_gmt, 'post_modified_gmt must be preserved' );
@@ -288,7 +291,7 @@ final class SermonWriterPostTest extends WP_UnitTestCase {
             'post_type'    => LegacyIdentifiers::POST_TYPE_SERMON,
             'post_title'   => 'Tricky Body',
             'post_status'  => 'publish',
-            'post_content' => 'blob',
+            'post_content' => '', // body lives in the description; assert it survives verbatim
         ) );
         // add_post_meta unslashes, so slash the seed to land $desc verbatim in
         // the DB — mirroring how WordPress actually stores meta.

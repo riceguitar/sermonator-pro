@@ -7,18 +7,50 @@ namespace Sermonator\Tests\Unit\Migration;
 use PHPUnit\Framework\TestCase;
 use Sermonator\Migration\PostContentReconciler;
 
+/**
+ * The reconciler must CAPTURE BOTH places Sermon Manager stored the sermon body:
+ * the `sermon_description` meta AND the native `post_content`. Whichever holds the
+ * text must end up in the visible body — never silently dropped to a hidden backup.
+ */
 final class PostContentReconcilerTest extends TestCase {
-    public function test_uses_description_as_content(): void {
-        $out = PostContentReconciler::reconcile( 'auto-generated blob', '<p>Real body</p>' );
-        $this->assertSame( '<p>Real body</p>', $out['content'] );
-    }
+    // --- the body source matrix --------------------------------------------
 
-    public function test_discards_blob_when_its_text_is_within_description(): void {
-        // Old post_content is SM's degraded text version of the same body.
+    public function test_description_only_when_post_content_is_a_redundant_copy(): void {
+        // SM's auto-generated post_content repeats the description → not unique → dropped.
         $out = PostContentReconciler::reconcile( 'Real body', '<p>Real body</p>' );
+        $this->assertSame( '<p>Real body</p>', $out['content'] );
         $this->assertNull( $out['backup'] );
         $this->assertFalse( $out['flag'] );
     }
+
+    public function test_post_content_BECOMES_body_when_description_is_empty(): void {
+        // THE HEADLINE CASE (real corpus: ~5% of sermons): the body was authored in the
+        // editor (post_content), the sermon_description meta is empty. The post_content
+        // must become the visible body — not vanish into a hidden backup.
+        $body = 'As Jesus traveled through the villages of Galilee, large crowds gathered.';
+        $out  = PostContentReconciler::reconcile( $body, '' );
+        $this->assertSame( $body, $out['content'], 'post_content body must render when the description is empty' );
+        $this->assertSame( $body, $out['backup'], 'and is also kept verbatim as the audit-trail backup' );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_post_content_becomes_body_when_description_is_null(): void {
+        $out = PostContentReconciler::reconcile( 'Unique content only here', null );
+        $this->assertSame( 'Unique content only here', $out['content'] );
+        $this->assertSame( 'Unique content only here', $out['backup'] );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_merges_BOTH_when_description_and_post_content_differ(): void {
+        // Both sources carry distinct substantive text → both must be visible.
+        $out = PostContentReconciler::reconcile( 'Editor-only paragraph', '<p>Meta description</p>' );
+        $this->assertStringContainsString( 'Meta description', $out['content'] );
+        $this->assertStringContainsString( 'Editor-only paragraph', $out['content'] );
+        $this->assertSame( 'Editor-only paragraph', $out['backup'] );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    // --- nothing-to-merge cases --------------------------------------------
 
     public function test_empty_description_with_empty_blob(): void {
         $out = PostContentReconciler::reconcile( '   ', null );
@@ -27,86 +59,76 @@ final class PostContentReconcilerTest extends TestCase {
         $this->assertFalse( $out['flag'] );
     }
 
-    public function test_preserves_and_flags_unique_blob_content(): void {
-        // Rare case: real content lived only in the editor (post_content), not in the description.
-        $out = PostContentReconciler::reconcile( 'Unique content only here', null );
-        $this->assertSame( '', $out['content'] ); // description is the canonical body going forward...
-        $this->assertSame( 'Unique content only here', $out['backup'] ); // ...but unique text is never dropped
-        $this->assertTrue( $out['flag'] );
-    }
-
-    public function test_whitespace_only_blob_is_not_backed_up(): void {
+    public function test_whitespace_only_blob_is_not_merged(): void {
         $out = PostContentReconciler::reconcile( "\n\t  ", 'desc' );
+        $this->assertSame( 'desc', $out['content'] );
         $this->assertNull( $out['backup'] );
         $this->assertFalse( $out['flag'] );
     }
 
-    public function test_post_content_temp_is_never_routed_to_backup(): void {
-        // post_content_temp has its OWN single canonical home (the writer copies it
-        // verbatim as its own meta row). The reconciler must NOT also route it to
-        // the backup body — that would be a second home + a double-flag. With no
-        // OTHER substantive source, the backup is therefore empty.
+    // --- media / shortcode structural payloads -----------------------------
+
+    public function test_iframe_only_blob_with_empty_description_becomes_body(): void {
+        $iframe = '<iframe src="https://player.example/embed/1"></iframe>';
+        $out    = PostContentReconciler::reconcile( $iframe, null );
+        $this->assertSame( $iframe, $out['content'], 'a media-only post_content body must render' );
+        $this->assertSame( $iframe, $out['backup'] );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    public function test_audio_video_embed_only_blobs_become_body(): void {
+        foreach ( array(
+            '<audio src="https://media.example/s.mp3"></audio>',
+            '<video><source src="https://media.example/s.mp4"></video>',
+            '<embed src="https://media.example/s.swf">',
+        ) as $media ) {
+            $out = PostContentReconciler::reconcile( $media, '' );
+            $this->assertSame( $media, $out['content'], "media-only blob must render: $media" );
+            $this->assertTrue( $out['flag'] );
+        }
+    }
+
+    public function test_shortcode_blob_is_merged_even_if_text_contained(): void {
+        // The shortcode carries data the plain description text does not.
+        $out = PostContentReconciler::reconcile( '[audio src="x.mp3"]Intro', '<p>Intro</p>', null );
+        $this->assertStringContainsString( '[audio src="x.mp3"]', $out['content'] );
+        $this->assertNotNull( $out['backup'] );
+        $this->assertTrue( $out['flag'] );
+    }
+
+    // --- post_content_temp owns its own canonical home (never merged here) --
+
+    public function test_post_content_temp_is_never_merged_or_backed_up(): void {
+        // temp has its OWN meta row (the writer copies it verbatim); the reconciler
+        // must not also pull it into the body or the backup.
         $out = PostContentReconciler::reconcile( '', null, 'Only in temp backup' );
         $this->assertSame( '', $out['content'] );
-        $this->assertNull( $out['backup'], 'post_content_temp must not be backed up (single canonical home)' );
-        $this->assertFalse( $out['flag'] );
-    }
-
-    public function test_temp_text_within_description_not_backed_up(): void {
-        $out = PostContentReconciler::reconcile( '', '<p>Full body here</p>', 'Full body here' );
         $this->assertNull( $out['backup'] );
         $this->assertFalse( $out['flag'] );
     }
 
-    public function test_iframe_only_blob_with_empty_description_is_preserved(): void {
-        // MUST-FIX #1: a media-only blob has NO visible text after strip_tags, but
-        // hasStructuralPayload() is true — the embed must be backed up and flagged,
-        // never dropped to nowhere.
-        $out = PostContentReconciler::reconcile( '<iframe src="https://player.example/embed/1"></iframe>', null );
-        $this->assertNotNull( $out['backup'], 'iframe-only blob must be backed up' );
-        $this->assertSame( '<iframe src="https://player.example/embed/1"></iframe>', $out['backup'] );
-        $this->assertTrue( $out['flag'] );
-    }
-
-    public function test_audio_only_blob_with_empty_description_is_preserved(): void {
-        $out = PostContentReconciler::reconcile( '<audio src="https://media.example/s.mp3"></audio>', '' );
-        $this->assertNotNull( $out['backup'], 'audio-only blob must be backed up' );
-        $this->assertTrue( $out['flag'] );
-    }
-
-    public function test_video_only_blob_with_empty_description_is_preserved(): void {
-        $out = PostContentReconciler::reconcile( '<video><source src="https://media.example/s.mp4"></video>', null );
-        $this->assertNotNull( $out['backup'], 'video-only blob must be backed up' );
-        $this->assertTrue( $out['flag'] );
-    }
-
-    public function test_embed_only_blob_with_empty_description_is_preserved(): void {
-        $out = PostContentReconciler::reconcile( '<embed src="https://media.example/s.swf">', null );
-        $this->assertNotNull( $out['backup'], 'embed-only blob must be backed up' );
-        $this->assertTrue( $out['flag'] );
-    }
-
-    public function test_shortcode_blob_not_discarded_even_if_text_contained(): void {
-        $out = PostContentReconciler::reconcile( '[audio src="x.mp3"]Intro', '<p>Intro</p>', null );
-        $this->assertNotNull( $out['backup'] );   // shortcode carries data the plain text doesn't
-        $this->assertTrue( $out['flag'] );
-    }
-
-    public function test_old_content_already_in_temp_row_not_double_backed_up(): void {
-        // The old post_content's substantive text already lives in the temp row
-        // (its own canonical home), so it must NOT be backed up again — only text
-        // absent from BOTH description and the temp row is preserved.
+    public function test_post_content_already_in_temp_row_not_re_merged(): void {
+        // The old post_content's text already lives in the temp row → not unique → dropped.
         $out = PostContentReconciler::reconcile( 'Shared body', 'desc', 'Shared body' );
-        $this->assertNull( $out['backup'], 'text already in the temp row is not re-backed-up' );
+        $this->assertSame( 'desc', $out['content'] );
+        $this->assertNull( $out['backup'] );
         $this->assertFalse( $out['flag'] );
     }
 
-    public function test_only_old_content_unique_to_both_is_backed_up(): void {
-        // Old post_content carries text absent from BOTH description and temp →
-        // it is the only thing backed up; the temp content stays in its own home.
+    public function test_post_content_text_within_description_not_merged(): void {
+        $out = PostContentReconciler::reconcile( 'Full body here', '<p>Full body here</p>', null );
+        $this->assertSame( '<p>Full body here</p>', $out['content'] );
+        $this->assertNull( $out['backup'] );
+        $this->assertFalse( $out['flag'] );
+    }
+
+    public function test_only_post_content_unique_to_both_is_merged(): void {
+        // post_content carries text absent from BOTH description and temp → it is merged;
+        // the temp content stays only in its own home (never here).
         $out = PostContentReconciler::reconcile( 'Alpha unique', 'desc', 'Beta unique' );
-        $this->assertStringContainsString( 'Alpha unique', (string) $out['backup'] );
-        $this->assertStringNotContainsString( 'Beta unique', (string) $out['backup'], 'temp content is never in the backup' );
+        $this->assertStringContainsString( 'Alpha unique', $out['content'] );
+        $this->assertStringNotContainsString( 'Beta unique', $out['content'], 'temp content is never pulled in here' );
+        $this->assertSame( 'Alpha unique', $out['backup'] );
         $this->assertTrue( $out['flag'] );
     }
 }
