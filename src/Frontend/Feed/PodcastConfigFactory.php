@@ -57,6 +57,110 @@ final class PodcastConfigFactory {
         );
     }
 
+    /**
+     * The migrated SM-Free option-podcast config keys, in priority order. Their PRESENCE (any one
+     * non-empty) is what {@see self::hasOptionPodcast()} treats as "this site had an SM-Free podcast".
+     *
+     * @var list<string>
+     */
+    private const OPTION_KEYS = array(
+        ID::OPTION_PODCAST_TITLE,
+        ID::OPTION_PODCAST_DESCRIPTION,
+        ID::OPTION_PODCAST_WEBSITE_LINK,
+        ID::OPTION_PODCAST_LANGUAGE,
+        ID::OPTION_PODCAST_COPYRIGHT,
+        ID::OPTION_PODCAST_ITUNES_AUTHOR,
+        ID::OPTION_PODCAST_ITUNES_SUBTITLE,
+        ID::OPTION_PODCAST_ITUNES_SUMMARY,
+        ID::OPTION_PODCAST_ITUNES_OWNER_NAME,
+        ID::OPTION_PODCAST_ITUNES_OWNER_EMAIL,
+        ID::OPTION_PODCAST_ITUNES_COVER_IMAGE,
+        ID::OPTION_PODCAST_ITUNES_SUB_CATEGORY,
+    );
+
+    /**
+     * Build a default podcast config from the migrated SM-Free option-podcast settings (no podcast
+     * post). Mirrors {@see self::fromPost()}'s field mapping + fallbacks, reading the flat
+     * `sermonator_*` options instead of the post-meta blob. Used by {@see PodcastFeed} to keep a
+     * migrated SM-Free church's single implicit podcast (all sermons) serving after the switch.
+     */
+    public function fromOptions( string $feedUrl ): PodcastConfig {
+        $get = static fn( string $optionKey ): string =>
+            is_string( $v = get_option( $optionKey, '' ) ) ? $v : '';
+
+        $title   = $get( ID::OPTION_PODCAST_TITLE ) !== '' ? $get( ID::OPTION_PODCAST_TITLE ) : (string) get_bloginfo( 'name' );
+        $summary = $get( ID::OPTION_PODCAST_ITUNES_SUMMARY );
+        $author  = $get( ID::OPTION_PODCAST_ITUNES_AUTHOR ) !== '' ? $get( ID::OPTION_PODCAST_ITUNES_AUTHOR ) : (string) get_bloginfo( 'name' );
+        $link    = $get( ID::OPTION_PODCAST_WEBSITE_LINK ) !== '' ? $get( ID::OPTION_PODCAST_WEBSITE_LINK ) : home_url( '/' );
+
+        // description: prefer iTunes summary, then the description option, then the blog tagline.
+        $description = $summary;
+        if ( $description === '' ) {
+            $description = $get( ID::OPTION_PODCAST_DESCRIPTION );
+        }
+        if ( $description === '' ) {
+            $description = (string) get_bloginfo( 'description' );
+        }
+
+        $category = ItunesCategory::normalize( self::subCategoryName( $get( ID::OPTION_PODCAST_ITUNES_SUB_CATEGORY ) ) );
+
+        return new PodcastConfig(
+            title:       $title,
+            link:        $link,
+            description: $description,
+            language:    $get( ID::OPTION_PODCAST_LANGUAGE ) !== '' ? $get( ID::OPTION_PODCAST_LANGUAGE ) : (string) get_bloginfo( 'language' ),
+            author:      $author,
+            summary:     $summary,
+            ownerName:   $get( ID::OPTION_PODCAST_ITUNES_OWNER_NAME ) !== '' ? $get( ID::OPTION_PODCAST_ITUNES_OWNER_NAME ) : $author,
+            ownerEmail:  $get( ID::OPTION_PODCAST_ITUNES_OWNER_EMAIL ),
+            imageUrl:    $get( ID::OPTION_PODCAST_ITUNES_COVER_IMAGE ),
+            category:    $category['category'],
+            subcategory: $category['subcategory'],
+            explicit:    false, // SM-Free has no explicit field.
+            copyright:   $get( ID::OPTION_PODCAST_COPYRIGHT ),
+            feedUrl:     $feedUrl
+        );
+    }
+
+    /**
+     * SM-Free stores `itunes_sub_category` as a numeric SELECT key ('0'-'7'), not the Apple name; its
+     * own feed maps the key to a name and defaults empty/unknown to "Christianity" (always under
+     * "Religion & Spirituality"). Mirror that so a real migrated '2' yields the Christianity
+     * subcategory rather than being dropped. A non-numeric value is assumed to already be a name
+     * (e.g. an SM-Pro-stored value) and passed through to {@see ItunesCategory::normalize()}.
+     */
+    private static function subCategoryName( string $raw ): string {
+        $names = array(
+            '1' => 'Buddhism',
+            '2' => 'Christianity',
+            '3' => 'Hinduism',
+            '4' => 'Islam',
+            '5' => 'Judaism',
+            '6' => 'Other',
+            '7' => 'Spirituality',
+        );
+        if ( isset( $names[ $raw ] ) ) {
+            return $names[ $raw ];
+        }
+        // '0', '', or any other numeric key → SM-Free's default. A non-numeric value is already a name.
+        return ( '' === $raw || ctype_digit( $raw ) ) ? 'Christianity' : $raw;
+    }
+
+    /**
+     * True iff at least one migrated SM-Free podcast option is a non-empty string — the GATE that
+     * tells {@see PodcastFeed} a site had an option-podcast (vs a fresh sermonator install), so the
+     * default-podcast-from-options feed is served only where there is a legacy podcast to continue.
+     */
+    public function hasOptionPodcast(): bool {
+        foreach ( self::OPTION_KEYS as $key ) {
+            $value = get_option( $key, '' );
+            if ( is_string( $value ) && $value !== '' ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public function emptyConfig( string $feedUrl ): PodcastConfig {
         return new PodcastConfig(
             title:       (string) get_bloginfo( 'name' ),
