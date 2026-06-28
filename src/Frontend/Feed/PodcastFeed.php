@@ -70,13 +70,16 @@ final class PodcastFeed {
             // post — its podcast is option-based and its single iTunes feed served ALL sermons. That
             // feed URL (?feed=rss2&post_type=wpfc_sermon) is routed here by LegacyFeedRouter; serving
             // an empty channel would silently kill live Apple/Spotify subscriptions. So when the
-            // migrated SM-Free podcast options are present, build the channel from them and serve the
-            // full sermon set (no scope) — the same MAX_ITEMS + GUID-continuity path as a real
-            // podcast. A fresh sermonator site (no option-podcast) still serves a valid empty channel.
-            $items = $factory->hasOptionPodcast() ? $this->items() : array();
-            $config = $factory->hasOptionPodcast()
-                ? $factory->fromOptions( $feedUrl )
-                : $factory->emptyConfig( $feedUrl );
+            // migrated SM-Free podcast options are present AND there is NO podcast post at all (the
+            // true SM-Free shape), build the channel from those options and serve the full sermon set
+            // (no scope) — the same MAX_ITEMS + GUID-continuity path as a real podcast. The
+            // no-podcast-post guard is load-bearing: on an SM-PRO site the same global options exist
+            // as per-podcast fallbacks, so without it a missing/unresolved default podcast would
+            // wrongly flip the base feed to an all-sermons channel with the global identity. A fresh
+            // sermonator site (no option-podcast) still serves a valid empty channel.
+            $serveOptionPodcast = $factory->hasOptionPodcast() && $this->publishedPodcastCount() === 0;
+            $config = $serveOptionPodcast ? $factory->fromOptions( $feedUrl ) : $factory->emptyConfig( $feedUrl );
+            $items  = $serveOptionPodcast ? $this->items() : array();
             echo ( new FeedBuilder() )->build( $config, $items ); // phpcs:ignore WordPress.Security.EscapeOutput
             return;
         }

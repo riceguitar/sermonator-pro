@@ -196,6 +196,20 @@ final class PodcastFeedTest extends WP_UnitTestCase {
         $this->assertStringContainsString( 'legacy-guid-xyz', $xml, 'feed must reuse the durable legacy GUID' );
     }
 
+    public function test_option_podcast_suppressed_when_a_podcast_post_exists(): void {
+        // SM-Pro shape: a podcast POST exists (global SM options are also set as its fallbacks).
+        // With no resolvable default podcast, the base feed must NOT flip to an all-sermons channel
+        // built from the global options — it stays an empty channel. (Guards the gate's no-post precondition.)
+        self::factory()->post->create( array( 'post_type' => ID::POST_TYPE_PODCAST, 'post_status' => 'publish' ) );
+        $this->seedSmFreeOptions();
+        $this->sermonWithAudio( 1000, 'ShouldNotAppear' );
+
+        $xml = $this->capture(); // no OPTION_DEFAULT_PODCAST + no ?podcast → resolvePodcast() <= 0
+
+        $this->assertSame( 0, substr_count( $xml, '<item>' ), 'a site with a podcast post must not serve the option-podcast all-sermons feed' );
+        $this->assertStringNotContainsString( 'ShouldNotAppear', $xml );
+    }
+
     public function test_no_option_podcast_and_no_post_does_not_flood_items(): void {
         // Regression guard: a fresh sermonator site (no option-podcast, no podcast post) must serve a
         // valid EMPTY channel even when sermons exist — the all-sermons fallback is SM-Free-only.

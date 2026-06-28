@@ -67,7 +67,8 @@ final class PodcastConfigFactoryTest extends TestCase {
             ID::OPTION_PODCAST_ITUNES_OWNER_NAME  => 'Owner Name',
             ID::OPTION_PODCAST_ITUNES_OWNER_EMAIL => 'owner@church.example',
             ID::OPTION_PODCAST_ITUNES_COVER_IMAGE => 'http://church.example/cover.jpg',
-            ID::OPTION_PODCAST_ITUNES_SUB_CATEGORY => 'Christianity',
+            // SM-Free stores this as a numeric SELECT key ('2' = Christianity), NOT the name.
+            ID::OPTION_PODCAST_ITUNES_SUB_CATEGORY => '2',
         );
     }
 
@@ -119,7 +120,7 @@ final class PodcastConfigFactoryTest extends TestCase {
         $this->assertSame( 'en-US', $config->language, 'language → bloginfo language' );
         $this->assertSame( 'http://example.com/', $config->link, 'link → home_url(/)' );
         $this->assertSame( ItunesCategory::DEFAULT_CATEGORY, $config->category );
-        $this->assertNull( $config->subcategory );
+        $this->assertSame( 'Christianity', $config->subcategory, "SM-Free's sub-category default is Christianity" );
         $this->assertSame( '', $config->ownerEmail );
         $this->assertSame( '', $config->imageUrl );
         $this->assertSame( '', $config->copyright );
@@ -132,6 +133,28 @@ final class PodcastConfigFactoryTest extends TestCase {
 
         $this->assertSame( 'Pastor Jane', $config->author );
         $this->assertSame( 'Pastor Jane', $config->ownerName, 'ownerName falls back to author when unset.' );
+    }
+
+    /**
+     * SM-Free stores itunes_sub_category as a numeric SELECT key; it must map to the Apple name.
+     *
+     * @dataProvider provideSubCategoryKeys
+     */
+    public function test_fromOptions_maps_numeric_sub_category_key_to_apple_name( string $stored, string $expectedSub ): void {
+        $this->options = array( ID::OPTION_PODCAST_ITUNES_SUB_CATEGORY => $stored );
+        $config = ( new PodcastConfigFactory() )->fromOptions( self::FEED_URL );
+        $this->assertSame( ItunesCategory::DEFAULT_CATEGORY, $config->category );
+        $this->assertSame( $expectedSub, (string) $config->subcategory, "stored '{$stored}' must map to {$expectedSub}" );
+    }
+
+    /** @return array<string,array{string,string}> */
+    public static function provideSubCategoryKeys(): array {
+        return array(
+            'christianity (2)' => array( '2', 'Christianity' ),
+            'buddhism (1)'     => array( '1', 'Buddhism' ),
+            'judaism (5)'      => array( '5', 'Judaism' ),
+            'zero → default'   => array( '0', 'Christianity' ),
+        );
     }
 
     // ---- hasOptionPodcast(): the GATE --------------------------------------------------------

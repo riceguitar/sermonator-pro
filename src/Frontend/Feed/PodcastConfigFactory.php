@@ -102,7 +102,7 @@ final class PodcastConfigFactory {
             $description = (string) get_bloginfo( 'description' );
         }
 
-        $category = ItunesCategory::normalize( $get( ID::OPTION_PODCAST_ITUNES_SUB_CATEGORY ) );
+        $category = ItunesCategory::normalize( self::subCategoryName( $get( ID::OPTION_PODCAST_ITUNES_SUB_CATEGORY ) ) );
 
         return new PodcastConfig(
             title:       $title,
@@ -120,6 +120,30 @@ final class PodcastConfigFactory {
             copyright:   $get( ID::OPTION_PODCAST_COPYRIGHT ),
             feedUrl:     $feedUrl
         );
+    }
+
+    /**
+     * SM-Free stores `itunes_sub_category` as a numeric SELECT key ('0'-'7'), not the Apple name; its
+     * own feed maps the key to a name and defaults empty/unknown to "Christianity" (always under
+     * "Religion & Spirituality"). Mirror that so a real migrated '2' yields the Christianity
+     * subcategory rather than being dropped. A non-numeric value is assumed to already be a name
+     * (e.g. an SM-Pro-stored value) and passed through to {@see ItunesCategory::normalize()}.
+     */
+    private static function subCategoryName( string $raw ): string {
+        $names = array(
+            '1' => 'Buddhism',
+            '2' => 'Christianity',
+            '3' => 'Hinduism',
+            '4' => 'Islam',
+            '5' => 'Judaism',
+            '6' => 'Other',
+            '7' => 'Spirituality',
+        );
+        if ( isset( $names[ $raw ] ) ) {
+            return $names[ $raw ];
+        }
+        // '0', '', or any other numeric key → SM-Free's default. A non-numeric value is already a name.
+        return ( '' === $raw || ctype_digit( $raw ) ) ? 'Christianity' : $raw;
     }
 
     /**
